@@ -20,7 +20,10 @@ import (
 	"time"
 	"unicode"
 
+	"gonc/pty"
+
 	"golang.org/x/net/proxy"
+	"golang.org/x/term"
 )
 
 var (
@@ -30,11 +33,11 @@ var (
 	auth             = flag.String("auth", "", "user:password (for SOCKS5 proxy)")
 	sendfile         = flag.String("sendfile", "", "path to file to send (optional)")
 	tlsEnabled       = flag.Bool("tls", false, "Enable TLS connection")
-	tls10_forced     = flag.Bool("tls10", false, "")
-	tls11_forced     = flag.Bool("tls11", false, "")
-	tls12_forced     = flag.Bool("tls12", false, "")
-	tls13_forced     = flag.Bool("tls13", false, "")
-	tlsSNI           = flag.String("sni", "", "")
+	tls10_forced     = flag.Bool("tls10", false, "force negotiation to specify TLS version")
+	tls11_forced     = flag.Bool("tls11", false, "force negotiation to specify TLS version")
+	tls12_forced     = flag.Bool("tls12", false, "force negotiation to specify TLS version")
+	tls13_forced     = flag.Bool("tls13", false, "force negotiation to specify TLS version")
+	tlsSNI           = flag.String("sni", "", "specify TLS SNI")
 	enableCRLF       = flag.Bool("C", false, "enable CRLF")
 	listenMode       = flag.Bool("l", false, "listen mode")
 	udpProtocol      = flag.Bool("u", false, "use UDP protocol")
@@ -44,6 +47,8 @@ var (
 	runCmd           = flag.String("exec", "", "runs a command for each connection")
 	mergeStderr      = flag.Bool("stderr", false, "when -exec, Merge stderr into stdout ")
 	keepOpen         = flag.Bool("keep-open", false, "keep listening after client disconnects")
+	enablePty        = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
+	term_oldstat     *term.State
 )
 
 // 新增的进度统计和伪设备相关代码
@@ -330,7 +335,7 @@ type closeWriter interface {
 }
 
 func usage() {
-	fmt.Println("go-netcat v1.0")
+	fmt.Println("go-netcat v1.1")
 	fmt.Println("Usage:")
 	fmt.Println("    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 }
@@ -360,6 +365,10 @@ func main() {
 	}
 	if *sendfile != "" && *runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-sendfile and -exec cannot be used together\n")
+		os.Exit(1)
+	}
+	if *enablePty && *enableCRLF {
+		fmt.Fprintf(os.Stderr, "-pty and -C cannot be used together\n")
 		os.Exit(1)
 	}
 
@@ -516,7 +525,8 @@ func main() {
 // 发送文件并输出传输速度
 func sendFile(filepath string, conn net.Conn, stats *ProgressStats) {
 	var file io.ReadCloser
-	var err error
+	var err, err1 error
+	var n int
 	if filepath == "/dev/zero" || filepath == "/dev/urandom" {
 		file, err = NewPseudoDevice(filepath)
 	} else {
@@ -531,9 +541,9 @@ func sendFile(filepath string, conn net.Conn, stats *ProgressStats) {
 	// 使用自定义复制函数以便更新统计信息
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := file.Read(buf)
-		if err != nil && err != io.EOF {
-			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		n, err1 = file.Read(buf)
+		if err1 != nil && err1 != io.EOF {
+			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err1)
 			break
 		}
 		if n == 0 {
@@ -547,16 +557,21 @@ func sendFile(filepath string, conn net.Conn, stats *ProgressStats) {
 		}
 
 		stats.Update(int64(n))
+		if err1 == io.EOF {
+			break
+		}
 	}
 }
 
 // 新增的copyWithProgress函数用于在数据传输时显示进度
 func copyWithProgress(dst io.Writer, src io.Reader, stats *ProgressStats) {
 	buf := make([]byte, 32*1024)
+	var n int
+	var err, err1 error
 	for {
-		n, err := src.Read(buf)
-		if err != nil && err != io.EOF {
-			fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
+		n, err1 = src.Read(buf)
+		if err1 != nil && err1 != io.EOF {
+			fmt.Fprintf(os.Stderr, "Read error: %v\n", err1)
 			break
 		}
 		if n == 0 {
@@ -570,18 +585,23 @@ func copyWithProgress(dst io.Writer, src io.Reader, stats *ProgressStats) {
 		}
 
 		stats.Update(int64(n))
+		if err1 == io.EOF {
+			break
+		}
 	}
 }
 
 func copyCharDeviceWithProgress(dst io.Writer, src io.Reader, stats *ProgressStats) {
+	var n int
+	var err, err1 error
+	var line string
 
 	reader := bufio.NewReader(src)
 	writer := bufio.NewWriter(dst)
-
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil && err != io.EOF {
-			fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
+		line, err1 = reader.ReadString('\n')
+		if err1 != nil && err1 != io.EOF {
+			fmt.Fprintf(os.Stderr, "Read error: %v\n", err1)
 			break
 		}
 
@@ -593,16 +613,15 @@ func copyCharDeviceWithProgress(dst io.Writer, src io.Reader, stats *ProgressSta
 			line += "\n"
 		}
 
-		n, err := writer.WriteString(line)
+		n, err = writer.WriteString(line)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
 			break
 		}
 		writer.Flush()
-
 		stats.Update(int64(n))
 
-		if err == io.EOF {
+		if err1 == io.EOF {
 			break
 		}
 	}
@@ -645,25 +664,25 @@ func parseCommandLine(command string) ([]string, error) {
 }
 
 func handleConnection(conn net.Conn, stats_in, stats_out *ProgressStats) {
+	defer conn.Close()
 	// 如果启用 TLS，进行 TLS 握手
 	if *tlsEnabled || *tls10_forced || *tls11_forced || *tls12_forced || *tls13_forced {
 		conn_tls := do_TLS(conn)
 		if conn_tls == nil {
-			conn.Close()
 			return
 		}
+		defer conn_tls.Close()
 		conn = conn_tls
 	}
 
 	// 如果指定了 sendfile 参数，发送指定的文件
 	if *sendfile != "" {
 		sendFile(*sendfile, conn, stats_out)
-		conn.Close()
 		return
 	}
 
 	var input io.Reader
-	var output io.Writer
+	var output io.WriteCloser
 	var cmd *exec.Cmd
 
 	if *runCmd != "" {
@@ -671,71 +690,85 @@ func handleConnection(conn net.Conn, stats_in, stats_out *ProgressStats) {
 		args, err := parseCommandLine(*runCmd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing command: %v\n", err)
-			conn.Close()
 			return
 		}
 
 		if len(args) == 0 {
 			fmt.Fprintf(os.Stderr, "Empty command\n")
-			conn.Close()
 			return
 		}
 
 		// 创建命令
 		cmd = exec.Command(args[0], args[1:]...)
 
-		// 创建管道
-		stdinPipe, err := cmd.StdinPipe()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
-			conn.Close()
-			return
-		}
-
-		stdoutPipe, err := cmd.StdoutPipe()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
-			conn.Close()
-			return
-		}
-
-		if *mergeStderr {
-			cmd.Stderr = cmd.Stdout
+		if *enablePty {
+			ptmx, err := pty.Start(cmd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to start pty: %v", err)
+				return
+			}
+			input = ptmx
+			output = ptmx
 		} else {
-			cmd.Stderr = os.Stderr
+			// 创建管道
+			stdinPipe, err := cmd.StdinPipe()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
+				return
+			}
+
+			stdoutPipe, err := cmd.StdoutPipe()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
+				return
+			}
+
+			if *mergeStderr {
+				cmd.Stderr = cmd.Stdout
+			} else {
+				cmd.Stderr = os.Stderr
+			}
+
+			input = stdoutPipe
+			output = stdinPipe
+
+			// 启动命令
+			if err := cmd.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
+				return
+			}
 		}
 
-		// 启动命令
-		if err := cmd.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
-			conn.Close()
-			return
-		}
-
-		// 设置输入输出为管道
-		input = stdoutPipe
-		output = stdinPipe
-
-		// 命令退出后关闭连接
 		go func() {
-			cmd.Wait()
+			copyWithProgress(conn, input, stats_out)
+			time.Sleep(1 * time.Second)
+			// 关闭连接
 			if tcpConn, ok := conn.(closeWriter); ok {
 				tcpConn.CloseWrite()
+			} else {
+				conn.Close()
 			}
-			conn.Close()
 		}()
 
-		go copyWithProgress(conn, input, stats_out)
 	} else {
 		// 使用标准输入输出
 		input = os.Stdin
 		output = os.Stdout
 
 		go func() {
-
 			info, err := os.Stdin.Stat()
 			if err == nil && info.Mode()&os.ModeCharDevice != 0 {
-				copyCharDeviceWithProgress(conn, input, stats_out)
+				if *enablePty {
+					term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "MakeRaw error: %v\n", err)
+						return
+					}
+					defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
+					copyWithProgress(conn, input, stats_out)
+				} else {
+					copyCharDeviceWithProgress(conn, input, stats_out)
+				}
 			} else {
 				copyWithProgress(conn, input, stats_out)
 			}
@@ -754,6 +787,12 @@ func handleConnection(conn net.Conn, stats_in, stats_out *ProgressStats) {
 	copyWithProgress(output, conn, stats_in)
 	time.Sleep(1 * time.Second)
 	conn.Close()
+	if *enablePty && output != nil {
+		output.Close()
+	}
+	if term_oldstat != nil {
+		term.Restore(int(os.Stdin.Fd()), term_oldstat)
+	}
 	// 如果使用了命令，等待命令结束
 	if cmd != nil {
 		cmd.Process.Kill()
