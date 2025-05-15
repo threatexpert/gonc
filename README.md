@@ -1,25 +1,51 @@
 ## go-netcat 简介
-   golang版 netcat
-   
+
+golang版 netcat,有以下特点：
+
+   - -exec结合-keep-open可为实现每个连接提供指定服务程序，-exec执行的程序将基于stdio管道提供服务。如果是/bin/sh这种shell程序，还可以加上-pty启用pseudo-terminal模式
+   - 控制台输入支持raw模式，特别是获得shell的操作时支持TAB、ctrl+c等输入
+   - 引入了cloudflare的turn服务探测公网地址，-turn方便查看自身地址经过NAT后的公网地址
+   - TCP/UDP两种都很方便实现内网对内网的穿透NAT建立点对点的通信，用-peer参数可方便NAT打洞
+   - 引入KCP方便建立稳定传输的UDP通道
+   - 自身可作为-exec的服务程序，然后基于多路复用隧道的功能提供流量转发或socks5代理
+   - TLS/DTLS针对TCP/UDP都支持
+   - 支持针对发送或接收统计传输速度
+
 ## 使用方法
 ```
 Usage of ./gonc:
   -C    enable CRLF
+  -app-mux
+        a Stream Multiplexing based proxy app
   -auth string
-        user:password (for SOCKS5 proxy)
+        user:password for SOCKS5 proxy; preshared key for kcp
   -bind string
         ip:port
   -exec string
         runs a command for each connection
   -inprogress
         show transfer progress
+  -kcp
+        use UDP+KCP protocol, -u can be omitted
   -keep-open
         keep listening after client disconnects
+  -keepalive int
+        none 0 will enable TCP keepalive feature
   -l    listen mode
+  -mux-address string
+        host:port (for connect or listen mode)
+  -mux-engine string
+        yamux | smux (default "smux")
+  -mux-mode string
+        connect | listen | stdio (default "stdio")
   -outprogress
         show transfer progress
+  -peer string
+        peer address to connect, will send a ping/SYN for NAT punching
   -pty
         <-exec> will run in a pseudo-terminal, and put the terminal into raw mode
+  -punchdata string
+        UDP punch payload (default "ping\n")
   -s5 string
         ip:port (SOCKS5 proxy)
   -sendfile string
@@ -31,13 +57,19 @@ Usage of ./gonc:
   -tls
         Enable TLS connection
   -tls10
-        force negotiation to specify tls version
+        force negotiation to specify TLS version
   -tls11
-        force negotiation to specify tls version
+        force negotiation to specify TLS version
   -tls12
-        force negotiation to specify tls version
+        force negotiation to specify TLS version
   -tls13
-        force negotiation to specify tls version
+        force negotiation to specify TLS version
+  -tlsserver
+        force as TLS server while connecting
+  -turn
+        use STUN to discover public IP
+  -turnsrv string
+        turn server (default "turn.cloudflare.com:3478")
   -u    use UDP protocol
 ```
 
