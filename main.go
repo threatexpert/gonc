@@ -21,7 +21,6 @@ import (
 	"gonc/pty"
 
 	"github.com/pion/dtls/v2"
-	"github.com/pion/stun"
 	"github.com/xtaci/kcp-go/v5"
 	"golang.org/x/net/proxy"
 	"golang.org/x/term"
@@ -44,7 +43,9 @@ var (
 	listenMode       = flag.Bool("l", false, "listen mode")
 	udpProtocol      = flag.Bool("u", false, "use UDP protocol")
 	kcpEnabled       = flag.Bool("kcp", false, "use UDP+KCP protocol, -u can be omitted")
+	kcpSEnabled      = flag.Bool("kcps", false, "kcp server mode")
 	localbind        = flag.String("bind", "", "ip:port")
+	remoteAddr       = flag.String("remote", "", "host:port")
 	showSendProgress = flag.Bool("outprogress", false, "show transfer progress")
 	showRecvProgress = flag.Bool("inprogress", false, "show transfer progress")
 	runCmd           = flag.String("exec", "", "runs a command for each connection")
@@ -58,12 +59,21 @@ var (
 	appMux           = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
 	keepAlive        = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
 	punchData        = flag.String("punchdata", "ping\n", "UDP punch payload")
+	autoP2P          = flag.String("p2p", "", "UID-A:UID-B")
+	MQTTServer       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883", "MQTT server")
 )
+
+func init() {
+	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
+}
 
 func init_TLS() {
 	var err error
-	if *tlsServerMode || *listenMode {
-		if isTLSEnabled() {
+	if isTLSEnabled() {
+		if *listenMode || *kcpSEnabled {
+			*tlsServerMode = true
+		}
+		if *tlsServerMode {
 			fmt.Fprintf(os.Stderr, "Generating certificate...\n")
 			tls_cert, err = misc.GenerateCertificate(*tlsSNI)
 			if err != nil {
@@ -118,7 +128,7 @@ func do_TLS(conn net.Conn) net.Conn {
 	}
 	// 使用 TLS 握手
 	var conn_tls *tls.Conn
-	if *listenMode || *tlsServerMode {
+	if *tlsServerMode {
 		tlsConfig.Certificates = []tls.Certificate{*tls_cert}
 		conn_tls = tls.Server(conn, tlsConfig)
 	} else {
@@ -151,7 +161,7 @@ func do_DTLS(conn net.Conn) net.Conn {
 	// DTLS Server / Client 模式
 	var dtlsConn *dtls.Conn
 	var err error
-	if *listenMode || *tlsServerMode {
+	if *tlsServerMode {
 		dtlsConfig.Certificates = []tls.Certificate{*tls_cert}
 		dtlsConn, err = dtls.Server(conn, dtlsConfig)
 	} else {
@@ -218,12 +228,13 @@ func showProgress(stats_in, stats_out *misc.ProgressStats) *time.Ticker {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.2")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.3")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 }
 
 func main() {
+	var err error
 
 	flag.Parse()
 
@@ -232,25 +243,6 @@ func main() {
 		return
 	}
 
-	// 获取目标地址和端口
-	host := ""
-	port := ""
-	args := flag.Args()
-	if len(args) == 2 {
-		host = args[0]
-		port = args[1]
-		if *tlsSNI == "" {
-			*tlsSNI = host
-		}
-	} else if len(args) == 1 && *listenMode {
-		port = args[0]
-		if *tlsSNI == "" {
-			*tlsSNI = "localhost"
-		}
-	} else {
-		usage()
-		os.Exit(1)
-	}
 	if *sendfile != "" && *runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-sendfile and -exec cannot be used together\n")
 		os.Exit(1)
@@ -271,17 +263,78 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-bind and -l cannot be used together\n")
 		os.Exit(1)
 	}
-	if *kcpEnabled {
+	if *kcpEnabled || *kcpSEnabled {
 		*udpProtocol = true
 	}
 
-	var err error
+	var conn net.Conn
+	var network string
+	if *udpProtocol {
+		network = "udp"
+	} else {
+		network = "tcp"
+	}
+
+	host := ""
+	port := ""
+	args := flag.Args()
+	if len(args) == 2 {
+		host = args[0]
+		port = args[1]
+	} else if len(args) == 1 && *listenMode {
+		port = args[0]
+	} else if len(args) == 0 && *remoteAddr != "" {
+		host, port, err = net.SplitHostPort(*remoteAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", *remoteAddr, err)
+			os.Exit(1)
+		}
+	} else if len(args) == 0 && *autoP2P != "" {
+		authParts := strings.SplitN(*autoP2P, ":", 2)
+		if len(authParts) != 2 {
+			fmt.Fprintf(os.Stderr, "Invalid p2p format. Expected UID-A:UID-B\n")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Exchanging NAT address info via MQTT...\n")
+		p2pInfo, err := misc.Do_autoP2P(network, authParts[0], authParts[1], *turnServer, *MQTTServer, 15*time.Second, true)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "p2p failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "P2P: LLAN: %s, LNAT: %s, RLAN: %s, RNAT: %s\n", p2pInfo.LocalLAN, p2pInfo.LocalNAT, p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
+
+		sameNAT, similarLAN := misc.CompareP2PAddresses(p2pInfo)
+		if sameNAT && similarLAN {
+			//应该在一个内网，用对方内网地址去连接
+			host, port, err = net.SplitHostPort(p2pInfo.RemoteLAN)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", p2pInfo.RemoteLAN, err)
+				os.Exit(1)
+			}
+		} else {
+			//用对方公网地址去连接
+			host, port, err = net.SplitHostPort(p2pInfo.RemoteNAT)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", p2pInfo.RemoteNAT, err)
+				os.Exit(1)
+			}
+		}
+		*localbind = p2pInfo.LocalLAN
+	} else {
+		usage()
+		os.Exit(1)
+	}
+
+	if *tlsSNI == "" {
+		if *listenMode {
+			*tlsSNI = "localhost"
+		} else {
+			*tlsSNI = host
+		}
+	}
 
 	init_TLS()
-
 	dialer := createDialer()
-
-	var conn net.Conn
 
 	if *listenMode {
 		// 监听模式
@@ -295,7 +348,7 @@ func main() {
 			}
 
 			if *useTurn {
-				err = getPublicIP("udp", addr.String(), 3*time.Second)
+				err = ShowPublicIP("udp", addr.String())
 				if err != nil {
 					panic(err)
 				}
@@ -346,7 +399,7 @@ func main() {
 			}
 			fmt.Fprintf(os.Stderr, "Listening TCP on %s\n", listener.Addr().String())
 			if *useTurn {
-				err = getPublicIP("tcp", listener.Addr().String(), 3*time.Second)
+				err = ShowPublicIP("tcp", listener.Addr().String())
 				if err != nil {
 					panic(err)
 				}
@@ -417,12 +470,6 @@ func main() {
 	} else {
 		//主动连接模式
 		var localAddr net.Addr
-		var network string
-		if *udpProtocol {
-			network = "udp"
-		} else {
-			network = "tcp"
-		}
 
 		if *localbind != "" {
 			if *udpProtocol {
@@ -439,7 +486,7 @@ func main() {
 			if *localbind == "" {
 				panic("-turn need be with -bind while connecting")
 			}
-			err = getPublicIP(network, localAddr.String(), 3*time.Second)
+			err = ShowPublicIP(network, localAddr.String())
 			if err != nil {
 				panic(err)
 			}
@@ -648,8 +695,10 @@ type closeWriter interface {
 
 func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	defer conn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	configKeepalive(conn)
+	configTCPKeepalive(conn)
 
 	// 如果启用 TLS，进行 TLS 握手
 	if isTLSEnabled() {
@@ -670,8 +719,8 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		}
 	}
 
-	if *kcpEnabled {
-		sess_kcp := do_KCP(conn)
+	if *kcpEnabled || *kcpSEnabled {
+		sess_kcp := do_KCP(ctx, conn, 30*time.Second)
 		if sess_kcp == nil {
 			return
 		}
@@ -811,87 +860,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	}
 }
 
-func getPublicIP(network, bind string, timeout time.Duration) (err error) {
-
-	var laddr net.Addr
-
-	switch network {
-	case "tcp":
-		laddr, err = net.ResolveTCPAddr("tcp", bind)
-		if err != nil {
-			return fmt.Errorf("resolve local tcp addr failed: %v", err)
-		}
-	case "udp":
-		laddr, err = net.ResolveUDPAddr("udp", bind)
-		if err != nil {
-			return fmt.Errorf("resolve local udp addr failed: %v", err)
-		}
-	default:
-		return fmt.Errorf("unsupported network: %s", network)
-	}
-
-	d := &net.Dialer{
-		LocalAddr: laddr,
-		Timeout:   timeout,
-	}
-
-	switch network {
-	case "tcp":
-		d.Control = misc.ControlTCP
-	case "udp":
-		d.Control = misc.ControlUDP
-	}
-
-	conn, err := d.Dial(network, *turnServer)
-	if err != nil {
-		return fmt.Errorf("STUN dial failed: %v", err)
-	}
-
-	c, err := stun.NewClient(conn)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("STUN NewClient failed: %v", err)
-	}
-
-	message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-	var xorAddr stun.XORMappedAddress
-	var err2 error
-	if err := c.Do(message, func(res stun.Event) {
-		if res.Error != nil {
-			err2 = fmt.Errorf("STUN error: %v", res.Error)
-			return
-		}
-		// 解析XOR-MAPPED-ADDRESS属性
-		if err := xorAddr.GetFrom(res.Message); err != nil {
-			err2 = fmt.Errorf("failed to get XOR-MAPPED-ADDRESS: %v", err)
-			return
-		}
-	}); err != nil {
-		return fmt.Errorf("STUN Do failed: %v", err)
-	}
-	if err2 != nil {
-		return err2
-	}
-
-	//fmt.Fprintf(os.Stderr, "Local  Address: %s\n", conn.LocalAddr().String())
-	fmt.Fprintf(os.Stderr, "Public Address: %s\n", xorAddr.String())
-
-	//tcp不关闭连接，保持连接有助于NAT穿透，如果有连接关闭了可能NAT打开的洞也关闭
-	if network == "tcp" {
-		go func() {
-			buf := make([]byte, 1)
-			_, _ = conn.Read(buf)
-			c.Close()
-		}()
-	} else {
-		c.Close()
-	}
-
-	return nil
-}
-
-func configKeepalive(conn net.Conn) {
+func configTCPKeepalive(conn net.Conn) {
 	if *keepAlive > 0 {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			ka := net.KeepAliveConfig{
@@ -929,7 +898,7 @@ func createKCPBlockCrypt(passphrase string, salt []byte) (kcp.BlockCrypt, error)
 	return blockCrypt, nil
 }
 
-func do_KCP(conn net.Conn) net.Conn {
+func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn {
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
@@ -942,41 +911,120 @@ func do_KCP(conn net.Conn) net.Conn {
 		}
 	}
 
+	// 通知keepalive调整间隔
+	intervalChange := make(chan time.Duration, 1)
+
+	// 启动 keepalive
+	startUDPKeepAlive(ctx, conn, []byte(*punchData), 2*time.Second, intervalChange)
+
 	pktconn := misc.NewPacketConnWrapper(conn, conn.RemoteAddr())
-	if *listenMode {
+	if *listenMode || *kcpSEnabled {
 		listener, err := kcp.ServeConn(blockCrypt, 10, 3, pktconn)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "kcp ServeConn failed: %v\n", err)
 			return nil
 		}
 
-		sess, err = listener.AcceptKCP()
-		if err != nil {
+		fmt.Fprintf(os.Stderr, "Waiting for a KCP session...\n")
+
+		sessChan := make(chan *kcp.UDPSession, 1)
+		errChan := make(chan error, 1)
+
+		go func() {
+			s, e := listener.AcceptKCP()
+			if e != nil {
+				errChan <- e
+				return
+			}
+			sessChan <- s
+		}()
+
+		select {
+		case sess = <-sessChan:
+		case err = <-errChan:
 			fmt.Fprintf(os.Stderr, "AcceptKCP failed: %v\n", err)
 			return nil
-		}
-		buf := make([]byte, 1)
-		n, err := sess.Read(buf)
-		if err != nil || n != 1 || buf[0] != '\n' {
-			fmt.Fprintf(os.Stderr, "kcp NewConn Handshake failed: %v\n", err)
+		case <-time.After(timeout):
+			fmt.Fprintf(os.Stderr, "AcceptKCP timeout\n")
 			return nil
 		}
-
-		fmt.Fprintf(os.Stderr, "New KCP connection from %s\n", sess.RemoteAddr())
 	} else {
 		sess, err = kcp.NewConn(conn.RemoteAddr().String(), blockCrypt, 10, 3, pktconn)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "kcp NewConn failed: %v\n", err)
 			return nil
 		}
-		_, err := sess.Write([]byte("\n"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "kcp NewConn Handshake failed: %v\n", err)
-			return nil
-		}
 	}
+
+	// 简单握手
+	handshake := []byte("HELLO")
+	_, err = sess.Write(handshake)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kcp Handshake send failed: %v\n", err)
+		return nil
+	}
+
+	// 设置20秒超时
+	sess.SetReadDeadline(time.Now().Add(timeout))
+
+	buf := make([]byte, len(handshake))
+	n, err := io.ReadFull(sess, buf)
+	if err != nil || n != len(handshake) || !bytes.Equal(buf, handshake) {
+		fmt.Fprintf(os.Stderr, "kcp Handshake recv failed: %v\n", err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "KCP session Established with %s\n", sess.RemoteAddr())
+
+	// 取消超时（恢复成无超时）
+	sess.SetReadDeadline(time.Time{})
+
+	// 告诉keep alive协程，把间隔调成15秒
+	select {
+	case intervalChange <- 15 * time.Second:
+	default:
+	}
+
 	sess.SetNoDelay(1, 10, 2, 1)
 	sess.SetWindowSize(512, 512)
 	sess.SetMtu(1400)
+
 	return sess
+}
+
+func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInterval time.Duration, intervalChange <-chan time.Duration) {
+	go func() {
+		keepAliveInterval := initInterval
+		ticker := time.NewTicker(keepAliveInterval)
+		defer ticker.Stop()
+
+		// 立即发送一次
+		if _, err := conn.Write(data); err != nil {
+			fmt.Fprintf(os.Stderr, "initial keepAlive Write failed: %v, will retry on ticker\n", err)
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case newInterval := <-intervalChange:
+				ticker.Stop()
+				keepAliveInterval = newInterval
+				ticker = time.NewTicker(keepAliveInterval)
+			case <-ticker.C:
+				if _, err := conn.Write(data); err != nil {
+					fmt.Fprintf(os.Stderr, "keepAlive Write failed: %v\n", err)
+					// 不退出，继续重试
+				}
+			}
+		}
+	}()
+}
+
+func ShowPublicIP(network, bind string) error {
+	_, nata, err := misc.GetPublicIP(network, bind, *turnServer, 3*time.Second)
+	if err == nil {
+		fmt.Fprintf(os.Stderr, "Public Address: %s\n", nata)
+	}
+
+	return err
 }

@@ -1,19 +1,27 @@
 ## go-netcat 简介
 
-golang版 netcat,有以下特点：
+golang版 netcat, 更方便的建立点对点通信。
 
-   - -exec结合-keep-open可为实现每个连接提供指定服务程序，-exec执行的程序将基于stdio管道提供服务。如果是/bin/sh这种shell程序，还可以加上-pty启用pseudo-terminal模式
-   - 控制台输入支持raw模式，特别是获得shell的操作时支持TAB、ctrl+c等输入
-   - 引入了cloudflare的turn服务探测公网地址，-turn方便查看自身地址经过NAT后的公网地址
-   - TCP/UDP两种都很方便实现内网对内网的穿透NAT建立点对点的通信，用-peer参数可方便NAT打洞
-   - 引入KCP方便建立稳定传输的UDP通道
-   - 自身可作为-exec的服务程序，然后基于多路复用隧道的功能提供流量转发或socks5代理
-   - TLS/DTLS针对TCP/UDP都支持
-   - 支持针对发送或接收统计传输速度
+有以下特点：
+
+ - 🔁 自动化内网穿透：使用 -p2p 自动实现 TCP/UDP 的 NAT 打洞与点对点连接，无需手动配置，依赖公共 TURN 和 MQTT 服务交换地址信息。
+
+ - 🚀 UDP 稳定传输通道：集成 KCP 协议，TCP无法穿透NAT的情况，用基于UDP的KCP也能保持通信的可靠性。
+
+ - 🔒 加密支持：支持 TCP 的 TLS 和 UDP 的 DTLS 加密传输。
+
+ - 🧩 可嵌入服务程序：通过 -exec 将工具作为子服务启动，结合多路复用能力，支持流量转发、Socks5 代理等场景。
+
+ - 🖥️ 伪终端支持：配合 -exec 和 -pty，为类似 /bin/sh 的交互式程序提供伪终端环境，增强 shell 控制体验（支持 TAB、Ctrl+C 等）。
+
+ - 💻 原始输入模式：-pty 启用控制台 raw 模式，在获取 shell 时提供更贴近原生终端的操作体验。
+
+ - 📈 实时速度统计：提供发送与接收方向的实时速度统计，便于测试传输性能。
+
 
 ## 使用方法
 ```
-Usage of ./gonc:
+Usage of gonc:
   -C    enable CRLF
   -app-mux
         a Stream Multiplexing based proxy app
@@ -27,11 +35,17 @@ Usage of ./gonc:
         show transfer progress
   -kcp
         use UDP+KCP protocol, -u can be omitted
+  -kcps
+        kcp server mode
   -keep-open
         keep listening after client disconnects
   -keepalive int
         none 0 will enable TCP keepalive feature
   -l    listen mode
+  -local string
+        ip:port (alias for -bind)
+  -mqttsrv string
+        MQTT server (default "tcp://broker.hivemq.com:1883")
   -mux-address string
         host:port (for connect or listen mode)
   -mux-engine string
@@ -40,12 +54,16 @@ Usage of ./gonc:
         connect | listen | stdio (default "stdio")
   -outprogress
         show transfer progress
+  -p2p string
+        UID-A:UID-B
   -peer string
         peer address to connect, will send a ping/SYN for NAT punching
   -pty
         <-exec> will run in a pseudo-terminal, and put the terminal into raw mode
   -punchdata string
         UDP punch payload (default "ping\n")
+  -remote string
+        host:port
   -s5 string
         ip:port (SOCKS5 proxy)
   -sendfile string
@@ -71,9 +89,34 @@ Usage of ./gonc:
   -turnsrv string
         turn server (default "turn.cloudflare.com:3478")
   -u    use UDP protocol
+
 ```
 
 ## 例子
+
+- 这个工具可以像nc那样用，例如
+
+    `gonc.exe www.baidu.com 80`
+
+    `gonc.exe -tls www.baidu.com 443`
+
+
+- 用TCP直接在两个内网P2P通信，要自己约定两个唯一ID，例如randomA和randomB，每次用都随机换ID避免和别人一样。
+
+    `gonc.exe -tlsserver -p2p randomA:randomB`
+
+    另一端用
+
+    `gonc.exe -tls -p2p randomB:randomA`
+
+- 由于TCP穿透NAT不如UDP成功率高，可以基于UDP的KCP协议实现通信，这样建立的是可靠传输的UDP
+
+    `gonc.exe -kcps -p2p randomA:randomB`
+
+    另一端用
+
+    `gonc.exe -kcp -p2p randomB:randomA`
+
 
 - 支持使用socks5代理
 
@@ -116,3 +159,11 @@ Usage of ./gonc:
     另一端用
 
     `gonc.exe -l 1234 > NUL`
+
+- 建立P2P隧道并提供socks5代理
+
+    `gonc.exe -tlsserver -p2p randomA:randomB -exec ". -app-mux socks5"`
+
+    另一端(本机开socks5端口)
+
+    `gonc.exe -tls -p2p randomB:randomA -exec ". -app-mux -l 1080"`

@@ -225,7 +225,7 @@ func mux_main() {
 		os.Exit(1)
 	}
 
-	configKeepalive(sessionConn)
+	configTCPKeepalive(sessionConn)
 	if isTLSEnabled() {
 		conn_tls := do_TLS(sessionConn)
 		if conn_tls == nil {
@@ -260,7 +260,7 @@ func mux_main() {
 		if err != nil {
 			log.Fatalf("listen failed: %v", err)
 		}
-		fmt.Fprintln(os.Stderr, "Listening on ", ln.Addr().String())
+		fmt.Fprintln(os.Stderr, "Listening on", ln.Addr().String())
 
 		go func() {
 			for {
