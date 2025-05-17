@@ -27,9 +27,18 @@ func (b *BoundUDPConn) Write(p []byte) (int, error) {
 	return b.conn.WriteToUDP(p, b.remoteAddr)
 }
 
-// Read 直接读取数据
+// Read 读取来自remoteAddr的数据
 func (b *BoundUDPConn) Read(p []byte) (int, error) {
-	return b.conn.Read(p)
+	for {
+		n, addr, err := b.conn.ReadFromUDP(p)
+		if err != nil {
+			return 0, err
+		}
+		if addr.IP.Equal(b.remoteAddr.IP) && addr.Port == b.remoteAddr.Port {
+			return n, nil
+		}
+		// 否则丢弃该数据包，继续读取
+	}
 }
 
 // Close 关闭底层连接

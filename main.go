@@ -20,7 +20,7 @@ import (
 	"gonc/misc"
 	"gonc/pty"
 
-	"github.com/pion/dtls/v2"
+	"github.com/pion/dtls/v3"
 	"github.com/xtaci/kcp-go/v5"
 	"golang.org/x/net/proxy"
 	"golang.org/x/term"
@@ -144,6 +144,9 @@ func do_TLS(conn net.Conn) net.Conn {
 }
 
 func do_DTLS(conn net.Conn) net.Conn {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
 	allCiphers := []dtls.CipherSuiteID{
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -161,13 +164,25 @@ func do_DTLS(conn net.Conn) net.Conn {
 	// DTLS Server / Client 模式
 	var dtlsConn *dtls.Conn
 	var err error
+
+	pktconn := misc.NewPacketConnWrapper(conn, conn.RemoteAddr())
+
+	intervalChange := make(chan time.Duration, 1)
+	// 开启NAT打洞
+	startUDPKeepAlive(ctx, conn, []byte(*punchData), 2*time.Second, intervalChange)
+
 	if *tlsServerMode {
 		dtlsConfig.Certificates = []tls.Certificate{*tls_cert}
-		dtlsConn, err = dtls.Server(conn, dtlsConfig)
+		dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
 	} else {
-		dtlsConn, err = dtls.Client(conn, dtlsConfig)
+		dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
 	}
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "DTLS Handshake failed: %v\n", err)
+		return nil
+	}
+
+	if err = dtlsConn.Handshake(); err != nil {
 		fmt.Fprintf(os.Stderr, "DTLS Handshake failed: %v\n", err)
 		return nil
 	}
@@ -228,14 +243,14 @@ func showProgress(stats_in, stats_out *misc.ProgressStats) *time.Ticker {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.3")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.4")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
+	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
 
 func main() {
 	var err error
-
 	flag.Parse()
 
 	if *appMux {
@@ -496,7 +511,7 @@ func main() {
 			// Unix域套接字
 			conn, err = net.Dial("unix", host)
 		} else {
-			// TCP连接
+			// TCP/UDP 连接
 			if localAddr == nil {
 				conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
 			} else {
@@ -536,54 +551,9 @@ func main() {
 	}
 }
 
-// 发送文件并输出传输速度
-func sendFile(filepath string, conn net.Conn, stats *misc.ProgressStats) {
-	var file io.ReadCloser
-	var err, err1 error
-	var n int
-	if filepath == "/dev/zero" || filepath == "/dev/urandom" {
-		file, err = misc.NewPseudoDevice(filepath)
-	} else {
-		file, err = os.Open(filepath)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
-		os.Exit(1)
-	}
-	defer file.Close()
-
-	// 使用自定义复制函数以便更新统计信息
-	var bufsize = 32 * 1024
-	if conn.LocalAddr().Network() == "udp" {
-		bufsize = 1320
-	}
-	buf := make([]byte, bufsize)
-	for {
-		n, err1 = file.Read(buf)
-		if err1 != nil && err1 != io.EOF {
-			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err1)
-			break
-		}
-		if n == 0 {
-			break
-		}
-
-		_, err = conn.Write(buf[:n])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error sending data: %v\n", err)
-			break
-		}
-
-		stats.Update(int64(n))
-		if err1 == io.EOF {
-			break
-		}
-	}
-}
-
 // 新增的copyWithProgress函数用于在数据传输时显示进度
-func copyWithProgress(dst io.Writer, src io.Reader, stats *misc.ProgressStats) {
-	buf := make([]byte, 32*1024)
+func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, stats *misc.ProgressStats) {
+	buf := make([]byte, blocksize)
 	var n int
 	var err, err1 error
 	for {
@@ -623,21 +593,24 @@ func copyCharDeviceWithProgress(dst io.Writer, src io.Reader, stats *misc.Progre
 			break
 		}
 
-		// 注意：line读到的可能是 "\r\n" 或 "\n"，都要统一处理
-		line = strings.TrimRight(line, "\r\n") // 去掉任何结尾的 \r 或 \n
-		if *enableCRLF {
-			line += "\r\n" // 统一加上 CRLF
-		} else {
-			line += "\n"
+		if len(line) > 0 {
+			if line[len(line)-1] == '\n' {
+				// 注意：line读到的可能是 "\r\n" 或 "\n"，都要统一处理
+				line = strings.TrimRight(line, "\r\n") // 去掉任何结尾的 \r 或 \n
+				if *enableCRLF {
+					line += "\r\n" // 统一加上 CRLF
+				} else {
+					line += "\n"
+				}
+			}
+			n, err = writer.WriteString(line)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
+				break
+			}
+			writer.Flush()
+			stats.Update(int64(n))
 		}
-
-		n, err = writer.WriteString(line)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
-			break
-		}
-		writer.Flush()
-		stats.Update(int64(n))
 
 		if err1 == io.EOF {
 			break
@@ -728,24 +701,43 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		conn = sess_kcp
 	}
 
-	// 如果指定了 sendfile 参数，发送指定的文件
-	if *sendfile != "" {
-		sendFile(*sendfile, conn, stats_out)
-		time.Sleep(1 * time.Second)
-		// 关闭连接
-		if tcpConn, ok := conn.(closeWriter); ok {
-			tcpConn.CloseWrite()
-		} else {
-			conn.Close()
-		}
-		return
-	}
-
 	var input io.Reader
 	var output io.WriteCloser
 	var cmd *exec.Cmd
+	var err error
+	var blocksize int = 32 * 1024
+	if conn.LocalAddr().Network() == "udp" {
+		blocksize = 1320
+	}
 
-	if *runCmd != "" {
+	if *sendfile != "" {
+		// 如果指定了 sendfile 参数，发送指定的文件
+		var file io.ReadCloser
+		if *sendfile == "/dev/zero" || *sendfile == "/dev/urandom" {
+			file, err = misc.NewPseudoDevice(*sendfile)
+		} else {
+			file, err = os.Open(*sendfile)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
+			os.Exit(1)
+		}
+		defer file.Close()
+
+		input = file
+		output = os.Stdout
+
+		go func() {
+			copyWithProgress(conn, input, blocksize, stats_out)
+			time.Sleep(1 * time.Second)
+			// 关闭连接
+			if tcpConn, ok := conn.(closeWriter); ok {
+				tcpConn.CloseWrite()
+			} else {
+				conn.Close()
+			}
+		}()
+	} else if *runCmd != "" {
 		// 分割命令和参数（支持带空格的参数）
 		args, err := parseCommandLine(*runCmd)
 		if err != nil {
@@ -800,7 +792,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		}
 
 		go func() {
-			copyWithProgress(conn, input, stats_out)
+			copyWithProgress(conn, input, blocksize, stats_out)
 			time.Sleep(1 * time.Second)
 			// 关闭连接
 			if tcpConn, ok := conn.(closeWriter); ok {
@@ -825,12 +817,12 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 						return
 					}
 					defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
-					copyWithProgress(conn, input, stats_out)
+					copyWithProgress(conn, input, blocksize, stats_out)
 				} else {
 					copyCharDeviceWithProgress(conn, input, stats_out)
 				}
 			} else {
-				copyWithProgress(conn, input, stats_out)
+				copyWithProgress(conn, input, blocksize, stats_out)
 			}
 
 			time.Sleep(1 * time.Second)
@@ -844,7 +836,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	}
 
 	// 从连接读取并输出到输出
-	copyWithProgress(output, conn, stats_in)
+	copyWithProgress(output, conn, blocksize, stats_in)
 	time.Sleep(1 * time.Second)
 	conn.Close()
 	if *enablePty && output != nil {

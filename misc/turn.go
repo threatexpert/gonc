@@ -306,32 +306,39 @@ func extractIP(addr string) string {
 }
 
 // 判断两个 IP 是否属于同一个 /24 网段（前 3 段相同）
-func isSameLAN(ip1, ip2 string) bool {
+func IsSameLAN(ip1, ip2 string) bool {
+	parsed1 := net.ParseIP(ip1)
+	parsed2 := net.ParseIP(ip2)
+	if parsed1 == nil || parsed2 == nil {
+		return false
+	}
+
+	if parsed1.IsLoopback() || parsed2.IsLoopback() {
+		return false
+	}
+
+	// 检查是否都在私有地址段
+	if parsed1.IsPrivate() && parsed2.IsPrivate() {
+		// 针对常见私网段用合理掩码判断
+		switch {
+		case parsed1[12] == 10 && parsed2[12] == 10:
+			return true // 10.0.0.0/8
+		case parsed1[12] == 172 && parsed2[12] == 172 &&
+			parsed1[13] >= 16 && parsed1[13] <= 31 &&
+			parsed2[13] >= 16 && parsed2[13] <= 31:
+			return parsed1[12] == parsed2[12] && parsed1[13] == parsed2[13]
+		case parsed1[12] == 192 && parsed1[13] == 168 &&
+			parsed2[12] == 192 && parsed2[13] == 168:
+			return parsed1[12] == parsed2[12] && parsed1[13] == parsed2[13]
+		}
+	}
+
 	parts1 := strings.Split(ip1, ".")
 	parts2 := strings.Split(ip2, ".")
 	if len(parts1) != 4 || len(parts2) != 4 {
 		return false
 	}
 	return parts1[0] == parts2[0] && parts1[1] == parts2[1] && parts1[2] == parts2[2]
-}
-
-// 判断是否是私有地址
-func isPrivateIP(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
-	}
-	privateRanges := []net.IPNet{
-		{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)},
-		{IP: net.IPv4(172, 16, 0, 0), Mask: net.CIDRMask(12, 32)},
-		{IP: net.IPv4(192, 168, 0, 0), Mask: net.CIDRMask(16, 32)},
-	}
-	for _, r := range privateRanges {
-		if r.Contains(parsed) {
-			return true
-		}
-	}
-	return false
 }
 
 func CompareP2PAddresses(info *P2PAddressInfo) (sameNATIP bool, similarLAN bool) {
@@ -341,7 +348,6 @@ func CompareP2PAddresses(info *P2PAddressInfo) (sameNATIP bool, similarLAN bool)
 
 	lanIP1 := extractIP(info.LocalLAN)
 	lanIP2 := extractIP(info.RemoteLAN)
-	similarLAN = (isPrivateIP(lanIP1) && isPrivateIP(lanIP2) && isSameLAN(lanIP1, lanIP2))
-
+	similarLAN = IsSameLAN(lanIP1, lanIP2)
 	return
 }
