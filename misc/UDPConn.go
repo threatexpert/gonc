@@ -1,8 +1,11 @@
 package misc
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"syscall"
 	"time"
 )
 
@@ -110,4 +113,19 @@ func (d *PacketConnWrapper) SetReadDeadline(t time.Time) error {
 
 func (d *PacketConnWrapper) SetWriteDeadline(t time.Time) error {
 	return d.conn.SetWriteDeadline(t)
+}
+
+func IsConnRefused(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			return sysErr.Err == syscall.ECONNREFUSED
+		}
+		// 有些系统直接是 syscall.Errno
+		if errno, ok := opErr.Err.(syscall.Errno); ok {
+			return errno == syscall.ECONNREFUSED
+		}
+	}
+	return false
 }

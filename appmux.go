@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"gonc/misc"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ var (
 	muxSessionMode    = flag.String("mux-mode", "stdio", "connect | listen | stdio")
 	muxSessionAddress = flag.String("mux-address", "", "host:port (for connect or listen mode)")
 	muxEngine         = flag.String("mux-engine", "smux", "yamux | smux")
+	httpServeDir      = "."
 )
 
 type stdioConn struct{}
@@ -135,23 +138,29 @@ func mux_usage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "   -app-mux target_host target_port")
 	fmt.Fprintln(os.Stderr, "   -app-mux socks5")
+	fmt.Fprintln(os.Stderr, "   -app-mux httpserver <rootDir>")
 	fmt.Fprintln(os.Stderr, "   -app-mux -l listen_port")
 }
 
 func mux_main() {
-	proxyMode := ""
+	appMode := ""
 	host := ""
 	port := ""
 	args := flag.Args()
-	if len(args) == 2 {
+	if len(args) == 1 && *listenMode {
+		port = args[0]
+		appMode = "listen"
+	} else if len(args) == 1 && args[0] == "socks5" {
+		appMode = "socks5"
+	} else if len(args) >= 1 && args[0] == "httpserver" {
+		appMode = "httpserver"
+		if len(args) > 1 {
+			httpServeDir = args[1]
+		}
+	} else if len(args) == 2 {
 		host = args[0]
 		port = args[1]
-		proxyMode = "forward"
-	} else if len(args) == 1 && *listenMode {
-		port = args[0]
-		proxyMode = "listen"
-	} else if len(args) == 1 && args[0] == "socks5" {
-		proxyMode = "socks5"
+		appMode = "forward"
 	} else {
 		mux_usage()
 		os.Exit(1)
@@ -235,7 +244,19 @@ func mux_main() {
 		sessionConn = conn_tls
 	}
 
-	if proxyMode == "listen" {
+	if appMode == "listen" {
+		fmt.Fprintln(os.Stderr, "Waiting for app-mux handshake...")
+		hello := make([]byte, 16)
+		if _, err := io.ReadFull(sessionConn, hello); err != nil {
+			fmt.Fprintf(os.Stderr, "mux read hello failed: %v\n", err)
+			os.Exit(1)
+		}
+		peer_mode := string(bytes.TrimRight(hello, "\x00"))
+		if peer_mode != "socks5" && peer_mode != "forward" && peer_mode != "httpserver" {
+			fmt.Fprintf(os.Stderr, "invalid peer mode: %q\n", peer_mode)
+			os.Exit(1)
+		}
+
 		var session interface{}
 		switch *muxEngine {
 		case "yamux":
@@ -260,7 +281,21 @@ func mux_main() {
 		if err != nil {
 			log.Fatalf("listen failed: %v", err)
 		}
-		fmt.Fprintln(os.Stderr, "Listening on", ln.Addr().String())
+
+		if peer_mode == "socks5" {
+			fmt.Fprintln(os.Stderr, "[socks5] Listening on", ln.Addr().String())
+		} else if peer_mode == "forward" {
+			fmt.Fprintln(os.Stderr, "[forward] Listening on", ln.Addr().String())
+		} else if peer_mode == "httpserver" {
+			addr := ln.Addr().String()
+			fmt.Fprintf(os.Stderr, "[httpserver] Serving files at %s\n", addr)
+			// 提示用户如何访问
+			_, port, _ := net.SplitHostPort(addr)
+			fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser to browse or download files.\n", port)
+		} else {
+			fmt.Fprintf(os.Stderr, "invalid peer mode: %q\n", peer_mode)
+			os.Exit(1)
+		}
 
 		go func() {
 			for {
@@ -298,6 +333,14 @@ func mux_main() {
 		}
 
 	} else {
+		hello := make([]byte, 16)
+		copy(hello, appMode)
+		_, err = sessionConn.Write(hello)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mux write hello failed: %v\n", err)
+			os.Exit(1)
+		}
+
 		var session interface{}
 		switch *muxEngine {
 		case "yamux":
@@ -313,7 +356,7 @@ func mux_main() {
 			os.Exit(1)
 		}
 
-		if proxyMode == "forward" {
+		if appMode == "forward" {
 			for {
 				var stream io.ReadWriteCloser
 				switch s := session.(type) {
@@ -340,7 +383,7 @@ func mux_main() {
 					handleProxy(s, targetConn)
 				}(wrappedStream)
 			}
-		} else if proxyMode == "socks5" {
+		} else if appMode == "socks5" {
 			logger := log.New(os.Stderr, "[socks5] ", log.LstdFlags)
 			conf := &socks5.Config{Logger: logger}
 			server, err := socks5.New(conf)
@@ -350,6 +393,34 @@ func mux_main() {
 			}
 			fmt.Fprintln(os.Stderr, "SOCKS5 ready on mux")
 			server.Serve(&muxListener{session})
+		} else if appMode == "httpserver" {
+			handler := createHTTPHandler(httpServeDir)
+
+			for {
+				var stream io.ReadWriteCloser
+				switch s := session.(type) {
+				case *yamux.Session:
+					stream, err = s.Accept()
+				case *smux.Session:
+					stream, err = s.Accept()
+				default:
+					err = fmt.Errorf("unknown mux session type")
+				}
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Accept mux stream failed:", err)
+					break
+				}
+				wrappedStream := &streamWrapper{ReadWriteCloser: stream}
+
+				go func(conn net.Conn) {
+					defer conn.Close()
+					listener := &singleConnListener{
+						conn: conn,
+						done: make(chan struct{}),
+					}
+					_ = http.Serve(listener, handler)
+				}(wrappedStream)
+			}
 		}
 	}
 }
@@ -363,4 +434,34 @@ func isSessionClosed(session interface{}) bool {
 	default:
 		return true
 	}
+}
+
+type singleConnListener struct {
+	conn net.Conn
+	done chan struct{}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	if l.conn != nil {
+		c := l.conn
+		l.conn = nil
+		return c, nil
+	}
+	<-l.done
+	return nil, fmt.Errorf("listener closed")
+}
+
+func (l *singleConnListener) Close() error {
+	close(l.done)
+	return nil
+}
+
+func (l *singleConnListener) Addr() net.Addr {
+	return dummyAddr("stream")
+}
+
+// rootDir 是你希望暴露的目录，比如 "./public"
+func createHTTPHandler(rootDir string) http.Handler {
+	fs := http.FileServer(http.Dir(rootDir))
+	return http.StripPrefix("/", fs)
 }

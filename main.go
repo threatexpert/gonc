@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -27,40 +28,43 @@ import (
 )
 
 var (
-	tls_cert *tls.Certificate = nil
+	tls_cert         *tls.Certificate = nil
+	sessionReady                      = false
+	sessionSharedKey []byte           = nil
 	// 定义命令行参数
-	socks5Addr       = flag.String("s5", "", "ip:port (SOCKS5 proxy)")
-	auth             = flag.String("auth", "", "user:password for SOCKS5 proxy; preshared key for kcp")
-	sendfile         = flag.String("sendfile", "", "path to file to send (optional)")
-	tlsEnabled       = flag.Bool("tls", false, "Enable TLS connection")
-	tlsServerMode    = flag.Bool("tlsserver", false, "force as TLS server while connecting")
-	tls10_forced     = flag.Bool("tls10", false, "force negotiation to specify TLS version")
-	tls11_forced     = flag.Bool("tls11", false, "force negotiation to specify TLS version")
-	tls12_forced     = flag.Bool("tls12", false, "force negotiation to specify TLS version")
-	tls13_forced     = flag.Bool("tls13", false, "force negotiation to specify TLS version")
-	tlsSNI           = flag.String("sni", "", "specify TLS SNI")
-	enableCRLF       = flag.Bool("C", false, "enable CRLF")
-	listenMode       = flag.Bool("l", false, "listen mode")
-	udpProtocol      = flag.Bool("u", false, "use UDP protocol")
-	kcpEnabled       = flag.Bool("kcp", false, "use UDP+KCP protocol, -u can be omitted")
-	kcpSEnabled      = flag.Bool("kcps", false, "kcp server mode")
-	localbind        = flag.String("bind", "", "ip:port")
-	remoteAddr       = flag.String("remote", "", "host:port")
-	showSendProgress = flag.Bool("outprogress", false, "show transfer progress")
-	showRecvProgress = flag.Bool("inprogress", false, "show transfer progress")
-	runCmd           = flag.String("exec", "", "runs a command for each connection")
-	mergeStderr      = flag.Bool("stderr", false, "when -exec, Merge stderr into stdout ")
-	keepOpen         = flag.Bool("keep-open", false, "keep listening after client disconnects")
-	enablePty        = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
-	term_oldstat     *term.State
-	useTurn          = flag.Bool("turn", false, "use STUN to discover public IP")
-	turnServer       = flag.String("turnsrv", "turn.cloudflare.com:3478", "turn server")
-	peer             = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
-	appMux           = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
-	keepAlive        = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
-	punchData        = flag.String("punchdata", "ping\n", "UDP punch payload")
-	autoP2P          = flag.String("p2p", "", "UID-A:UID-B")
-	MQTTServer       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883", "MQTT server")
+	socks5Addr      = flag.String("s5", "", "ip:port (SOCKS5 proxy)")
+	auth            = flag.String("auth", "", "user:password for SOCKS5 proxy; preshared key for kcp")
+	sendfile        = flag.String("sendfile", "", "path to file to send (optional)")
+	tlsEnabled      = flag.Bool("tls", false, "Enable TLS connection")
+	tlsServerMode   = flag.Bool("tlsserver", false, "force as TLS server while connecting")
+	tls10_forced    = flag.Bool("tls10", false, "force negotiation to specify TLS version")
+	tls11_forced    = flag.Bool("tls11", false, "force negotiation to specify TLS version")
+	tls12_forced    = flag.Bool("tls12", false, "force negotiation to specify TLS version")
+	tls13_forced    = flag.Bool("tls13", false, "force negotiation to specify TLS version")
+	tlsSNI          = flag.String("sni", "", "specify TLS SNI")
+	enableCRLF      = flag.Bool("C", false, "enable CRLF")
+	listenMode      = flag.Bool("l", false, "listen mode")
+	udpProtocol     = flag.Bool("u", false, "use UDP protocol")
+	kcpEnabled      = flag.Bool("kcp", false, "use UDP+KCP protocol, -u can be omitted")
+	kcpSEnabled     = flag.Bool("kcps", false, "kcp server mode")
+	localbind       = flag.String("bind", "", "ip:port")
+	remoteAddr      = flag.String("remote", "", "host:port")
+	progressEnabled = flag.Bool("progress", false, "show transfer progress")
+	runCmd          = flag.String("exec", "", "runs a command for each connection")
+	mergeStderr     = flag.Bool("stderr", false, "when -exec, Merge stderr into stdout ")
+	keepOpen        = flag.Bool("keep-open", false, "keep listening after client disconnects")
+	enablePty       = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
+	term_oldstat    *term.State
+	useTurn         = flag.Bool("turn", false, "use STUN to discover public IP")
+	turnServer      = flag.String("turnsrv", "turn.cloudflare.com:3478", "turn server, others: stunserver2025.stunprotocol.org:3478 ; stun.l.google.com:19302 (UDP only)")
+	peer            = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
+	appMux          = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
+	keepAlive       = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
+	punchData       = flag.String("punchdata", "ping\n", "UDP punch payload")
+	MQTTServer      = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883", "MQTT server, others: tcp://broker.emqx.io:1883 ; tcp://test.mosquitto.org:1883")
+	autoP2P         = flag.String("p2p", "", "sessionUID")
+	autoP2PKCP      = flag.String("p2p-kcp", "", "sessionUID, kcp over udp, will be retried up to 3 times upon failure.")
+	autoP2PTCP      = flag.String("p2p-tcp", "", "sessionUID, tcp, will be retried up to 3 times upon failure.")
 )
 
 func init() {
@@ -129,17 +133,19 @@ func do_TLS(conn net.Conn) net.Conn {
 	// 使用 TLS 握手
 	var conn_tls *tls.Conn
 	if *tlsServerMode {
+		fmt.Fprintf(os.Stderr, "Performing TLS-S handshake...")
 		tlsConfig.Certificates = []tls.Certificate{*tls_cert}
 		conn_tls = tls.Server(conn, tlsConfig)
 	} else {
+		fmt.Fprintf(os.Stderr, "Performing TLS-C handshake...")
 		tlsConfig.ServerName = *tlsSNI
 		conn_tls = tls.Client(conn, tlsConfig)
 	}
 	if err := conn_tls.Handshake(); err != nil {
-		fmt.Fprintf(os.Stderr, "TLS Handshake failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed: %v\n", err)
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "TLS Handshake completed.\n")
+	fmt.Fprintf(os.Stderr, "completed.\n")
 	return conn_tls
 }
 
@@ -159,6 +165,7 @@ func do_DTLS(conn net.Conn) net.Conn {
 		CipherSuites:         allCiphers,
 		InsecureSkipVerify:   true, // 和 tls.Config 一样，跳过证书校验
 		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		FlightInterval:       2 * time.Second,
 	}
 
 	// DTLS Server / Client 模式
@@ -168,26 +175,49 @@ func do_DTLS(conn net.Conn) net.Conn {
 	pktconn := misc.NewPacketConnWrapper(conn, conn.RemoteAddr())
 
 	intervalChange := make(chan time.Duration, 1)
-	// 开启NAT打洞
-	startUDPKeepAlive(ctx, conn, []byte(*punchData), 2*time.Second, intervalChange)
+	// 开启NAT打洞， 首包是4秒后发出punch包
+	startUDPKeepAlive(ctx, conn, []byte(*punchData), 4*time.Second, intervalChange)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	firstRefusedLogged := false
 
 	if *tlsServerMode {
-		dtlsConfig.Certificates = []tls.Certificate{*tls_cert}
-		dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
+		fmt.Fprintf(os.Stderr, "Performing DTLS-S handshake...")
 	} else {
-		dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
+		fmt.Fprintf(os.Stderr, "Performing DTLS-C handshake...")
 	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "DTLS Handshake failed: %v\n", err)
-		return nil
+	for {
+		if *tlsServerMode {
+			dtlsConfig.Certificates = []tls.Certificate{*tls_cert}
+			//dtls.Server 不会主动发包，startUDPKeepAlive4秒后发出punch包有助于P2P建立通信
+			dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
+		} else {
+			//dtls.Client 会立刻发出hello包，dtls.Server
+			dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
+		}
+		if err != nil && !misc.IsConnRefused(err) {
+			fmt.Fprintf(os.Stderr, "failed: %v\n", err)
+			return nil
+		}
+
+		if err = dtlsConn.Handshake(); err != nil {
+			if misc.IsConnRefused(err) {
+				if !firstRefusedLogged {
+					fmt.Fprintf(os.Stderr, "(ECONNREFUSED)...")
+					firstRefusedLogged = true
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "failed: %v\n", err)
+			return nil
+		}
+		break
 	}
 
-	if err = dtlsConn.Handshake(); err != nil {
-		fmt.Fprintf(os.Stderr, "DTLS Handshake failed: %v\n", err)
-		return nil
-	}
+	conn.SetReadDeadline(time.Time{})
 
-	fmt.Fprintf(os.Stderr, "DTLS Handshake completed.\n")
+	fmt.Fprintf(os.Stderr, "completed.\n")
 	return dtlsConn
 }
 
@@ -226,20 +256,52 @@ func createDialer() proxy.Dialer {
 	}
 }
 
-func showProgress(stats_in, stats_out *misc.ProgressStats) *time.Ticker {
-	// 启动进度显示
-	ticker := time.NewTicker(1000 * time.Millisecond)
+func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *sync.WaitGroup) {
+	wg.Add(1)
+	ticker := time.NewTicker(1 * time.Second)
 	go func() {
-		for range ticker.C {
-			if *showSendProgress {
-				fmt.Fprintf(os.Stderr, "%s        \r", stats_out.String(false))
-			}
-			if *showRecvProgress {
-				fmt.Fprintf(os.Stderr, "%s        \r", stats_in.String(false))
+		defer wg.Done()
+		for {
+			select {
+			case <-ticker.C:
+				if sessionReady {
+					now := time.Now()
+					in := statsIn.Stats(now, false)
+					out := statsOut.Stats(now, false)
+					elapsed := int(now.Sub(statsIn.StartTime()).Seconds())
+					h := elapsed / 3600
+					m := (elapsed % 3600) / 60
+					s := elapsed % 60
+					fmt.Fprintf(os.Stderr,
+						"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \r",
+						misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
+						misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
+						h, m, s,
+					)
+				}
+
+			case <-done:
+				ticker.Stop()
+				if sessionReady {
+					// 打印最终进度
+					now := time.Now()
+					in := statsIn.Stats(now, true)
+					out := statsOut.Stats(now, true)
+					elapsed := int(now.Sub(statsIn.StartTime()).Seconds())
+					h := elapsed / 3600
+					m := (elapsed % 3600) / 60
+					s := elapsed % 60
+					fmt.Fprintf(os.Stderr,
+						"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \n",
+						misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
+						misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
+						h, m, s,
+					)
+				}
+				return
 			}
 		}
 	}()
-	return ticker
 }
 
 func usage() {
@@ -278,12 +340,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-bind and -l cannot be used together\n")
 		os.Exit(1)
 	}
+	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "") {
+		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-kcp, -p2p-tcp) cannot be used together\n")
+		os.Exit(1)
+	}
 	if *kcpEnabled || *kcpSEnabled {
 		*udpProtocol = true
 	}
 
+	var wg *sync.WaitGroup
+	var done chan bool
 	var conn net.Conn
 	var network string
+	var sessionP2PUid string
 	if *udpProtocol {
 		network = "udp"
 	} else {
@@ -304,14 +373,35 @@ func main() {
 			fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", *remoteAddr, err)
 			os.Exit(1)
 		}
-	} else if len(args) == 0 && *autoP2P != "" {
-		authParts := strings.SplitN(*autoP2P, ":", 2)
-		if len(authParts) != 2 {
-			fmt.Fprintf(os.Stderr, "Invalid p2p format. Expected UID-A:UID-B\n")
+	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "") {
+		*listenMode = false
+		if *autoP2P != "" {
+			sessionP2PUid = *autoP2P
+		} else if *autoP2PKCP != "" {
+			sessionP2PUid = *autoP2PKCP
+			*udpProtocol = true
+		} else if *autoP2PTCP != "" {
+			sessionP2PUid = *autoP2PTCP
+			*udpProtocol = false
+		} else {
 			os.Exit(1)
 		}
+	} else {
+		usage()
+		os.Exit(1)
+	}
+
+	if *tlsSNI == "" {
+		if *listenMode {
+			*tlsSNI = "localhost"
+		} else {
+			*tlsSNI = host
+		}
+	}
+
+	if *autoP2P != "" && sessionP2PUid != "" {
 		fmt.Fprintf(os.Stderr, "Exchanging NAT address info via MQTT...\n")
-		p2pInfo, err := misc.Do_autoP2P(network, authParts[0], authParts[1], *turnServer, *MQTTServer, 15*time.Second, true)
+		p2pInfo, err := misc.Do_autoP2P(network, sessionP2PUid, *turnServer, *MQTTServer, 25*time.Second, false, true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "p2p failed: %v\n", err)
 			os.Exit(1)
@@ -335,16 +425,36 @@ func main() {
 			}
 		}
 		*localbind = p2pInfo.LocalLAN
-	} else {
-		usage()
-		os.Exit(1)
-	}
+		if !misc.SelectRole(p2pInfo) {
+			time.Sleep(2 * time.Second)
+		}
 
-	if *tlsSNI == "" {
-		if *listenMode {
-			*tlsSNI = "localhost"
+	} else if *autoP2PKCP != "" && sessionP2PUid != "" {
+		var isRoleClient bool
+		conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(sessionP2PUid, *turnServer, *MQTTServer, true)
+		if err != nil {
+			os.Exit(1)
+		}
+
+		configUDPConn(conn)
+		fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
+
+		if isRoleClient {
+			//client mode
+			*kcpSEnabled = false
+			*kcpEnabled = true
 		} else {
-			*tlsSNI = host
+			*kcpSEnabled = true
+			*kcpEnabled = false
+		}
+	} else if *autoP2PTCP != "" && sessionP2PUid != "" {
+		var isRoleClient bool
+		conn, isRoleClient, _, err = misc.Auto_P2P_TCP_NAT_Traversal(sessionP2PUid, *turnServer, *MQTTServer, false)
+		if err != nil {
+			os.Exit(1)
+		}
+		if isTLSEnabled() {
+			*tlsServerMode = !isRoleClient
 		}
 	}
 
@@ -457,9 +567,12 @@ func main() {
 				// 创建进度统计
 				stats_in := misc.NewProgressStats()
 				stats_out := misc.NewProgressStats()
-				// 启动进度显示
-				showProgress(stats_in, stats_out)
-
+				if *progressEnabled {
+					// 启动进度显示
+					wg = &sync.WaitGroup{}
+					done = make(chan bool)
+					showProgress(stats_in, stats_out, done, wg)
+				}
 				defer listener.Close()
 				for {
 					conn, err = listener.Accept()
@@ -482,7 +595,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
 			}
 		}
-	} else {
+	} else if conn == nil {
 		//主动连接模式
 		var localAddr net.Addr
 
@@ -531,23 +644,27 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		configUDPConn(conn)
-		fmt.Fprintf(os.Stderr, "Connected to: %s\n", net.JoinHostPort(host, port))
+		if network == "udp" {
+			configUDPConn(conn)
+			fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
+		} else {
+			fmt.Fprintf(os.Stderr, "Connected to: %s\n", net.JoinHostPort(host, port))
+		}
 	}
 
 	// 创建进度统计
 	stats_in := misc.NewProgressStats()
 	stats_out := misc.NewProgressStats()
-
-	// 启动进度显示
-	ticker := showProgress(stats_in, stats_out)
-	handleConnection(conn, stats_in, stats_out)
-	ticker.Stop()
-	if *showSendProgress {
-		fmt.Fprintf(os.Stderr, "%s\n", stats_out.String(true))
+	if *progressEnabled {
+		wg = &sync.WaitGroup{}
+		done = make(chan bool)
+		showProgress(stats_in, stats_out, done, wg)
 	}
-	if *showRecvProgress {
-		fmt.Fprintf(os.Stderr, "%s\n", stats_in.String(true))
+
+	handleConnection(conn, stats_in, stats_out)
+	if *progressEnabled {
+		done <- true
+		wg.Wait()
 	}
 }
 
@@ -699,6 +816,12 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		}
 		defer sess_kcp.Close()
 		conn = sess_kcp
+	}
+
+	if !sessionReady {
+		stats_in.ResetStart()
+		stats_out.ResetStart()
+		sessionReady = true
 	}
 
 	var input io.Reader
@@ -890,12 +1013,29 @@ func createKCPBlockCrypt(passphrase string, salt []byte) (kcp.BlockCrypt, error)
 	return blockCrypt, nil
 }
 
+func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("invalid key length: expected 32, got %d", len(key))
+	}
+	blockCrypt, err := kcp.NewAESBlockCrypt(key[:]) // key[:] 转为 []byte
+	if err != nil {
+		return nil, fmt.Errorf("kcp NewAESBlockCrypt failed: %v", err)
+	}
+	return blockCrypt, nil
+}
+
 func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn {
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
 
-	if *auth != "" {
+	if sessionSharedKey != nil && !isTLSEnabled() {
+		blockCrypt, err = createKCPBlockCryptFromKey(sessionSharedKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "createKCPBlockCryptFromKey failed: %v\n", err)
+			return nil
+		}
+	} else if *auth != "" {
 		blockCrypt, err = createKCPBlockCrypt(*auth, []byte("1234567890abcdef"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "createKCPBlockCrypt failed: %v\n", err)
@@ -911,24 +1051,35 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 
 	pktconn := misc.NewPacketConnWrapper(conn, conn.RemoteAddr())
 	if *listenMode || *kcpSEnabled {
+		if blockCrypt == nil {
+			fmt.Fprintf(os.Stderr, "Performing KCP-S handshake...")
+		} else {
+			fmt.Fprintf(os.Stderr, "Performing encrypted KCP-S handshake...")
+		}
 		listener, err := kcp.ServeConn(blockCrypt, 10, 3, pktconn)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "kcp ServeConn failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "ServeConn failed: %v\n", err)
 			return nil
 		}
-
-		fmt.Fprintf(os.Stderr, "Waiting for a KCP session...\n")
+		listener.SetDeadline(time.Now().Add(timeout))
 
 		sessChan := make(chan *kcp.UDPSession, 1)
 		errChan := make(chan error, 1)
 
 		go func() {
-			s, e := listener.AcceptKCP()
-			if e != nil {
-				errChan <- e
+			for {
+				s, e := listener.AcceptKCP()
+				if e != nil {
+					if misc.IsConnRefused(e) {
+						continue
+					}
+					errChan <- e
+					return
+				}
+				sessChan <- s
 				return
 			}
-			sessChan <- s
+
 		}()
 
 		select {
@@ -937,13 +1088,18 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 			fmt.Fprintf(os.Stderr, "AcceptKCP failed: %v\n", err)
 			return nil
 		case <-time.After(timeout):
-			fmt.Fprintf(os.Stderr, "AcceptKCP timeout\n")
+			fmt.Fprintf(os.Stderr, "timeout\n")
 			return nil
 		}
 	} else {
+		if blockCrypt == nil {
+			fmt.Fprintf(os.Stderr, "Performing KCP-C handshake...")
+		} else {
+			fmt.Fprintf(os.Stderr, "Performing encrypted KCP-C handshake...")
+		}
 		sess, err = kcp.NewConn(conn.RemoteAddr().String(), blockCrypt, 10, 3, pktconn)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "kcp NewConn failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "NewConn failed: %v\n", err)
 			return nil
 		}
 	}
@@ -952,7 +1108,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 	handshake := []byte("HELLO")
 	_, err = sess.Write(handshake)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "kcp Handshake send failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "send handshake failed: %v\n", err)
 		return nil
 	}
 
@@ -962,10 +1118,10 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 	buf := make([]byte, len(handshake))
 	n, err := io.ReadFull(sess, buf)
 	if err != nil || n != len(handshake) || !bytes.Equal(buf, handshake) {
-		fmt.Fprintf(os.Stderr, "kcp Handshake recv failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "recv handshake failed: %v\n", err)
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "KCP session Established with %s\n", sess.RemoteAddr())
+	fmt.Fprintf(os.Stderr, "completed.\n")
 
 	// 取消超时（恢复成无超时）
 	sess.SetReadDeadline(time.Time{})
@@ -989,11 +1145,6 @@ func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInte
 		ticker := time.NewTicker(keepAliveInterval)
 		defer ticker.Stop()
 
-		// 立即发送一次
-		if _, err := conn.Write(data); err != nil {
-			fmt.Fprintf(os.Stderr, "initial keepAlive Write failed: %v, will retry on ticker\n", err)
-		}
-
 		for {
 			select {
 			case <-ctx.Done():
@@ -1004,7 +1155,7 @@ func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInte
 				ticker = time.NewTicker(keepAliveInterval)
 			case <-ticker.C:
 				if _, err := conn.Write(data); err != nil {
-					fmt.Fprintf(os.Stderr, "keepAlive Write failed: %v\n", err)
+					fmt.Fprintf(os.Stderr, "keepAlive send failed: %v\n", err)
 					// 不退出，继续重试
 				}
 			}
