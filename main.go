@@ -62,22 +62,24 @@ var (
 	keepAlive       = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
 	punchData       = flag.String("punchdata", "ping\n", "UDP punch payload")
 	MQTTServer      = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883", "MQTT server, others: tcp://broker.emqx.io:1883 ; tcp://test.mosquitto.org:1883")
-	autoP2P         = flag.String("p2p", "", "sessionUID")
-	autoP2PKCP      = flag.String("p2p-kcp", "", "sessionUID, kcp over udp, will be retried up to 3 times upon failure.")
-	autoP2PTCP      = flag.String("p2p-tcp", "", "sessionUID, tcp, will be retried up to 3 times upon failure.")
+	autoP2P         = flag.String("p2p", "", "P2PSessionKey")
+	autoP2PKCP      = flag.String("p2p-kcp", "", "P2PSessionKey, kcp over udp, will be retried up to 3 times upon failure.")
+	autoP2PTCP      = flag.String("p2p-tcp", "", "P2PSessionKey, tcp, will be retried up to 3 times upon failure.")
+	MQTTWait        = flag.String("mqtt-wait", "", "")
+	MQTTPush        = flag.String("mqtt-push", "", "")
 )
 
 func init() {
 	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
 }
 
-func init_TLS() {
+func init_TLS(genCertForced bool) {
 	var err error
 	if isTLSEnabled() {
 		if *listenMode || *kcpSEnabled {
 			*tlsServerMode = true
 		}
-		if *tlsServerMode {
+		if genCertForced || *tlsServerMode {
 			fmt.Fprintf(os.Stderr, "Generating certificate...\n")
 			tls_cert, err = misc.GenerateCertificate(*tlsSNI)
 			if err != nil {
@@ -305,7 +307,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.4")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.5")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
@@ -352,7 +354,8 @@ func main() {
 	var done chan bool
 	var conn net.Conn
 	var network string
-	var sessionP2PUid string
+	var P2PSessionKey string
+	var clearCSRole bool
 	if *udpProtocol {
 		network = "udp"
 	} else {
@@ -376,14 +379,30 @@ func main() {
 	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "") {
 		*listenMode = false
 		if *autoP2P != "" {
-			sessionP2PUid = *autoP2P
+			P2PSessionKey = *autoP2P
+			clearCSRole = true //根据参数决定TLS/KCP的C/S角色
 		} else if *autoP2PKCP != "" {
-			sessionP2PUid = *autoP2PKCP
+			clearCSRole = false //尝试不同TLS/KCP的C/S角色
+			P2PSessionKey = *autoP2PKCP
+			*kcpEnabled = true
 			*udpProtocol = true
+			network = "udp"
 		} else if *autoP2PTCP != "" {
-			sessionP2PUid = *autoP2PTCP
+			clearCSRole = false
+			P2PSessionKey = *autoP2PTCP
 			*udpProtocol = false
+			network = "tcp"
 		} else {
+			os.Exit(1)
+		}
+		if P2PSessionKey == "." {
+			P2PSessionKey, err = misc.GenerateSecureRandomString(16)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Fprintf(os.Stderr, "Keep this key secret! It is used to establish the secure P2P tunnel: %s\n", P2PSessionKey)
+		} else if misc.IsWeakPassword(P2PSessionKey) {
+			fmt.Fprintf(os.Stderr, "Weak password detected. Please use at least 8 characters and avoid common or repetitive patterns.\n")
 			os.Exit(1)
 		}
 	} else {
@@ -399,66 +418,40 @@ func main() {
 		}
 	}
 
-	if *autoP2P != "" && sessionP2PUid != "" {
-		fmt.Fprintf(os.Stderr, "Exchanging NAT address info via MQTT...\n")
-		p2pInfo, err := misc.Do_autoP2P(network, sessionP2PUid, *turnServer, *MQTTServer, 25*time.Second, false, true)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "p2p failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "P2P: LLAN: %s, LNAT: %s, RLAN: %s, RNAT: %s\n", p2pInfo.LocalLAN, p2pInfo.LocalNAT, p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
+	if P2PSessionKey != "" {
+		if *keepOpen {
+			// 创建进度统计
+			stats_in := misc.NewProgressStats()
+			stats_out := misc.NewProgressStats()
+			if *progressEnabled {
+				// 启动进度显示
+				wg = &sync.WaitGroup{}
+				done = make(chan bool)
+				showProgress(stats_in, stats_out, done, wg)
+			}
 
-		sameNAT, similarLAN := misc.CompareP2PAddresses(p2pInfo)
-		if sameNAT && similarLAN {
-			//应该在一个内网，用对方内网地址去连接
-			host, port, err = net.SplitHostPort(p2pInfo.RemoteLAN)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", p2pInfo.RemoteLAN, err)
-				os.Exit(1)
+			init_TLS(true)
+
+			for {
+				conn, err = do_P2P(network, P2PSessionKey, clearCSRole)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
+					time.Sleep(10 * time.Second)
+					continue
+				}
+				handleConnection(conn, stats_in, stats_out)
+				time.Sleep(2 * time.Second)
 			}
 		} else {
-			//用对方公网地址去连接
-			host, port, err = net.SplitHostPort(p2pInfo.RemoteNAT)
+			conn, err = do_P2P(network, P2PSessionKey, clearCSRole)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", p2pInfo.RemoteNAT, err)
+				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 				os.Exit(1)
 			}
-		}
-		*localbind = p2pInfo.LocalLAN
-		if !misc.SelectRole(p2pInfo) {
-			time.Sleep(2 * time.Second)
-		}
-
-	} else if *autoP2PKCP != "" && sessionP2PUid != "" {
-		var isRoleClient bool
-		conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(sessionP2PUid, *turnServer, *MQTTServer, true)
-		if err != nil {
-			os.Exit(1)
-		}
-
-		configUDPConn(conn)
-		fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
-
-		if isRoleClient {
-			//client mode
-			*kcpSEnabled = false
-			*kcpEnabled = true
-		} else {
-			*kcpSEnabled = true
-			*kcpEnabled = false
-		}
-	} else if *autoP2PTCP != "" && sessionP2PUid != "" {
-		var isRoleClient bool
-		conn, isRoleClient, _, err = misc.Auto_P2P_TCP_NAT_Traversal(sessionP2PUid, *turnServer, *MQTTServer, false)
-		if err != nil {
-			os.Exit(1)
-		}
-		if isTLSEnabled() {
-			*tlsServerMode = !isRoleClient
 		}
 	}
 
-	init_TLS()
+	init_TLS(false)
 	dialer := createDialer()
 
 	if *listenMode {
@@ -1112,7 +1105,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 		return nil
 	}
 
-	// 设置20秒超时
+	// 设置握手超时
 	sess.SetReadDeadline(time.Now().Add(timeout))
 
 	buf := make([]byte, len(handshake))
@@ -1170,4 +1163,87 @@ func ShowPublicIP(network, bind string) error {
 	}
 
 	return err
+}
+
+func Mqtt_ensure_ready(sessionKey string) error {
+	var msg string
+	var err error
+
+	if *MQTTWait != "" {
+		msg, err = misc.MqttWait(sessionKey, *MQTTServer, 10*time.Minute)
+		if err != nil {
+			return fmt.Errorf("mqtt-wait: %v", err)
+		}
+		if msg != *MQTTWait {
+			return fmt.Errorf("mqtt-wait: not the expected message")
+		}
+	}
+
+	if *MQTTPush != "" {
+		err = misc.MqttPush(*MQTTPush, sessionKey, *MQTTServer)
+		if err != nil {
+			return fmt.Errorf("mqtt-push: %v", err)
+		}
+	}
+	return nil
+}
+
+func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
+	var err error
+	var conn net.Conn
+	var isRoleClient bool
+
+	if clearCSRole {
+		err = Mqtt_ensure_ready(sessionKey)
+		if err != nil {
+			return nil, err
+		}
+		conn, _, err = misc.Simple_P2P(network, sessionKey, *turnServer, *MQTTServer)
+		if err != nil {
+			return nil, err
+		}
+	} else if network == "udp" {
+		err = Mqtt_ensure_ready(sessionKey)
+		if err != nil {
+			return nil, err
+		}
+		conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(sessionKey, *turnServer, *MQTTServer, true)
+		if err != nil {
+			return nil, err
+		}
+
+		if isRoleClient {
+			//client mode
+			*kcpSEnabled = false
+			*kcpEnabled = true
+		} else {
+			*kcpSEnabled = true
+			*kcpEnabled = false
+		}
+	} else if network == "tcp" {
+		err = Mqtt_ensure_ready(sessionKey)
+		if err != nil {
+			return nil, err
+		}
+		conn, isRoleClient, _, err = misc.Auto_P2P_TCP_NAT_Traversal(sessionKey, *turnServer, *MQTTServer, false)
+		if err != nil {
+			return nil, err
+		}
+		if isTLSEnabled() {
+			*tlsServerMode = !isRoleClient
+		}
+	} else {
+		return nil, fmt.Errorf("unexpected p2p mode")
+	}
+
+	if conn != nil {
+		if network == "udp" {
+			configUDPConn(conn)
+			fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
+		} else {
+			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+		}
+	}
+
+	return conn, nil
 }

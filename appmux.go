@@ -179,7 +179,7 @@ func mux_main() {
 	var err error
 	var localAddr net.Addr
 
-	init_TLS()
+	init_TLS(false)
 
 	dialer := createDialer()
 
