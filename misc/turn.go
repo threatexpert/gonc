@@ -558,8 +558,8 @@ func Simple_P2P(network, sessionUid, turnServer string, brokerServer string) (ne
 		listener.Close()
 		if err2 == nil {
 			// 检查是否是对端连接（仅比较 IP，忽略端口）
-			clientIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-			if err == nil {
+			clientIP, _, err2 := net.SplitHostPort(conn.RemoteAddr().String())
+			if err2 == nil {
 				expectedIP, _, _ := net.SplitHostPort(remoteAddr)
 				if clientIP == expectedIP {
 					return conn, isClient, nil
@@ -802,12 +802,13 @@ func Auto_P2P_TCP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 		}
 
 		if listener != nil {
-			conn, err = listener.Accept()
+			var err2 error
+			conn, err2 = listener.Accept()
 			listener.Close()
-			if err == nil {
+			if err2 == nil {
 				// 检查是否是对端连接（仅比较 IP，忽略端口）
-				clientIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-				if err == nil {
+				clientIP, _, err2 := net.SplitHostPort(conn.RemoteAddr().String())
+				if err2 == nil {
 					expectedIP, _, _ := net.SplitHostPort(remoteAddr)
 					if clientIP == expectedIP {
 						fmt.Fprintf(os.Stderr, "TCP-P2P connection established (accept)!\n")
@@ -818,6 +819,7 @@ func Auto_P2P_TCP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 				conn = nil
 			}
 		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
 
 	return nil, false, nil, fmt.Errorf("P2P TCP Simultaneous Open failed after 4 rounds")
