@@ -28,9 +28,10 @@ import (
 )
 
 var (
-	tls_cert         *tls.Certificate = nil
-	sessionReady                      = false
-	sessionSharedKey []byte           = nil
+	tls_cert               *tls.Certificate = nil
+	sessionReady                            = false
+	sessionSharedKey       []byte           = nil
+	tcpSecureStreamEnabled                  = false
 	// 定义命令行参数
 	socks5Addr      = flag.String("s5", "", "ip:port (SOCKS5 proxy)")
 	auth            = flag.String("auth", "", "user:password for SOCKS5 proxy; preshared key for kcp")
@@ -65,6 +66,7 @@ var (
 	autoP2P         = flag.String("p2p", "", "P2PSessionKey")
 	autoP2PKCP      = flag.String("p2p-kcp", "", "P2PSessionKey, kcp over udp, will be retried up to 3 times upon failure.")
 	autoP2PTCP      = flag.String("p2p-tcp", "", "P2PSessionKey, tcp, will be retried up to 3 times upon failure.")
+	autoP2PTCPSS    = flag.String("p2p-ss", "", "p2p-tcp + AES-CTR")
 	MQTTWait        = flag.String("mqtt-wait", "", "")
 	MQTTPush        = flag.String("mqtt-push", "", "")
 )
@@ -342,8 +344,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-bind and -l cannot be used together\n")
 		os.Exit(1)
 	}
-	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "") {
-		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-kcp, -p2p-tcp) cannot be used together\n")
+	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-kcp, -p2p-tcp, -p2p-ss) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *kcpEnabled || *kcpSEnabled {
@@ -376,7 +378,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", *remoteAddr, err)
 			os.Exit(1)
 		}
-	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "") {
+	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
 		*listenMode = false
 		if *autoP2P != "" {
 			P2PSessionKey = *autoP2P
@@ -391,6 +393,12 @@ func main() {
 			clearCSRole = false
 			P2PSessionKey = *autoP2PTCP
 			*udpProtocol = false
+			network = "tcp"
+		} else if *autoP2PTCPSS != "" {
+			clearCSRole = false
+			P2PSessionKey = *autoP2PTCPSS
+			*udpProtocol = false
+			tcpSecureStreamEnabled = true
 			network = "tcp"
 		} else {
 			os.Exit(1)
@@ -1225,9 +1233,14 @@ func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		conn, isRoleClient, _, err = misc.Auto_P2P_TCP_NAT_Traversal(sessionKey, *turnServer, *MQTTServer, false)
+		conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(sessionKey, *turnServer, *MQTTServer, tcpSecureStreamEnabled)
 		if err != nil {
 			return nil, err
+		}
+		if tcpSecureStreamEnabled {
+			var key32 [32]byte
+			copy(key32[:], sessionSharedKey)
+			conn = misc.NewSecureStreamConn(conn, key32)
 		}
 		if isTLSEnabled() {
 			*tlsServerMode = !isRoleClient
