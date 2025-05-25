@@ -10,6 +10,7 @@ require (
 	github.com/pion/stun v0.6.1
 	github.com/xtaci/kcp-go/v5 v5.6.20
 	github.com/xtaci/smux v1.5.34
+	golang.org/x/crypto v0.38.0
 	golang.org/x/net v0.40.0
 	golang.org/x/sys v0.33.0
 	golang.org/x/term v0.32.0
@@ -27,6 +28,5 @@ require (
 	github.com/templexxx/cpu v0.1.1 // indirect
 	github.com/templexxx/xorsimd v0.4.3 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
-	golang.org/x/crypto v0.38.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
 )

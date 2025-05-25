@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"golang.org/x/crypto/scrypt"
 )
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -65,6 +67,15 @@ func IsWeakPassword(password string) bool {
 	}
 
 	return false
+}
+
+func DerivePSK(password string) ([]byte, error) {
+	salt := []byte("gonc-psk-salt")
+	key, err := scrypt.Key([]byte(password), salt, 1<<15, 8, 1, 32) // 输出 256bit PSK
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
 }
 
 type SecureStreamConn struct {
