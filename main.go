@@ -77,6 +77,8 @@ var (
 
 func init() {
 	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
+	flag.StringVar(&misc.TopicExchange, "mqtt-nat-topic", misc.TopicExchange, "")
+	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
 }
 
 func init_TLS(genCertForced bool) {

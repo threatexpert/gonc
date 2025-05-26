@@ -25,6 +25,8 @@ import (
 )
 
 var (
+	TopicExchange      = "nat-exchange/"
+	TopicExchangeWait  = "nat-exchange-wait/"
 	lastStunClient     *stun.Client
 	lastStunClientConn net.Conn
 	lastStunClientLock sync.Mutex
@@ -187,92 +189,18 @@ func CalculateMD5(input string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func deriveKeyForTopic(uid string) string {
-	salt := "nc-mqtt-topic-id:"
+func deriveKeyForTopic(salt, uid string) string {
 	h := sha256.New()
 	h.Write([]byte(salt))
 	h.Write([]byte(CalculateMD5(uid)))
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-// func MQTT_Exchange(sendData, localUid, remoteUid, brokerServer string, timeout time.Duration) (recvData string, err error) {
-// 	localTopic := "nat-exchange/" + deriveKeyForTopic(localUid)
-// 	remoteTopic := "nat-exchange/" + deriveKeyForTopic(remoteUid)
-// 	localAckTopic := "nat-ack/" + deriveKeyForTopic(localUid)
-// 	remoteAckTopic := "nat-ack/" + deriveKeyForTopic(remoteUid)
-
-// 	opts := mqtt.NewClientOptions().AddBroker(brokerServer)
-// 	opts.SetClientID(deriveKeyForTopic(localUid) + fmt.Sprint(time.Now().UnixNano()))
-// 	client := mqtt.NewClient(opts)
-
-// 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-// 		return "", token.Error()
-// 	}
-// 	defer client.Disconnect(250)
-
-// 	recvRemoteData := make(chan string, 1)
-// 	recvAck := make(chan struct{}, 1)
-
-// 	// 订阅远端发送的地址数据
-// 	if token := client.Subscribe(remoteTopic, 0, func(_ mqtt.Client, msg mqtt.Message) {
-// 		recvRemoteData <- string(msg.Payload())
-// 	}); token.Wait() && token.Error() != nil {
-// 		return "", token.Error()
-// 	}
-
-// 	// 订阅本地确认 topic（远端收到我方数据后会发确认）
-// 	if token := client.Subscribe(localAckTopic, 0, func(_ mqtt.Client, msg mqtt.Message) {
-// 		recvAck <- struct{}{}
-// 	}); token.Wait() && token.Error() != nil {
-// 		return "", token.Error()
-// 	}
-
-// 	//发布数据
-// 	client.Publish(localTopic, 0, false, sendData)
-// 	stopPublish := make(chan struct{})
-// 	go func() {
-// 		ticker := time.NewTicker(2 * time.Second)
-// 		defer ticker.Stop()
-// 		for {
-// 			select {
-// 			case <-stopPublish:
-// 				return
-// 			case <-ticker.C:
-// 				client.Publish(localTopic, 0, false, sendData)
-// 			}
-// 		}
-// 	}()
-
-// 	var remoteData string
-// 	gotRemote := false
-// 	gotAck := false
-// 	timeoutTimer := time.NewTimer(timeout)
-// 	defer timeoutTimer.Stop()
-
-// 	for !(gotRemote && gotAck) {
-// 		select {
-// 		case remoteData = <-recvRemoteData:
-// 			gotRemote = true
-// 			client.Publish(remoteAckTopic, 1, false, "ok")
-// 		case <-recvAck:
-// 			gotAck = true // 收到对方对我数据的确认，将退出循环
-// 		case <-timeoutTimer.C:
-// 			close(stopPublish) //等待确认超时了则停止发布数据
-// 			return "", errors.New("timeout waiting for remote data exchange")
-// 		}
-// 	}
-
-// 	//退出循环了说明确认了，停止发布数据
-// 	close(stopPublish)
-
-// 	return remoteData, nil
-// }
-
 func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout time.Duration) (recvData string, err error) {
-	topic := "nat-exchange/" + deriveKeyForTopic(sessionUid)
+	topic := TopicExchange + deriveKeyForTopic("mqtt-topic-gonc-ex", sessionUid)
 
 	opts := mqtt.NewClientOptions().AddBroker(brokerServer)
-	opts.SetClientID(deriveKeyForTopic(sessionUid) + fmt.Sprint(time.Now().UnixNano()))
+	opts.SetClientID(deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid) + fmt.Sprint(time.Now().UnixNano()))
 	client := mqtt.NewClient(opts)
 
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
@@ -832,15 +760,15 @@ func logStderr(msg string, args ...interface{}) {
 }
 
 func MqttWait(sessionUid, brokerServer string, timeout time.Duration) (string, error) {
-	uid := deriveKeyForTopic(sessionUid)
-	topic := "nat-exchange-wait/" + uid
+	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
+	topic := TopicExchangeWait + uid
 	logStderr("Waiting for event on topic: %s\n", topic)
 
 	msgReceived := make(chan string, 1)
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerServer).
-		SetClientID("waiter-" + uid).
+		SetClientID(uid).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(3 * time.Second).
@@ -894,14 +822,14 @@ func MqttWait(sessionUid, brokerServer string, timeout time.Duration) (string, e
 
 // MqttPush 连接到 MQTT 服务器并发送消息到指定 topic
 func MqttPush(msg, sessionUid, brokerServer string) error {
-	uid := deriveKeyForTopic(sessionUid)
-	topic := "nat-exchange-wait/" + uid
+	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
+	topic := TopicExchangeWait + uid
 
 	fmt.Fprintf(os.Stderr, "MQTT: pushing to topic %s: %s\n", topic, msg)
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerServer).
-		SetClientID("mqtt-push-" + uid).
+		SetClientID(uid).
 		SetConnectTimeout(5 * time.Second)
 
 	client := mqtt.NewClient(opts)
