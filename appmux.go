@@ -463,5 +463,12 @@ func (l *singleConnListener) Addr() net.Addr {
 // rootDir 是你希望暴露的目录，比如 "./public"
 func createHTTPHandler(rootDir string) http.Handler {
 	fs := http.FileServer(http.Dir(rootDir))
-	return http.StripPrefix("/", fs)
+	return loggingMiddleware(http.StripPrefix("/", fs))
+}
+
+func loggingMiddleware(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s", r.Method, r.URL.Path)
+		handler.ServeHTTP(w, r)
+	})
 }
