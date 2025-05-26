@@ -391,7 +391,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.5")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.6beta")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
@@ -970,8 +970,9 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		sessionReady = true
 	}
 
-	var input io.Reader
+	var input io.ReadCloser
 	var output io.WriteCloser
+	var binaryMode = true
 	var cmd *exec.Cmd
 	var err error
 	var blocksize int = 32 * 1024
@@ -995,17 +996,6 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 
 		input = file
 		output = os.Stdout
-
-		go func() {
-			copyWithProgress(conn, input, blocksize, stats_out)
-			time.Sleep(1 * time.Second)
-			// 关闭连接
-			if tcpConn, ok := conn.(closeWriter); ok {
-				tcpConn.CloseWrite()
-			} else {
-				conn.Close()
-			}
-		}()
 	} else if *runCmd != "" {
 		// 分割命令和参数（支持带空格的参数）
 		args, err := parseCommandLine(*runCmd)
@@ -1059,54 +1049,79 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 				return
 			}
 		}
-
-		go func() {
-			copyWithProgress(conn, input, blocksize, stats_out)
-			time.Sleep(1 * time.Second)
-			// 关闭连接
-			if tcpConn, ok := conn.(closeWriter); ok {
-				tcpConn.CloseWrite()
-			} else {
-				conn.Close()
-			}
-		}()
-
 	} else {
 		// 使用标准输入输出
 		input = os.Stdin
 		output = os.Stdout
-
-		go func() {
-			info, err := os.Stdin.Stat()
-			if err == nil && info.Mode()&os.ModeCharDevice != 0 {
-				if *enablePty {
-					term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "MakeRaw error: %v\n", err)
-						return
-					}
-					defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
-					copyWithProgress(conn, input, blocksize, stats_out)
-				} else {
-					copyCharDeviceWithProgress(conn, input, stats_out)
-				}
-			} else {
-				copyWithProgress(conn, input, blocksize, stats_out)
-			}
-
-			time.Sleep(1 * time.Second)
-			// 关闭连接
-			if tcpConn, ok := conn.(closeWriter); ok {
-				tcpConn.CloseWrite()
-			} else {
-				conn.Close()
-			}
-		}()
+		binaryMode = false
 	}
 
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	abort := make(chan struct{})
+	inExited := make(chan struct{})  //
+	outExited := make(chan struct{}) //
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		defer close(outExited)
+
+		info, err := os.Stdin.Stat()
+		if err == nil && info.Mode()&os.ModeCharDevice != 0 && !binaryMode {
+			if *enablePty {
+				term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "MakeRaw error: %v\n", err)
+					return
+				}
+				defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
+				copyWithProgress(conn, input, blocksize, stats_out)
+			} else {
+				copyCharDeviceWithProgress(conn, input, stats_out)
+			}
+		} else {
+			copyWithProgress(conn, input, blocksize, stats_out)
+		}
+
+		time.Sleep(1 * time.Second)
+		// 关闭连接
+		if tcpConn, ok := conn.(closeWriter); ok {
+			tcpConn.CloseWrite()
+		} else {
+			conn.Close()
+		}
+	}()
 	// 从连接读取并输出到输出
-	copyWithProgress(output, conn, blocksize, stats_in)
-	time.Sleep(1 * time.Second)
+	go func() {
+		defer wg.Done()
+		defer close(inExited)
+
+		copyWithProgress(output, conn, blocksize, stats_in)
+		time.Sleep(1 * time.Second)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// 等第一个 goroutine 退出
+	select {
+	case <-inExited:
+		close(abort)
+	case <-outExited:
+		//
+	}
+	select {
+	case <-abort:
+		//fmt.Fprintf(os.Stderr, "Input routine completed.\n")
+	case <-done:
+		//fmt.Fprintf(os.Stderr, "All routines completed.\n")
+	case <-time.After(60 * time.Second):
+		//fmt.Fprintf(os.Stderr, "Timeout after one routine exited.\n")
+	}
+
 	conn.Close()
 	if *enablePty && output != nil {
 		output.Close()
