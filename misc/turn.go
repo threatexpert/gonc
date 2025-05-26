@@ -768,7 +768,7 @@ func MqttWait(sessionUid, brokerServer string, timeout time.Duration) (string, e
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerServer).
-		SetClientID(uid).
+		SetClientID(deriveKeyForTopic("mqtt-topic-gonc-waiter", sessionUid)).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(3 * time.Second).
@@ -829,7 +829,7 @@ func MqttPush(msg, sessionUid, brokerServer string) error {
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerServer).
-		SetClientID(uid).
+		SetClientID(deriveKeyForTopic("mqtt-topic-gonc-push", sessionUid)).
 		SetConnectTimeout(5 * time.Second)
 
 	client := mqtt.NewClient(opts)
