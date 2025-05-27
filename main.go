@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -447,6 +448,12 @@ func main() {
 	}
 	if *presharedKey != "" {
 		secureStreamEnabled = true
+		if strings.HasPrefix(*presharedKey, "@") {
+			*presharedKey, err = ReadPSKFile(*presharedKey)
+			if err != nil {
+				panic(err)
+			}
+		}
 	}
 
 	var wg *sync.WaitGroup
@@ -486,6 +493,11 @@ func main() {
 			*kcpEnabled = true
 			*udpProtocol = true
 			network = "udp"
+			// if *tlsServerMode || *kcpSEnabled {
+			// 	misc.DebugServerRole = "S"
+			// } else {
+			// 	misc.DebugServerRole = "C"
+			// }
 		} else if *autoP2PTCP != "" {
 			clearCSRole = false
 			P2PSessionKey = *autoP2PTCP
@@ -499,6 +511,12 @@ func main() {
 			network = "tcp"
 		} else {
 			os.Exit(1)
+		}
+		if strings.HasPrefix(P2PSessionKey, "@") {
+			P2PSessionKey, err = ReadPSKFile(P2PSessionKey)
+			if err != nil {
+				panic(err)
+			}
 		}
 		if P2PSessionKey == "." {
 			P2PSessionKey, err = misc.GenerateSecureRandomString(22)
@@ -600,7 +618,7 @@ func main() {
 				for {
 					fmt.Fprintf(os.Stderr, "Waiting for initial UDP packet to establish session...\n")
 					uconn.SetReadDeadline(time.Time{})
-					buconn := misc.NewBoundUDPConn(uconn, nil, true)
+					buconn := misc.NewBoundUDPConn(uconn, "", true)
 					if err = buconn.WaitAndLockRemote(); err != nil {
 						fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 						os.Exit(1)
@@ -612,22 +630,22 @@ func main() {
 				}
 			} else {
 				if *peer != "" {
-					peerAddr, err := net.ResolveUDPAddr("udp", *peer)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Invalid peer address: %v\n", err)
-						os.Exit(1)
-					}
-
+					peerIP, startPort, endPort := parsePeerAddressRange(*peer)
 					data := []byte(*punchData)
-					_, err = uconn.WriteToUDP(data, peerAddr)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Failed to send punch packet: %v\n", err)
-						os.Exit(1)
-					} else {
-						fmt.Fprintf(os.Stderr, "Sent punch packet to %s\n", peerAddr.String())
+					for port := startPort; port <= endPort; port++ {
+						addrStr := net.JoinHostPort(peerIP, strconv.Itoa(port))
+						peerAddr, err := net.ResolveUDPAddr("udp", addrStr)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "Invalid peer address %s: %v\n", addrStr, err)
+							continue
+						}
+						_, err = uconn.WriteToUDP(data, peerAddr)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "Failed to send punch packet to %s: %v\n", addrStr, err)
+						}
 					}
 				}
-				buconn := misc.NewBoundUDPConn(uconn, nil, false)
+				buconn := misc.NewBoundUDPConn(uconn, "", false)
 				if err = buconn.WaitAndLockRemote(); err != nil {
 					fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 					os.Exit(1)
@@ -948,7 +966,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		var key32 [32]byte
 		if sessionSharedKey != nil {
 			copy(key32[:], sessionSharedKey)
-			fmt.Fprintf(os.Stderr, "Communication is encrypted with AES using the session shared key.\n")
+			fmt.Fprintf(os.Stderr, "Communication is encrypted(ECDHE) with AES.\n")
 		} else if *presharedKey != "" {
 			k, err := misc.DerivePSK(*presharedKey)
 			if err != nil {
@@ -956,7 +974,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 				return
 			}
 			copy(key32[:], k)
-			fmt.Fprintf(os.Stderr, "Communication is encrypted with AES using the PSK.\n")
+			fmt.Fprintf(os.Stderr, "Communication is encrypted(PSK) with AES.\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "Missing key for secure stream\n")
 			return
@@ -1009,46 +1027,53 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			return
 		}
 
-		// 创建命令
-		cmd = exec.Command(args[0], args[1:]...)
-
-		if *enablePty {
-			ptmx, err := pty.Start(cmd)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to start pty: %v", err)
-				return
-			}
-			input = ptmx
-			output = ptmx
+		if strings.TrimPrefix(args[0], "-") == "app-mux" {
+			Appp_mux_main(conn, args[1:])
+			return
 		} else {
-			// 创建管道
-			stdinPipe, err := cmd.StdinPipe()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
-				return
-			}
 
-			stdoutPipe, err := cmd.StdoutPipe()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
-				return
-			}
+			// 创建命令
+			cmd = exec.Command(args[0], args[1:]...)
 
-			if *mergeStderr {
-				cmd.Stderr = cmd.Stdout
+			if *enablePty {
+				ptmx, err := pty.Start(cmd)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to start pty: %v", err)
+					return
+				}
+				input = ptmx
+				output = ptmx
 			} else {
-				cmd.Stderr = os.Stderr
-			}
+				// 创建管道
+				stdinPipe, err := cmd.StdinPipe()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
+					return
+				}
 
-			input = stdoutPipe
-			output = stdinPipe
+				stdoutPipe, err := cmd.StdoutPipe()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
+					return
+				}
 
-			// 启动命令
-			if err := cmd.Start(); err != nil {
-				fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
-				return
+				if *mergeStderr {
+					cmd.Stderr = cmd.Stdout
+				} else {
+					cmd.Stderr = os.Stderr
+				}
+
+				input = stdoutPipe
+				output = stdinPipe
+
+				// 启动命令
+				if err := cmd.Start(); err != nil {
+					fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
+					return
+				}
 			}
 		}
+
 	} else {
 		// 使用标准输入输出
 		input = os.Stdin
@@ -1193,7 +1218,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
-
+	var keyType = ""
 	//如果已经有TLS加密了，则不再给KCP配置加密
 	if sessionSharedKey != nil && !isTLSEnabled() {
 		blockCrypt, err = createKCPBlockCryptFromKey(sessionSharedKey)
@@ -1201,12 +1226,14 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 			fmt.Fprintf(os.Stderr, "createKCPBlockCryptFromKey failed: %v\n", err)
 			return nil
 		}
+		keyType = "ECDHE"
 	} else if *presharedKey != "" && !isTLSEnabled() {
 		blockCrypt, err = createKCPBlockCrypt(*presharedKey, []byte("1234567890abcdef"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "createKCPBlockCrypt failed: %v\n", err)
 			return nil
 		}
+		keyType = "PSK"
 	}
 
 	// 通知keepalive调整间隔
@@ -1220,7 +1247,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 		if blockCrypt == nil {
 			fmt.Fprintf(os.Stderr, "Performing KCP-S handshake...")
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing encrypted KCP-S handshake...")
+			fmt.Fprintf(os.Stderr, "Performing encrypted(%s) KCP-S handshake...", keyType)
 		}
 		listener, err := kcp.ServeConn(blockCrypt, 10, 3, pktconn)
 		if err != nil {
@@ -1261,7 +1288,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 		if blockCrypt == nil {
 			fmt.Fprintf(os.Stderr, "Performing KCP-C handshake...")
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing encrypted KCP-C handshake...")
+			fmt.Fprintf(os.Stderr, "Performing encrypted(%s) KCP-C handshake using...", keyType)
 		}
 		sess, err = kcp.NewConn(conn.RemoteAddr().String(), blockCrypt, 10, 3, pktconn)
 		if err != nil {
@@ -1428,4 +1455,70 @@ func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
 	}
 
 	return conn, nil
+}
+
+func parsePeerAddressRange(peer string) (host string, startPort, endPort int) {
+	host, portPart, err := net.SplitHostPort(peer)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid peer address: %v\n", err)
+		os.Exit(1)
+	}
+
+	if strings.Contains(portPart, "-") {
+		ports := strings.SplitN(portPart, "-", 2)
+		startPort, err = strconv.Atoi(ports[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid start port: %v\n", err)
+			os.Exit(1)
+		}
+		endPort, err = strconv.Atoi(ports[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid end port: %v\n", err)
+			os.Exit(1)
+		}
+		if startPort > endPort {
+			fmt.Fprintf(os.Stderr, "Start port greater than end port\n")
+			os.Exit(1)
+		}
+	} else {
+		startPort, err = strconv.Atoi(portPart)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid port: %v\n", err)
+			os.Exit(1)
+		}
+		endPort = startPort
+	}
+
+	return host, startPort, endPort
+}
+
+func ReadPSKFile(filepath string) (string, error) {
+	// 检查是否以@开头
+	if !strings.HasPrefix(filepath, "@") {
+		return filepath, nil // 如果不是文件路径，直接返回原内容
+	}
+
+	// 提取实际文件路径（去掉@符号）
+	filename := strings.TrimPrefix(filepath, "@")
+
+	// 打开文件
+	file, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// 读取第一行
+	scanner := bufio.NewScanner(file)
+	if scanner.Scan() {
+		// 去除首尾空白字符和换行符
+		line := strings.TrimSpace(scanner.Text())
+		return line, nil
+	}
+
+	// 处理文件为空的情况
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", nil // 空文件返回空字符串
 }

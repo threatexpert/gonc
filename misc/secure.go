@@ -19,6 +19,19 @@ import (
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 func GenerateSecureRandomString(length int) (string, error) {
+	for {
+		result, err := generateRandomString(length)
+		if err != nil {
+			return "", err
+		}
+		if !IsWeakPassword(result) {
+			return result, nil
+		}
+	}
+}
+
+// 实际的随机字符串生成逻辑（原函数拆解出来）
+func generateRandomString(length int) (string, error) {
 	result := make([]byte, length)
 	max := big.NewInt(int64(len(charset)))
 

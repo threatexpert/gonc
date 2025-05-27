@@ -12,20 +12,29 @@ import (
 )
 
 type BoundUDPConn struct {
-	conn          *net.UDPConn
-	remoteAddr    *net.UDPAddr
-	keepOpen      bool
-	closeChan     chan struct{}
-	closeOnce     sync.Once // 保护closeChan
-	connCloseOnce sync.Once // 保护底层连接
-	firstPacket   []byte    // 缓存的首包
+	conn           *net.UDPConn
+	remoteAddr     *net.UDPAddr
+	keepOpen       bool
+	closeChan      chan struct{}
+	closeOnce      sync.Once // 保护closeChan
+	connCloseOnce  sync.Once // 保护底层连接
+	firstPacket    []byte    // 缓存的首包
+	lastPacketAddr string
 }
 
 // NewBoundUDPConn 创建连接，remoteAddr为nil时允许任意源地址
-func NewBoundUDPConn(conn *net.UDPConn, remoteAddr *net.UDPAddr, keepOpen bool) *BoundUDPConn {
+func NewBoundUDPConn(conn *net.UDPConn, raddr string, keepOpen bool) *BoundUDPConn {
+	var udpaddr *net.UDPAddr
+	var err error
+	if raddr != "" {
+		udpaddr, err = net.ResolveUDPAddr("udp", raddr)
+		if err != nil {
+			return nil
+		}
+	}
 	return &BoundUDPConn{
 		conn:       conn,
-		remoteAddr: remoteAddr,
+		remoteAddr: udpaddr,
 		keepOpen:   keepOpen,
 		closeChan:  make(chan struct{}),
 	}
@@ -46,8 +55,17 @@ func (b *BoundUDPConn) WaitAndLockRemote() error {
 }
 
 // SetRemoteAddr 动态设置目标地址
-func (b *BoundUDPConn) SetRemoteAddr(addr *net.UDPAddr) {
-	b.remoteAddr = addr
+func (b *BoundUDPConn) SetRemoteAddr(addr string) error {
+	udpaddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+	b.remoteAddr = udpaddr
+	return nil
+}
+
+func (b *BoundUDPConn) GetLastPacketRemoteAddr() string {
+	return b.lastPacketAddr
 }
 
 func (b *BoundUDPConn) Read(p []byte) (int, error) {
@@ -76,6 +94,7 @@ func (b *BoundUDPConn) Read(p []byte) (int, error) {
 				(addr.IP.Equal(b.remoteAddr.IP) && addr.Port == b.remoteAddr.Port)
 
 			if addrValid {
+				b.lastPacketAddr = addr.String()
 				return n, nil
 			}
 			continue

@@ -1,6 +1,7 @@
 package misc
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -16,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +32,8 @@ var (
 	lastStunClient     *stun.Client
 	lastStunClientConn net.Conn
 	lastStunClientLock sync.Mutex
+
+	DebugServerRole string
 )
 
 func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (localaddress, nataddress string, err error) {
@@ -194,6 +198,13 @@ func deriveKeyForTopic(salt, uid string) string {
 	h.Write([]byte(salt))
 	h.Write([]byte(CalculateMD5(uid)))
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func deriveKeyForPayload(uid string) string {
+	h := sha256.New()
+	h.Write([]byte("gonc-p2p-payload"))
+	h.Write([]byte(CalculateMD5(uid)))
+	return hex.EncodeToString(h.Sum(nil))[:8]
 }
 
 func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout time.Duration) (recvData string, err error) {
@@ -405,7 +416,21 @@ func CompareP2PAddresses(info *P2PAddressInfo) (sameNATIP bool, similarLAN bool)
 	return
 }
 
+func isSamePort(addr1, addr2 string) bool {
+	_, port1, err1 := net.SplitHostPort(addr1)
+	_, port2, err2 := net.SplitHostPort(addr2)
+
+	if err1 != nil || err2 != nil {
+		return false
+	}
+
+	return port1 == port2
+}
+
 func SelectRole(p2pInfo *P2PAddressInfo) bool {
+	// if DebugServerRole != "" {
+	// 	return DebugServerRole == "C"
+	// }
 	return strings.Compare(CalculateMD5(p2pInfo.LocalLAN+p2pInfo.LocalNAT), CalculateMD5(p2pInfo.RemoteLAN+p2pInfo.RemoteNAT)) <= 0
 }
 
@@ -501,15 +526,36 @@ func Simple_P2P(network, sessionUid, turnServer string, brokerServer string) (ne
 	return nil, false, err
 }
 
+func udpPunchPortRange(port string) (a, b int, err error) {
+	// 将端口号转换为整数
+	basePort, err := strconv.Atoi(port)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid port number %s: %v", port, err)
+	}
+
+	// 计算端口范围，确保在 1-65535 之间
+	minPort := basePort - 1000
+	if minPort < 1 {
+		minPort = 1
+	}
+
+	maxPort := basePort + 1000
+	if maxPort > 65535 {
+		maxPort = 65535
+	}
+	return minPort, maxPort, nil
+}
+
 func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, needSharedKey bool) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 12
+	punchPayload := []byte(deriveKeyForPayload(sessionUid))
 	for round := 1; round <= 4; round++ {
 
 		fmt.Fprintf(os.Stderr, "=== Round %d: Trying UDP-P2P Connection ===\n", round)
 
-		// 1. 交换 NAT 信息
+		// 交换 NAT 信息
 		p2pInfo, err := Do_autoP2P("udp", sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("P2P info exchange failed: %v", err)
@@ -525,20 +571,7 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 			isClient = !isClient
 		}
 
-		// 2. 解析本地地址
-		localAddr, err := net.ResolveUDPAddr("udp", p2pInfo.LocalLAN)
-		if err != nil {
-			return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
-		}
-
-		// 3. 创建拨号器
-		dialer := &net.Dialer{
-			LocalAddr: localAddr,
-			Control:   ControlUDP,
-			Timeout:   5 * time.Second,
-		}
-
-		// 4. 选择最佳目标地址（内网优先）
+		// 选择最佳目标地址（内网优先）
 		sameNAT, similarLAN := CompareP2PAddresses(p2pInfo)
 		remoteAddr := p2pInfo.RemoteNAT // 默认公网
 		routeReason := "different network"
@@ -547,44 +580,53 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 			routeReason = "same NAT & similar LAN"
 		}
 
-		// 5. 建立 UDP 连接
-		conn, err := dialer.Dial("udp", remoteAddr)
+		localAddr, err := net.ResolveUDPAddr("udp", p2pInfo.LocalLAN)
 		if err != nil {
-			return nil, false, nil, fmt.Errorf("failed to dial remote: %v", err)
+			return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
 		}
-
-		// 6. 打印详细连接信息
+		remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("failed to resolve remote address: %v", err)
+		}
+		// 打印详细连接信息
 		fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT)
 		fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
 		fmt.Fprintf(os.Stderr, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
-
 		if isClient {
 			fmt.Fprintf(os.Stderr, "  - %-14s: sending PING every 1s (start immediately)\n", "Client Mode")
 		} else {
 			fmt.Fprintf(os.Stderr, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
 		}
-
 		fmt.Fprintf(os.Stderr, "  - %-14s: %ds\n", "Timeout", count)
+		isRemoteNatPortChanged := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
 
-		// 7. 启动读写协程
+		// 启动读写协程
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
 		defer cancel()
 
 		recvChan := make(chan bool)
 		errChan := make(chan error)
 
+		uconn, err := net.ListenUDP("udp", localAddr)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+		}
+		buconn := NewBoundUDPConn(uconn, "", false)
+
 		// 读协程：收包，类似TCP三次握手等待TCP SYN+ACK
 		go func() {
 			buf := make([]byte, 1024)
 			for {
-				n, err := conn.Read(buf)
+				n, err := buconn.Read(buf)
 				if err != nil {
 					errChan <- err
 					return
 				}
-				if n >= 4 && string(buf[:4]) == "ping" {
+				if bytes.Equal(buf[:n], punchPayload) {
 					fmt.Fprintf(os.Stderr, "Received PING from peer!\n")
-					conn.Write([]byte("ping")) //类似TCP三次握手收到SYN+ACK后，发送个ACK
+					buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
+					buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
+					buconn.Write(punchPayload)
 					recvChan <- true
 					return
 				}
@@ -595,12 +637,27 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 		go func() {
 			if isClient {
 				// 客户端：立即发 ping
+				uconn.WriteToUDP(punchPayload, remoteUDPAddr)
+
+				remoteNatIP, remoteNatPort, err1 := net.SplitHostPort(p2pInfo.RemoteNAT)
+				if err1 == nil && isRemoteNatPortChanged && !strings.HasPrefix(routeReason, "same") {
+					// 对方的内网端口和NAT端口不一致，在一段端口范围内尝试打洞
+					minPort, maxPort, _ := udpPunchPortRange(remoteNatPort)
+					fmt.Fprintf(os.Stderr, "Starting to send hole-punching packets to %s:%d-%d\n", remoteNatIP, minPort, maxPort)
+					for i := 0; i < 2; i++ {
+						for port := minPort; port <= maxPort; port++ {
+							addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(port))
+							peerAddr, _ := net.ResolveUDPAddr("udp", addrStr)
+							uconn.WriteToUDP(punchPayload, peerAddr)
+						}
+					}
+				}
 				for i := 0; i < count; i++ {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						if _, err := conn.Write([]byte("ping")); err != nil {
+						if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
 							errChan <- err
 							return
 						}
@@ -616,7 +673,7 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 					case <-ctx.Done():
 						return
 					default:
-						if _, err := conn.Write([]byte("ping")); err != nil {
+						if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
 							errChan <- err
 							return
 						}
@@ -627,17 +684,17 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 			}
 		}()
 
-		// 8. 等待结果
+		// 等待结果
 		select {
 		case <-recvChan:
 			fmt.Fprintf(os.Stderr, "UDP-P2P connection established!\n")
-			return conn, isClient, sharedKey, nil
+			return buconn, isClient, sharedKey, nil
 		case err := <-errChan:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			conn.Close()
+			buconn.Close()
 		case <-ctx.Done():
 			fmt.Fprintf(os.Stderr, "Round %d timeout (%ds)\n", round, count)
-			conn.Close()
+			buconn.Close()
 		}
 		fmt.Fprintf(os.Stderr, "\n")
 	}

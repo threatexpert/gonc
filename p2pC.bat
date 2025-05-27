@@ -8,7 +8,7 @@ title p2p-C
 echo ________________________________
 echo Running command at %TIME%
 
-gonc.exe -mqtt-push hello -p2p-kcp 12345678 -exec ". -app-mux -l 9999" -tls
+gonc.exe -mqtt-push hello -p2p-kcp 12345678 -exec "-app-mux -l 9999" -tls
 
 timeout /t 10 >nul
 goto loop

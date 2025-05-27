@@ -25,6 +25,15 @@ var (
 	httpServeDir      = "."
 )
 
+type MuxSessionConfig struct {
+	Engine      string
+	AppMode     string
+	Host        string // for forward
+	Port        string
+	RootDir     string // for httpserver
+	SessionConn net.Conn
+}
+
 type stdioConn struct{}
 
 func (s *stdioConn) Read(p []byte) (int, error)         { return os.Stdin.Read(p) }
@@ -244,184 +253,260 @@ func mux_main() {
 		sessionConn = conn_tls
 	}
 
-	if appMode == "listen" {
-		fmt.Fprintln(os.Stderr, "Waiting for app-mux handshake...")
-		hello := make([]byte, 16)
-		if _, err := io.ReadFull(sessionConn, hello); err != nil {
-			fmt.Fprintf(os.Stderr, "mux read hello failed: %v\n", err)
-			os.Exit(1)
-		}
-		peer_mode := string(bytes.TrimRight(hello, "\x00"))
-		if peer_mode != "socks5" && peer_mode != "forward" && peer_mode != "httpserver" {
-			fmt.Fprintf(os.Stderr, "invalid peer mode: %q\n", peer_mode)
-			os.Exit(1)
-		}
+	cfg := MuxSessionConfig{
+		Engine:      *muxEngine,
+		AppMode:     appMode,
+		Host:        host,
+		Port:        port,
+		RootDir:     httpServeDir,
+		SessionConn: sessionConn,
+	}
+	err = handleMuxSession(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "app-mux: %v\n", err)
+	}
+}
 
-		var session interface{}
-		switch *muxEngine {
-		case "yamux":
-			session, err = yamux.Client(sessionConn, nil)
-		case "smux":
-			session, err = smux.Client(sessionConn, nil)
-		default:
-			fmt.Fprintf(os.Stderr, "Unknown mux-engine: %s\n", *muxEngine)
-			os.Exit(1)
+func Appp_mux_main(conn net.Conn, args []string) {
+	appMode := ""
+	host := ""
+	port := ""
+	if len(args) == 2 && args[0] == "-l" {
+		port = args[1]
+		appMode = "listen"
+	} else if len(args) == 1 && args[0] == "socks5" {
+		appMode = "socks5"
+	} else if len(args) >= 1 && args[0] == "httpserver" {
+		appMode = "httpserver"
+		if len(args) > 1 {
+			httpServeDir = args[1]
 		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mux client failed:", err)
-			os.Exit(1)
-		}
-
-		laddr := port
-		if !strings.Contains(laddr, ":") {
-			laddr = "127.0.0.1:" + laddr
-		}
-
-		ln, err := net.Listen("tcp", laddr)
-		if err != nil {
-			log.Fatalf("listen failed: %v", err)
-		}
-
-		if peer_mode == "socks5" {
-			fmt.Fprintln(os.Stderr, "[socks5] Listening on", ln.Addr().String())
-		} else if peer_mode == "forward" {
-			fmt.Fprintln(os.Stderr, "[forward] Listening on", ln.Addr().String())
-		} else if peer_mode == "httpserver" {
-			addr := ln.Addr().String()
-			fmt.Fprintf(os.Stderr, "[httpserver] Serving files at %s\n", addr)
-			// 提示用户如何访问
-			_, port, _ := net.SplitHostPort(addr)
-			fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser to browse or download files.\n", port)
-		} else {
-			fmt.Fprintf(os.Stderr, "invalid peer mode: %q\n", peer_mode)
-			os.Exit(1)
-		}
-
-		go func() {
-			for {
-				if closed := isSessionClosed(session); closed {
-					fmt.Fprintln(os.Stderr, "mux session closed")
-					os.Exit(1)
-				}
-				time.Sleep(1 * time.Second)
-			}
-		}()
-
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Accept failed:", err)
-				continue
-			}
-			go func(c net.Conn) {
-				var stream io.ReadWriteCloser
-				switch s := session.(type) {
-				case *yamux.Session:
-					stream, err = s.Open()
-				case *smux.Session:
-					stream, err = s.Open()
-				default:
-					err = fmt.Errorf("unknown mux session type")
-				}
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "mux Open failed:", err)
-					c.Close()
-					return
-				}
-				handleProxy(c, stream)
-			}(conn)
-		}
-
+	} else if len(args) == 2 {
+		host = args[0]
+		port = args[1]
+		appMode = "forward"
 	} else {
-		hello := make([]byte, 16)
-		copy(hello, appMode)
-		_, err = sessionConn.Write(hello)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mux write hello failed: %v\n", err)
-			os.Exit(1)
-		}
+		mux_usage()
+		return
+	}
 
-		var session interface{}
-		switch *muxEngine {
-		case "yamux":
-			session, err = yamux.Server(sessionConn, nil)
-		case "smux":
-			session, err = smux.Server(sessionConn, nil)
-		default:
-			fmt.Fprintf(os.Stderr, "Unknown mux-engine: %s\n", *muxEngine)
-			os.Exit(1)
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mux server failed:", err)
-			os.Exit(1)
-		}
+	cfg := MuxSessionConfig{
+		Engine:      *muxEngine,
+		AppMode:     appMode,
+		Host:        host,
+		Port:        port,
+		RootDir:     httpServeDir,
+		SessionConn: conn,
+	}
 
-		if appMode == "forward" {
-			for {
-				var stream io.ReadWriteCloser
-				switch s := session.(type) {
-				case *yamux.Session:
-					stream, err = s.Accept()
-				case *smux.Session:
-					stream, err = s.Accept()
-				default:
-					err = fmt.Errorf("unknown mux session type")
-				}
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "Accept mux stream failed:", err)
-					break
-				}
-				wrappedStream := &streamWrapper{ReadWriteCloser: stream}
-				go func(s io.ReadWriteCloser) {
-					defer s.Close()
-					targetConn, err := net.Dial("tcp", net.JoinHostPort(host, port))
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "Connect target failed:", err)
-						return
-					}
-					defer targetConn.Close()
-					handleProxy(s, targetConn)
-				}(wrappedStream)
+	err := handleMuxSession(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "app-mux: %v\n", err)
+	}
+}
+
+func handleMuxSession(cfg MuxSessionConfig) error {
+	switch cfg.AppMode {
+	case "listen":
+		return handleListenMode(cfg)
+	case "forward":
+		return handleForwardMode(cfg)
+	case "socks5":
+		return handleSocks5Mode(cfg)
+	case "httpserver":
+		return handleHTTPServerMode(cfg)
+	default:
+		return fmt.Errorf("unsupported app mode: %s", cfg.AppMode)
+	}
+}
+
+func handleListenMode(cfg MuxSessionConfig) error {
+	fmt.Fprintln(os.Stderr, "Waiting for app-mux handshake...")
+	hello := make([]byte, 16)
+	if _, err := io.ReadFull(cfg.SessionConn, hello); err != nil {
+		return fmt.Errorf("mux read hello failed: %v", err)
+	}
+	peerMode := string(bytes.TrimRight(hello, "\x00"))
+
+	var session interface{}
+	var err error
+
+	session, err = createMuxSession(cfg.Engine, cfg.SessionConn, true)
+	if err != nil {
+		return err
+	}
+
+	laddr := cfg.Port
+	if !strings.Contains(laddr, ":") {
+		laddr = "127.0.0.1:" + laddr
+	}
+	ln, err := net.Listen("tcp", laddr)
+	if err != nil {
+		return fmt.Errorf("listen failed: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "[%s] Listening on %s\n", peerMode, ln.Addr().String())
+	if peerMode == "httpserver" {
+		_, port, _ := net.SplitHostPort(ln.Addr().String())
+		fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser\n", port)
+	}
+
+	// session health check
+	var sessErr error
+	go func() {
+		for {
+			if isSessionClosed(session) {
+				sessErr = fmt.Errorf("mux session closed")
+				ln.Close()
+				return
 			}
-		} else if appMode == "socks5" {
-			logger := log.New(os.Stderr, "[socks5] ", log.LstdFlags)
-			conf := &socks5.Config{Logger: logger}
-			server, err := socks5.New(conf)
+			time.Sleep(time.Second)
+		}
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if sessErr != nil {
+				return sessErr
+			}
+			return fmt.Errorf("listener accept failed: %v", err)
+		}
+
+		go func(c net.Conn) {
+			var stream io.ReadWriteCloser
+			switch s := session.(type) {
+			case *yamux.Session:
+				stream, err = s.Open()
+			case *smux.Session:
+				stream, err = s.Open()
+			}
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "Create socks5 failed:", err)
-				os.Exit(1)
+				fmt.Fprintln(os.Stderr, "mux Open failed:", err)
+				c.Close()
+				return
 			}
-			fmt.Fprintln(os.Stderr, "SOCKS5 ready on mux")
-			server.Serve(&muxListener{session})
-		} else if appMode == "httpserver" {
-			handler := createHTTPHandler(httpServeDir)
+			handleProxy(c, stream)
+		}(conn)
+	}
+}
 
-			for {
-				var stream io.ReadWriteCloser
-				switch s := session.(type) {
-				case *yamux.Session:
-					stream, err = s.Accept()
-				case *smux.Session:
-					stream, err = s.Accept()
-				default:
-					err = fmt.Errorf("unknown mux session type")
-				}
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "Accept mux stream failed:", err)
-					break
-				}
-				wrappedStream := &streamWrapper{ReadWriteCloser: stream}
+func handleForwardMode(cfg MuxSessionConfig) error {
+	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
+		return err
+	}
 
-				go func(conn net.Conn) {
-					defer conn.Close()
-					listener := &singleConnListener{
-						conn: conn,
-						done: make(chan struct{}),
-					}
-					_ = http.Serve(listener, handler)
-				}(wrappedStream)
-			}
+	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stderr, "forward ready on mux")
+
+	for {
+		var stream io.ReadWriteCloser
+		switch s := session.(type) {
+		case *yamux.Session:
+			stream, err = s.Accept()
+		case *smux.Session:
+			stream, err = s.Accept()
 		}
+		if err != nil {
+			return fmt.Errorf("accept mux stream failed: %v", err)
+		}
+
+		go func(s io.ReadWriteCloser) {
+			defer s.Close()
+			targetConn, err := net.Dial("tcp", net.JoinHostPort(cfg.Host, cfg.Port))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Connect target failed:", err)
+				return
+			}
+			defer targetConn.Close()
+			handleProxy(s, targetConn)
+		}(&streamWrapper{ReadWriteCloser: stream})
+	}
+}
+
+func handleSocks5Mode(cfg MuxSessionConfig) error {
+	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
+		return err
+	}
+
+	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
+	if err != nil {
+		return err
+	}
+
+	logger := log.New(os.Stderr, "[socks5] ", log.LstdFlags)
+	conf := &socks5.Config{Logger: logger}
+	server, err := socks5.New(conf)
+	if err != nil {
+		return fmt.Errorf("create socks5 failed: %v", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "SOCKS5 ready on mux")
+	return server.Serve(&muxListener{session})
+}
+
+func handleHTTPServerMode(cfg MuxSessionConfig) error {
+	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
+		return err
+	}
+
+	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
+	if err != nil {
+		return err
+	}
+
+	handler := createHTTPHandler(cfg.RootDir)
+
+	fmt.Fprintln(os.Stderr, "httpserver ready on mux")
+
+	for {
+		var stream io.ReadWriteCloser
+		switch s := session.(type) {
+		case *yamux.Session:
+			stream, err = s.Accept()
+		case *smux.Session:
+			stream, err = s.Accept()
+		}
+		if err != nil {
+			return fmt.Errorf("accept mux stream failed: %v", err)
+		}
+
+		go func(conn net.Conn) {
+			defer conn.Close()
+			listener := &singleConnListener{
+				conn: conn,
+				done: make(chan struct{}),
+			}
+			_ = http.Serve(listener, handler)
+		}(&streamWrapper{ReadWriteCloser: stream})
+	}
+}
+
+func sendHello(conn net.Conn, mode string) error {
+	hello := make([]byte, 16)
+	copy(hello, mode)
+	_, err := conn.Write(hello)
+	return err
+}
+
+func createMuxSession(engine string, conn net.Conn, isClient bool) (interface{}, error) {
+	switch engine {
+	case "yamux":
+		if isClient {
+			return yamux.Client(conn, nil)
+		}
+		return yamux.Server(conn, nil)
+	case "smux":
+		if isClient {
+			return smux.Client(conn, nil)
+		}
+		return smux.Server(conn, nil)
+	default:
+		return nil, fmt.Errorf("unknown mux engine: %s", engine)
 	}
 }
 
