@@ -3,20 +3,6 @@ go mod tidy
 
 set app=gonc
 
-set PY=
-python --version > nul 2>&1
-IF %ERRORLEVEL% EQU 0 (
-    set PY=python > nul
-)
-py --version > nul 2>&1
-IF %ERRORLEVEL% EQU 0 (
-    set PY=py > nul
-)
-if "%PY%"=="" (
-    echo no python
-)
-
-
 SET GOOS=windows
 SET GOARCH=386
 SET CGO_ENABLED=0
