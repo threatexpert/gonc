@@ -4,7 +4,7 @@ golang版 netcat, 更方便的建立点对点通信。
 
 有以下特点：
 
- - 🔁 自动化内网穿透：使用 -p2p-tcp/-p2p-kcp 自动实现 TCP/UDP 的 NAT 打洞与点对点连接，无需手动配置，依赖公共 TURN 和 MQTT 服务交换地址信息。
+ - 🔁 自动化内网穿透：使用 -p2p 自动实现 TCP/UDP 的 NAT 打洞与点对点连接，无需手动配置，依赖公共 TURN 和 MQTT 服务交换地址信息。
 
  - 🚀 UDP 稳定传输通道：集成 KCP 协议，TCP无法穿透NAT的情况，用基于UDP的KCP也能保持通信的可靠性。
 
@@ -30,17 +30,11 @@ golang版 netcat, 更方便的建立点对点通信。
 
 - 用TCP直接在两个内网P2P通信，要自己约定一个唯一ID，例如 randomString ，每次用都随机换ID避免和别人一样。
 
-    `gonc.exe -tls -p2p-tcp randomString`
+    `gonc.exe -p2p randomString`
 
-    另一端用也完全一样的的参数，程序会自己协商角色（tls client/server）并完成TLS协议
+    另一端用也完全一样的的参数，程序会自己尝试TCP或UDP建立通信，自己协商角色（tls client/server）并完成TLS协议
 
-    `gonc.exe -tls -p2p-tcp randomString`
-
-- 由于TCP穿透NAT不如UDP成功率高，可以基于UDP的KCP协议实现通信，这样建立的是可靠传输的UDP
-
-    `gonc.exe -p2p-kcp randomString`
-
-    另一端用也完全一样的的参数
+    `gonc.exe -p2p randomString`
 
 
 - 支持使用socks5代理
@@ -88,17 +82,17 @@ golang版 netcat, 更方便的建立点对点通信。
     
     端口转发
 
-    `gonc.exe -p2p-kcp randomString -exec ". -app-mux 127.0.0.1 3389"`
+    `gonc.exe -p2p randomString -exec "-app-mux 127.0.0.1 3389"`
 
     或
 
-    `gonc.exe -p2p-kcp randomString -exec ". -app-mux socks5"`
+    `gonc.exe -p2p randomString -exec "-app-mux socks5"`
 
     或
 
-    `gonc.exe -p2p-kcp randomString -exec ". -app-mux httpserver c:/RootDir"`
+    `gonc.exe -p2p randomString -exec "-app-mux httpserver c:/RootDir"`
 
 
     另一端(本机监听端口)，例如对端使用了httpserver参数，那么访问本机9999端口可实现浏览对端的文件列表
 
-    `gonc.exe -p2p-kcp randomString -exec ". -app-mux -l 9999"`
+    `gonc.exe -p2p randomString -exec "-app-mux -l 9999"`
