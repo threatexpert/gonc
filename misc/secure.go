@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/big"
@@ -43,6 +44,16 @@ func generateRandomString(length int) (string, error) {
 		result[i] = charset[n.Int64()]
 	}
 	return string(result), nil
+}
+
+func secureSeed() int64 {
+	var seed int64
+	err := binary.Read(rand.Reader, binary.BigEndian, &seed)
+	if err != nil {
+		// 回退到时间种子
+		return time.Now().UnixNano()
+	}
+	return seed
 }
 
 // IsWeakPassword 判断一个密码是否太弱

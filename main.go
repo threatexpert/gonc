@@ -68,18 +68,22 @@ var (
 	keepAlive         = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
 	punchData         = flag.String("punchdata", "ping\n", "UDP punch payload")
 	MQTTServer        = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883", "MQTT server, others: tcp://broker.emqx.io:1883 ; tcp://test.mosquitto.org:1883")
-	autoP2P           = flag.String("p2p", "", "P2PSessionKey")
-	autoP2PKCP        = flag.String("p2p-kcp", "", "P2PSessionKey, kcp over udp, will be retried up to 3 times upon failure.")
-	autoP2PTCP        = flag.String("p2p-tcp", "", "P2PSessionKey, tcp, will be retried up to 3 times upon failure.")
+	autoP2P           = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
+	autoP2PKCP        = flag.String("p2p-kcp", "", "P2P session key, kcp over udp, will be retried up to 3 times upon failure.")
+	autoP2PTCP        = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
 	autoP2PTCPSS      = flag.String("p2p-ss", "", "p2p-tcp + AES-CTR")
-	MQTTWait          = flag.String("mqtt-wait", "", "")
-	MQTTPush          = flag.String("mqtt-push", "", "")
+	MQTTWait          = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
+	MQTTPush          = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
+	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
+	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
 )
 
 func init() {
 	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
 	flag.StringVar(&misc.TopicExchange, "mqtt-nat-topic", misc.TopicExchange, "")
 	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
+	flag.IntVar(&misc.PunchingShortTTL, "punch-short-ttl", misc.PunchingShortTTL, "")
+	flag.IntVar(&misc.PunchingBatchPortSize, "punch-batch", misc.PunchingBatchPortSize, "brutely guess, 0 is disabled")
 }
 
 func init_TLS(genCertForced bool) {
@@ -93,12 +97,11 @@ func init_TLS(genCertForced bool) {
 				fmt.Fprintf(os.Stderr, "EC and RSA both are disabled\n")
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "Generating certificate...")
 			if *tlsECCertEnabled {
 				if *presharedKey != "" {
-					fmt.Fprintf(os.Stderr, "ECDSA derived from PSK...")
+					fmt.Fprintf(os.Stderr, "Generating ECDSA(PSK-derived) cert for secure communication...")
 				} else {
-					fmt.Fprintf(os.Stderr, "random ECDSA...")
+					fmt.Fprintf(os.Stderr, "Generating ECDSA(randomly) cert for secure communication...")
 				}
 				tls_cert_EC, err = misc.GenerateECDSACertificate(*tlsSNI, *presharedKey)
 				if err != nil {
@@ -107,7 +110,7 @@ func init_TLS(genCertForced bool) {
 				}
 			}
 			if *tlsRSACertEnabled {
-				fmt.Fprintf(os.Stderr, "RSA...")
+				fmt.Fprintf(os.Stderr, "Generating RSA cert...")
 				tls_cert_RSA, err = misc.GenerateRSACertificate(*tlsSNI)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error generating RSA certificate: %v\n", err)
@@ -395,6 +398,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "go-netcat v1.6beta")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
+	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
 
@@ -435,6 +439,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-psk and -tlsrsa cannot be used together\n")
 		os.Exit(1)
 	}
+	if *useIPv4 && *useIPv6 {
+		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
+		os.Exit(1)
+	}
 	if *kcpEnabled || *kcpSEnabled {
 		*udpProtocol = true
 	}
@@ -461,11 +469,16 @@ func main() {
 	var conn net.Conn
 	var network string
 	var P2PSessionKey string
-	var clearCSRole bool
+	var tryDiffNetwork bool
 	if *udpProtocol {
 		network = "udp"
 	} else {
 		network = "tcp"
+	}
+	if *useIPv4 {
+		network += "4"
+	} else if *useIPv6 {
+		network += "6"
 	}
 
 	host := ""
@@ -485,10 +498,12 @@ func main() {
 	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
 		*listenMode = false
 		if *autoP2P != "" {
+			network = "any"
 			P2PSessionKey = *autoP2P
-			clearCSRole = true //根据参数决定TLS/KCP的C/S角色
+			tryDiffNetwork = true
+			*tlsEnabled = true //-p2p 默认开启tls安全通信
 		} else if *autoP2PKCP != "" {
-			clearCSRole = false //尝试不同TLS/KCP的C/S角色
+			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PKCP
 			*kcpEnabled = true
 			*udpProtocol = true
@@ -499,18 +514,23 @@ func main() {
 			// 	misc.DebugServerRole = "C"
 			// }
 		} else if *autoP2PTCP != "" {
-			clearCSRole = false
+			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PTCP
 			*udpProtocol = false
 			network = "tcp"
 		} else if *autoP2PTCPSS != "" {
-			clearCSRole = false
+			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PTCPSS
 			*udpProtocol = false
 			secureStreamEnabled = true
 			network = "tcp"
 		} else {
 			os.Exit(1)
+		}
+		if *useIPv4 {
+			network += "4"
+		} else if *useIPv6 {
+			network += "6"
 		}
 		if strings.HasPrefix(P2PSessionKey, "@") {
 			P2PSessionKey, err = ReadPSKFile(P2PSessionKey)
@@ -558,7 +578,7 @@ func main() {
 			}
 
 			for {
-				conn, err = do_P2P(network, P2PSessionKey, clearCSRole)
+				conn, err = do_P2P_multistuns(network, P2PSessionKey, tryDiffNetwork)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 					time.Sleep(10 * time.Second)
@@ -568,10 +588,13 @@ func main() {
 				time.Sleep(2 * time.Second)
 			}
 		} else {
-			conn, err = do_P2P(network, P2PSessionKey, clearCSRole)
+			conn, err = do_P2P_multistuns(network, P2PSessionKey, tryDiffNetwork)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 				os.Exit(1)
+			}
+			if tryDiffNetwork {
+				network = conn.LocalAddr().Network()
 			}
 		}
 	}
@@ -583,20 +606,21 @@ func main() {
 		listenAddr := net.JoinHostPort(host, port)
 		if *udpProtocol {
 			// 绑定UDP地址
-			addr, err := net.ResolveUDPAddr("udp", listenAddr)
+			addr, err := net.ResolveUDPAddr(network, listenAddr)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error resolving UDP address: %v\n", err)
 				os.Exit(1)
 			}
 
 			if *useTurn {
-				err = ShowPublicIP("udp", addr.String())
+				err = ShowPublicIP(network, addr.String())
 				if err != nil {
 					panic(err)
 				}
+				time.Sleep(1500 * time.Millisecond) //等待一会儿，避免立刻监听又收到stun服务器回复的udp包
 			}
 
-			uconn, err := net.ListenUDP("udp", addr)
+			uconn, err := net.ListenUDP(network, addr)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error listening on UDP address: %v\n", err)
 				os.Exit(1)
@@ -634,7 +658,7 @@ func main() {
 					data := []byte(*punchData)
 					for port := startPort; port <= endPort; port++ {
 						addrStr := net.JoinHostPort(peerIP, strconv.Itoa(port))
-						peerAddr, err := net.ResolveUDPAddr("udp", addrStr)
+						peerAddr, err := net.ResolveUDPAddr(network, addrStr)
 						if err != nil {
 							fmt.Fprintf(os.Stderr, "Invalid peer address %s: %v\n", addrStr, err)
 							continue
@@ -654,52 +678,57 @@ func main() {
 				conn = buconn
 			}
 		} else {
+			//TCP listen
 			var listener net.Listener
 			var stopSynTrigger bool = false
 			lc := net.ListenConfig{}
 			if *peer != "" || *useTurn {
 				lc.Control = misc.ControlTCP
 			}
-			listener, err = lc.Listen(context.Background(), "tcp", listenAddr)
+			listener, err = lc.Listen(context.Background(), network, listenAddr)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stderr, "Listening TCP on %s\n", listener.Addr().String())
 			if *useTurn {
-				err = ShowPublicIP("tcp", listener.Addr().String())
+				err = ShowPublicIP(network, listener.Addr().String())
 				if err != nil {
 					panic(err)
 				}
 			}
 
 			if *peer != "" {
-				// 发起一次 outbound TCP SYN，触发 NAT 映射
-				laddr, _ := net.ResolveTCPAddr("tcp", listener.Addr().String())
-				raddr, err := net.ResolveTCPAddr("tcp", *peer)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", *peer, err)
-					os.Exit(1)
-				}
+				// 发起 outbound TCP SYN，触发 NAT 映射
+				laddr, _ := net.ResolveTCPAddr(network, listener.Addr().String())
 
 				go func() {
-
 					for !stopSynTrigger {
 						d := net.Dialer{
 							LocalAddr: laddr,
 							Timeout:   20 * time.Millisecond,
-							Control:   misc.ControlTCP,
+							Control:   misc.ControlTCPTTL, //小ttl，通常到不了对端
 						}
-						pc, err := d.Dial("tcp", raddr.String())
-						if err == nil {
-							if tcpCon, ok := conn.(*net.TCPConn); ok {
-								tcpCon.SetLinger(0)
+
+						peerIP, startPort, endPort := parsePeerAddressRange(*peer)
+						for port := startPort; port <= endPort; port++ {
+							addrStr := net.JoinHostPort(peerIP, strconv.Itoa(port))
+							peerAddr, err := net.ResolveTCPAddr(network, addrStr)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "Invalid peer address %s: %v\n", addrStr, err)
+								continue
 							}
-							pc.Close()
-						}
-						fmt.Fprintf(os.Stderr, "Sent a TCP SYN(%s->%s) to trigger NAT mapping\n", laddr.String(), raddr.String())
-						if !stopSynTrigger {
-							time.Sleep(2 * time.Second)
+							pc, err := d.Dial(network, peerAddr.String())
+							if err == nil {
+								if tcpCon, ok := conn.(*net.TCPConn); ok {
+									tcpCon.SetLinger(0)
+								}
+								pc.Close()
+							}
+							fmt.Fprintf(os.Stderr, "Sent a TCP SYN(%s->%s) to trigger NAT mapping\n", laddr.String(), peerAddr.String())
+							if !stopSynTrigger {
+								time.Sleep(2 * time.Second)
+							}
 						}
 					}
 				}()
@@ -741,15 +770,21 @@ func main() {
 	} else if conn == nil {
 		//主动连接模式
 		var localAddr net.Addr
+		var localTcpAddr *net.TCPAddr
 
 		if *localbind != "" {
-			if *udpProtocol {
-				localAddr, err = net.ResolveUDPAddr("udp", *localbind)
-			} else {
-				localAddr, err = net.ResolveTCPAddr("tcp", *localbind)
-			}
-			if err != nil {
-				panic(err)
+			switch {
+			case strings.HasPrefix(network, "tcp"):
+				localTcpAddr, err = net.ResolveTCPAddr(network, *localbind)
+				if err != nil {
+					panic(err)
+				}
+				localAddr = localTcpAddr
+			case strings.HasPrefix(network, "udp"):
+				localAddr, err = net.ResolveUDPAddr(network, *localbind)
+				if err != nil {
+					panic(err)
+				}
 			}
 		}
 
@@ -774,10 +809,10 @@ func main() {
 				dialer := &net.Dialer{
 					LocalAddr: localAddr,
 				}
-				switch network {
-				case "tcp":
+				switch {
+				case strings.HasPrefix(network, "tcp"):
 					dialer.Control = misc.ControlTCP
-				case "udp":
+				case strings.HasPrefix(network, "udp"):
 					dialer.Control = misc.ControlUDP
 				}
 				conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
@@ -787,7 +822,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		if network == "udp" {
+		if strings.HasPrefix(network, "udp") {
 			configUDPConn(conn)
 			fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
 		} else {
@@ -994,7 +1029,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	var cmd *exec.Cmd
 	var err error
 	var blocksize int = 32 * 1024
-	if conn.LocalAddr().Network() == "udp" {
+	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 		blocksize = 1320
 	}
 
@@ -1211,7 +1246,7 @@ func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
 }
 
 func isKCPEnabled() bool {
-	return *kcpEnabled || *kcpSEnabled
+	return *udpProtocol && (*kcpEnabled || *kcpSEnabled)
 }
 
 func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn {
@@ -1388,30 +1423,96 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	return nil
 }
 
-func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
-	var err error
+func do_P2P_multistuns(network, sessionKey string, tryDiffNetwork bool) (net.Conn, error) {
+	if len(*turnServer) == 0 {
+		return nil, fmt.Errorf("empty stunservers list")
+	}
+
+	var lastErr error
+	stunsServers := strings.Split(*turnServer, ",")
+	for _, stun := range stunsServers {
+		stun = strings.TrimSpace(stun)
+		if stun == "" {
+			continue
+		}
+
+		conn, err := do_P2P(network, sessionKey, stun, tryDiffNetwork)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		if len(stunsServers) == 1 {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("all STUN servers failed, last error: %w", lastErr)
+	}
+	return nil, fmt.Errorf("no valid STUN servers provided")
+}
+
+func do_P2P(network, sessionKey, stunServer string, tryDiffNetwork bool) (net.Conn, error) {
+	var err, err2 error
 	var conn net.Conn
 	var isRoleClient bool
 
-	if clearCSRole {
+	if tryDiffNetwork {
 		err = Mqtt_ensure_ready(sessionKey)
 		if err != nil {
 			return nil, err
 		}
-		conn, _, err = misc.Simple_P2P(network, sessionKey, *turnServer, *MQTTServer)
-		if err != nil {
-			return nil, err
-		}
-	} else if network == "udp" {
-		err = Mqtt_ensure_ready(sessionKey)
-		if err != nil {
-			return nil, err
-		}
-		conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(sessionKey, *turnServer, *MQTTServer, true)
+		conn, isRoleClient, err = misc.Easy_P2P(network, sessionKey, stunServer, *MQTTServer)
 		if err != nil {
 			return nil, err
 		}
 
+		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+			*udpProtocol = true
+			if isRoleClient {
+				*kcpSEnabled = false
+				*kcpEnabled = true
+			} else {
+				*kcpSEnabled = true
+				*kcpEnabled = false
+			}
+		} else {
+			*udpProtocol = false
+			*kcpSEnabled = false
+			*kcpEnabled = false
+		}
+		*tlsEnabled = true
+		if isTLSEnabled() {
+			*tlsServerMode = !isRoleClient
+		}
+	} else if strings.HasPrefix(network, "udp") {
+		err = Mqtt_ensure_ready(sessionKey)
+		if err != nil {
+			return nil, err
+		}
+		if network == "udp6" {
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, true, 2)
+			if err != nil {
+				return nil, err
+			}
+		} else if network == "udp4" {
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, true, 4)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal("udp6", sessionKey, stunServer, *MQTTServer, true, 2)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_UDP_NAT_Traversal("udp4", sessionKey, stunServer, *MQTTServer, true, 4)
+				if err2 != nil {
+					//返回udp4的err
+					return nil, err
+				}
+			}
+		}
+
+		*udpProtocol = true
 		if isRoleClient {
 			//client mode
 			*kcpSEnabled = false
@@ -1423,14 +1524,31 @@ func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
 		if isTLSEnabled() {
 			*tlsServerMode = !isRoleClient
 		}
-	} else if network == "tcp" {
+	} else if strings.HasPrefix(network, "tcp") {
 		err = Mqtt_ensure_ready(sessionKey)
 		if err != nil {
 			return nil, err
 		}
-		conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(sessionKey, *turnServer, *MQTTServer, secureStreamEnabled)
-		if err != nil {
-			return nil, err
+		if network == "tcp6" {
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 2)
+			if err != nil {
+				return nil, err
+			}
+		} else if network == "tcp4" {
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 4)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal("tcp6", sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 2)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_TCP_NAT_Traversal("tcp4", sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 4)
+				if err2 != nil {
+					//返回tcp4的err
+					return nil, err
+				}
+			}
 		}
 		if secureStreamEnabled {
 			if sessionSharedKey == nil || len(sessionSharedKey) != 32 {
@@ -1438,6 +1556,9 @@ func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
 				return nil, fmt.Errorf("expect a 32 bytes session key")
 			}
 		}
+		*udpProtocol = false
+		*kcpSEnabled = false
+		*kcpEnabled = false
 		if isTLSEnabled() {
 			*tlsServerMode = !isRoleClient
 		}
@@ -1446,7 +1567,7 @@ func do_P2P(network, sessionKey string, clearCSRole bool) (net.Conn, error) {
 	}
 
 	if conn != nil {
-		if network == "udp" {
+		if strings.HasPrefix(network, "udp") {
 			configUDPConn(conn)
 			fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
 		} else {

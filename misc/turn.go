@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -33,11 +34,12 @@ var (
 	lastStunClientConn net.Conn
 	lastStunClientLock sync.Mutex
 
-	DebugServerRole string
+	DebugServerRole       string
+	PunchingShortTTL      int = 5
+	PunchingBatchPortSize int = 0
 )
 
 func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (localaddress, nataddress string, err error) {
-
 	lastStunClientLock.Lock()
 	defer lastStunClientLock.Unlock()
 
@@ -51,14 +53,19 @@ func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (local
 
 	var laddr net.Addr
 
-	switch network {
-	case "tcp":
-		laddr, err = net.ResolveTCPAddr("tcp", bind)
+	if network == "tcp" || network == "udp" {
+		//传参不明确时统一用ipv4
+		network += "4"
+	}
+
+	switch {
+	case strings.HasPrefix(network, "tcp"):
+		laddr, err = net.ResolveTCPAddr(network, bind)
 		if err != nil {
 			return "", "", fmt.Errorf("resolve local tcp addr failed: %v", err)
 		}
-	case "udp":
-		laddr, err = net.ResolveUDPAddr("udp", bind)
+	case strings.HasPrefix(network, "udp"):
+		laddr, err = net.ResolveUDPAddr(network, bind)
 		if err != nil {
 			return "", "", fmt.Errorf("resolve local udp addr failed: %v", err)
 		}
@@ -71,10 +78,10 @@ func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (local
 		Timeout:   timeout,
 	}
 
-	switch network {
-	case "tcp":
+	switch {
+	case strings.HasPrefix(network, "tcp"):
 		d.Control = ControlTCP
-	case "udp":
+	case strings.HasPrefix(network, "udp"):
 		d.Control = ControlUDP
 	}
 
@@ -113,7 +120,7 @@ func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (local
 	}
 
 	//tcp不关闭连接，保持连接可能有助于NAT穿透，如果有连接关闭了可能NAT打开的洞也关闭
-	if network == "tcp" {
+	if strings.HasPrefix(network, "tcp") {
 		lastStunClient = c
 		lastStunClientConn = conn
 		go func(tc net.Conn, sc *stun.Client) {
@@ -208,6 +215,7 @@ func deriveKeyForPayload(uid string) string {
 }
 
 func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout time.Duration) (recvData string, err error) {
+	var qos byte = 2
 	topic := TopicExchange + deriveKeyForTopic("mqtt-topic-gonc-ex", sessionUid)
 
 	opts := mqtt.NewClientOptions().AddBroker(brokerServer)
@@ -224,15 +232,18 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout 
 	recvRemoteData := make(chan string, 1)
 
 	// 订阅
-	if token := client.Subscribe(topic, 0, func(_ mqtt.Client, msg mqtt.Message) {
+	if token := client.Subscribe(topic, qos, func(_ mqtt.Client, msg mqtt.Message) {
 		recvRemoteData <- string(msg.Payload())
 	}); token.Wait() && token.Error() != nil {
 		return "", token.Error()
 	}
 
 	//发布数据
-	client.Publish(topic, 0, false, sendData)
+	if token := client.Publish(topic, qos, false, sendData); token.Wait() && token.Error() != nil {
+		return "", token.Error()
+	}
 	stopPublish := make(chan struct{})
+	defer close(stopPublish)
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -241,7 +252,7 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout 
 			case <-stopPublish:
 				return
 			case <-ticker.C:
-				client.Publish(topic, 0, false, sendData)
+				client.Publish(topic, qos, false, sendData)
 			}
 		}
 	}()
@@ -256,16 +267,14 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout 
 		case remoteData = <-recvRemoteData:
 			if remoteData != sendData {
 				gotRemote = true
-				client.Publish(topic, 1, false, sendData)
+				token := client.Unsubscribe(topic)
+				token.Wait()
+				client.Publish(topic, qos, false, sendData)
 			}
 		case <-timeoutTimer.C:
-			close(stopPublish) //等待确认超时了则停止发布数据
 			return "", errors.New("timeout waiting for remote data exchange")
 		}
 	}
-
-	//退出循环了说明确认了，停止发布数据
-	close(stopPublish)
 
 	return remoteData, nil
 }
@@ -281,19 +290,27 @@ func deriveKey(salt, uid string) [32]byte {
 
 func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout time.Duration, needSharedKey, verb bool) (*P2PAddressInfo, error) {
 
+	var err, pubIPErr error
 	var priv *ecdsa.PrivateKey
 	var sharedKey [32]byte
 	myKey := deriveKey(network, sessionUid)
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Getting local & public IP...\n")
+		fmt.Fprintf(os.Stderr, "    Getting local & public IP (using STUN server: %s)...", turnServer)
 	}
-	localAddr, natAddr, err := GetPublicIP(network, "", turnServer, 5*time.Second)
-	if err != nil {
-		return nil, err
+	localAddr, natAddr, pubIPErr := GetPublicIP(network, "", turnServer, 5*time.Second)
+	if pubIPErr != nil {
+		if verb {
+			fmt.Fprintf(os.Stderr, "Failed\n")
+		}
+	} else {
+		if verb {
+			fmt.Fprintf(os.Stderr, "OK\n")
+		}
 	}
+	//即使GetPublicIP失败了，localAddr和natAddr为空时也通过MQTT告诉对方
 	myInfo := map[string]string{"lan": localAddr, "nat": natAddr, "pk": ""}
-	if needSharedKey {
+	if pubIPErr == nil && needSharedKey {
 		// ECC key gen
 		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -307,11 +324,21 @@ func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout ti
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Sending encrypted address info...\n")
+		fmt.Fprintf(os.Stderr, "    Exchanging NAT address info...")
 	}
 	remoteInfoRaw, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServer, timeout)
 	if err != nil {
+		if verb {
+			fmt.Fprintf(os.Stderr, "Failed\n")
+		}
 		return nil, err
+	}
+	if verb {
+		fmt.Fprintf(os.Stderr, "OK\n")
+	}
+
+	if pubIPErr != nil {
+		return nil, pubIPErr
 	}
 
 	var remotePayload securePayload
@@ -332,11 +359,14 @@ func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout ti
 	nat, ok2 := remoteInfo["nat"]
 	remotePubRaw, ok3 := remoteInfo["pk"]
 	if !ok1 || !ok2 || !ok3 {
-		return nil, fmt.Errorf("missing required remote address fields")
+		return nil, fmt.Errorf("missing required remote address fields from peer")
+	}
+	if lan == "" || nat == "" {
+		return nil, fmt.Errorf("the peer did not provide LAN or NAT %s address", network)
 	}
 	if needSharedKey {
 		if len(remotePubRaw) == 0 {
-			return nil, fmt.Errorf("missing pk data")
+			return nil, fmt.Errorf("missing pk field from peer")
 		}
 		remotePubBytes, err := base64.StdEncoding.DecodeString(remotePubRaw)
 		if err != nil {
@@ -369,7 +399,6 @@ func extractIP(addr string) string {
 	return host
 }
 
-// 判断两个 IP 是否属于同一个 /24 网段（前 3 段相同）
 func IsSameLAN(ip1, ip2 string) bool {
 	parsed1 := net.ParseIP(ip1)
 	parsed2 := net.ParseIP(ip2)
@@ -377,32 +406,45 @@ func IsSameLAN(ip1, ip2 string) bool {
 		return false
 	}
 
-	if parsed1.IsLoopback() || parsed2.IsLoopback() {
-		return false
+	// 检查是否都是环回地址
+	if parsed1.IsLoopback() && parsed2.IsLoopback() {
+		return true
 	}
 
-	// 检查是否都在私有地址段
-	if parsed1.IsPrivate() && parsed2.IsPrivate() {
-		// 针对常见私网段用合理掩码判断
-		switch {
-		case parsed1[12] == 10 && parsed2[12] == 10:
-			return true // 10.0.0.0/8
-		case parsed1[12] == 172 && parsed2[12] == 172 &&
-			parsed1[13] >= 16 && parsed1[13] <= 31 &&
-			parsed2[13] >= 16 && parsed2[13] <= 31:
-			return parsed1[12] == parsed2[12] && parsed1[13] == parsed2[13]
-		case parsed1[12] == 192 && parsed1[13] == 168 &&
-			parsed2[12] == 192 && parsed2[13] == 168:
-			return parsed1[12] == parsed2[12] && parsed1[13] == parsed2[13]
+	// IPv4 私有地址判断
+	if parsed1.To4() != nil && parsed2.To4() != nil {
+		if parsed1.IsPrivate() && parsed2.IsPrivate() {
+			switch {
+			case parsed1[12] == 10 && parsed2[12] == 10:
+				return true // 10.0.0.0/8
+			case parsed1[12] == 172 && parsed2[12] == 172 &&
+				parsed1[13] >= 16 && parsed1[13] <= 31 &&
+				parsed2[13] >= 16 && parsed2[13] <= 31:
+				return parsed1[12] == parsed2[12] && parsed1[13] == parsed2[13]
+			case parsed1[12] == 192 && parsed1[13] == 168 &&
+				parsed2[12] == 192 && parsed2[13] == 168:
+				return parsed1[12] == parsed2[12] && parsed1[13] == parsed2[13]
+			}
 		}
-	}
-
-	parts1 := strings.Split(ip1, ".")
-	parts2 := strings.Split(ip2, ".")
-	if len(parts1) != 4 || len(parts2) != 4 {
+		parts1 := strings.Split(ip1, ".")
+		parts2 := strings.Split(ip2, ".")
+		if len(parts1) == 4 && len(parts2) == 4 {
+			return parts1[0] == parts2[0] && parts1[1] == parts2[1] && parts1[2] == parts2[2]
+		}
 		return false
 	}
-	return parts1[0] == parts2[0] && parts1[1] == parts2[1] && parts1[2] == parts2[2]
+
+	// IPv6 私有地址判断 (ULA, fc00::/7)
+	if parsed1.IsPrivate() && parsed2.IsPrivate() {
+		// 简单判断前 64 位是否相同（通常 IPv6 LAN 使用相同前缀）
+		for i := 0; i < 8; i++ {
+			if parsed1[i] != parsed2[i] {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func CompareP2PAddresses(info *P2PAddressInfo) (sameNATIP bool, similarLAN bool) {
@@ -427,6 +469,15 @@ func isSamePort(addr1, addr2 string) bool {
 	return port1 == port2
 }
 
+func IsIPv6(addr string) bool {
+	ipStr, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	return ip != nil && ip.To4() == nil
+}
+
 func SelectRole(p2pInfo *P2PAddressInfo) bool {
 	// if DebugServerRole != "" {
 	// 	return DebugServerRole == "C"
@@ -434,129 +485,109 @@ func SelectRole(p2pInfo *P2PAddressInfo) bool {
 	return strings.Compare(CalculateMD5(p2pInfo.LocalLAN+p2pInfo.LocalNAT), CalculateMD5(p2pInfo.RemoteLAN+p2pInfo.RemoteNAT)) <= 0
 }
 
-func Simple_P2P(network, sessionUid, turnServer string, brokerServer string) (net.Conn, bool, error) {
-	fmt.Fprintf(os.Stderr, "Exchanging NAT address info via MQTT...\n")
-	p2pInfo, err := Do_autoP2P(network, sessionUid, turnServer, brokerServer, 25*time.Second, false, true)
-	if err != nil {
-		return nil, false, err
+func p2pCanDirect(p2pInfo *P2PAddressInfo) bool {
+
+	if p2pInfo.LocalNAT == "" || p2pInfo.RemoteNAT == "" {
+		return false
 	}
-	isClient := SelectRole(p2pInfo)
+	if p2pInfo.LocalLAN == "" || p2pInfo.RemoteLAN == "" {
+		return false
+	}
+
 	sameNAT, similarLAN := CompareP2PAddresses(p2pInfo)
-	remoteAddr := p2pInfo.RemoteNAT // 默认公网
-	routeReason := "different network"
 	if sameNAT && similarLAN {
-		remoteAddr = p2pInfo.RemoteLAN // 同内网
-		routeReason = "same NAT & similar LAN"
-	}
-	if sameNAT && similarLAN {
-		remoteAddr = p2pInfo.RemoteLAN // 同内网
+		return true
 	}
 
-	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT)
-	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
-	fmt.Fprintf(os.Stderr, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
-	if network == "tcp" {
-		if isClient {
-			fmt.Fprintf(os.Stderr, "  - %-14s: connect start immediately\n", "Active Mode")
+	isLocalNatPortChanged := !isSamePort(p2pInfo.LocalLAN, p2pInfo.LocalNAT)
+	isRemoteNatPortChanged := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
+
+	if isLocalNatPortChanged && isRemoteNatPortChanged {
+		return false
+	}
+
+	return true
+}
+
+func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.Conn, bool, error) {
+	var conn net.Conn
+	var isRoleClient bool
+	var p2pInfo *P2PAddressInfo
+	tcp6Tried := false
+	tcp4Tried := false
+	var err_tcp6, err_tcp4, err_udp error
+	finetwork := "tcp"
+
+	if network == "any" || strings.HasSuffix(network, "6") {
+		finetwork += "6"
+		fmt.Fprintf(os.Stderr, "=== Checking IPv6 reachability ===\n")
+	} else {
+		finetwork += "4"
+	}
+
+	p2pInfo, err_tcp6 = Do_autoP2P(finetwork, sessionUid, turnServer, brokerServer, 25*time.Second, false, true)
+	if err_tcp6 == nil {
+		fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT)
+		fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
+		if p2pCanDirect(p2pInfo) {
+			if finetwork == "tcp4" {
+				tcp4Tried = true
+			} else if finetwork == "tcp6" {
+				tcp6Tried = true
+			}
+			time.Sleep(3 * time.Second)
+			conn, isRoleClient, _, err_tcp6 = Auto_P2P_TCP_NAT_Traversal(finetwork, sessionUid,
+				turnServer, brokerServer, false, 2)
+			if err_tcp6 == nil {
+				return conn, isRoleClient, nil
+			}
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp6)
+			time.Sleep(3 * time.Second)
 		} else {
-			fmt.Fprintf(os.Stderr, "  - %-14s: connect start after 2s\n", "Passive Mode")
+			//tcp4、6都不需要再尝试了
+			tcp4Tried = true
+			tcp6Tried = true
 		}
+	} else {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp6)
+		time.Sleep(3 * time.Second)
 	}
 
-	dialer := &net.Dialer{}
-	var localTcpAddr *net.TCPAddr
-	switch network {
-	case "tcp":
-		dialer.Control = ControlTCP
-		localTcpAddr, err = net.ResolveTCPAddr("tcp", p2pInfo.LocalLAN)
-		if err != nil {
-			return nil, false, err
-		}
-		dialer.LocalAddr = localTcpAddr
-	case "udp":
-		dialer.Control = ControlUDP
-		localAddr, err := net.ResolveUDPAddr("udp", p2pInfo.LocalLAN)
-		if err != nil {
-			return nil, false, err
-		}
-		dialer.LocalAddr = localAddr
-	}
-
-	var listener net.Listener
-
-	if !isClient {
-		if network == "tcp" {
-			lc := net.ListenConfig{
-				Control: ControlTCP,
+	if network == "any" || strings.HasSuffix(network, "4") {
+		if finetwork == "tcp6" && !tcp4Tried && !tcp6Tried {
+			//如果是没有共同的IPv6的条件，则尝试IPv4的tcp
+			conn, isRoleClient, _, err_tcp4 = Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid,
+				turnServer, brokerServer, false, 2)
+			if err_tcp4 == nil {
+				return conn, isRoleClient, nil
 			}
-			listener, err = lc.Listen(context.Background(), "tcp", localTcpAddr.String())
-			if err != nil {
-				return nil, false, err
-			}
-
-			// 设置accept超时
-			deadline := time.Now().Add(10 * time.Second)
-			listener.(*net.TCPListener).SetDeadline(deadline)
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp4)
+			time.Sleep(3 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
-	}
-	conn, err := dialer.Dial(network, remoteAddr)
-	if err == nil {
-		return conn, isClient, nil
-	}
 
-	if listener != nil {
-		var err2 error
-		conn, err2 = listener.Accept()
-		listener.Close()
-		if err2 == nil {
-			// 检查是否是对端连接（仅比较 IP，忽略端口）
-			clientIP, _, err2 := net.SplitHostPort(conn.RemoteAddr().String())
-			if err2 == nil {
-				expectedIP, _, _ := net.SplitHostPort(remoteAddr)
-				if clientIP == expectedIP {
-					return conn, isClient, nil
-				}
-			}
-			conn.Close() // 不是目标连接，关闭
-			conn = nil
+		conn, isRoleClient, _, err_udp = Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid,
+			turnServer, brokerServer, false, 2)
+		if err_udp == nil {
+			return conn, isRoleClient, nil
 		}
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp)
 	}
 
-	return nil, false, err
+	return nil, false, fmt.Errorf("direct P2P connection failed after both TCP and UDP attempts")
 }
 
-func udpPunchPortRange(port string) (a, b int, err error) {
-	// 将端口号转换为整数
-	basePort, err := strconv.Atoi(port)
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid port number %s: %v", port, err)
-	}
-
-	// 计算端口范围，确保在 1-65535 之间
-	minPort := basePort - 1000
-	if minPort < 1 {
-		minPort = 1
-	}
-
-	maxPort := basePort + 1000
-	if maxPort > 65535 {
-		maxPort = 65535
-	}
-	return minPort, maxPort, nil
-}
-
-func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, needSharedKey bool) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 12
+	var batchPortSize = PunchingBatchPortSize
 	punchPayload := []byte(deriveKeyForPayload(sessionUid))
-	for round := 1; round <= 4; round++ {
+	for round := 1; round <= maxRound; round++ {
 
-		fmt.Fprintf(os.Stderr, "=== Round %d: Trying UDP-P2P Connection ===\n", round)
+		fmt.Fprintf(os.Stderr, "=== Round %d: Trying P2P(%s) Connection ===\n", round, network)
 
 		// 交换 NAT 信息
-		p2pInfo, err := Do_autoP2P("udp", sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
+		p2pInfo, err := Do_autoP2P(network, sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("P2P info exchange failed: %v", err)
 		}
@@ -575,16 +606,77 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 		sameNAT, similarLAN := CompareP2PAddresses(p2pInfo)
 		remoteAddr := p2pInfo.RemoteNAT // 默认公网
 		routeReason := "different network"
+		inSameLAN := false
 		if sameNAT && similarLAN {
 			remoteAddr = p2pInfo.RemoteLAN // 同内网
 			routeReason = "same NAT & similar LAN"
+			inSameLAN = true
 		}
 
-		localAddr, err := net.ResolveUDPAddr("udp", p2pInfo.LocalLAN)
+		localMaybeNAT4 := !isSamePort(p2pInfo.LocalLAN, p2pInfo.LocalNAT)
+		remoteMaybeNAT4 := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
+
+		brutelyGuess := false
+		punchingDisabled := false
+		randomSrcPort := false
+		ttl := 64
+		randDstPorts := []int{}
+		if !inSameLAN {
+			if !localMaybeNAT4 && remoteMaybeNAT4 {
+				//如果本地不是对称型的，但远程像对称型的，使用小TTL值策略，仅为了本地NAT打开洞，而打洞包不触及对方NAT
+				ttl = PunchingShortTTL
+				randDstPorts = mathrand.New(mathrand.NewSource(secureSeed())).Perm(65535 - 1024)
+			} else if localMaybeNAT4 && !remoteMaybeNAT4 {
+				randomSrcPort = true
+			} else if localMaybeNAT4 && remoteMaybeNAT4 {
+				//经过NAT端口都变了，看起来都像是对称型的，但并不一定，假如有一端的NAT3就有可能成功
+				if batchPortSize > 0 {
+					//暴力递增测试端口
+					if isClient {
+						brutelyGuess = true
+						ttl = PunchingShortTTL
+					} else {
+						punchingDisabled = true
+					}
+				} else {
+					//800个随机端口预测
+					if isClient {
+						ttl = PunchingShortTTL
+						randDstPorts = mathrand.New(mathrand.NewSource(secureSeed())).Perm(65535 - 1024)
+					} else {
+						randomSrcPort = true
+					}
+				}
+			}
+		}
+		if len(randDstPorts) > 0 {
+			//本轮固定这800个随机数
+			for i, port := range randDstPorts {
+				randDstPorts[i] = port + 1024
+			}
+		}
+
+		if !inSameLAN && (localMaybeNAT4 || remoteMaybeNAT4) {
+			if batchPortSize > 0 {
+				count = (65535/batchPortSize)*3 + 6
+			} else {
+				count = 18
+			}
+		} else {
+			count = 12
+		}
+		if count < 8 {
+			count = 8
+		}
+		if count > 60 {
+			count = 60
+		}
+
+		localAddr, err := net.ResolveUDPAddr(network, p2pInfo.LocalLAN)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
 		}
-		remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+		remoteUDPAddr, err := net.ResolveUDPAddr(network, remoteAddr)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("failed to resolve remote address: %v", err)
 		}
@@ -598,20 +690,28 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 			fmt.Fprintf(os.Stderr, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
 		}
 		fmt.Fprintf(os.Stderr, "  - %-14s: %ds\n", "Timeout", count)
-		isRemoteNatPortChanged := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
 
 		// 启动读写协程
+		ctxStopPunching, stopPunching := context.WithCancel(context.Background())
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
 		defer cancel()
+		defer stopPunching()
 
+		type AddrPair struct {
+			Local  *net.UDPAddr
+			Remote *net.UDPAddr
+		}
+		gotHoleCh := make(chan AddrPair, 1)
 		recvChan := make(chan bool)
 		errChan := make(chan error)
 
-		uconn, err := net.ListenUDP("udp", localAddr)
+		uconn, err := net.ListenUDP(network, localAddr)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
 		}
 		buconn := NewBoundUDPConn(uconn, "", false)
+
+		SetUDPTTL(uconn, ttl)
 
 		// 读协程：收包，类似TCP三次握手等待TCP SYN+ACK
 		go func() {
@@ -623,9 +723,12 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 					return
 				}
 				if bytes.Equal(buf[:n], punchPayload) {
+					stopPunching()
 					fmt.Fprintf(os.Stderr, "Received PING from peer!\n")
 					buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
+					SetUDPTTL(uconn, 64)
 					buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
+					time.Sleep(250 * time.Millisecond)
 					buconn.Write(punchPayload)
 					recvChan <- true
 					return
@@ -635,49 +738,199 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 
 		// 写协程：按角色发包，类似TCP三次握手发送 SYN
 		go func() {
-			if isClient {
-				// 客户端：立即发 ping
-				uconn.WriteToUDP(punchPayload, remoteUDPAddr)
+			minPort := 1024
+			maxPort := 65534
+			batchSize := batchPortSize
+			currentBatch := 0
+			if batchSize > 0 {
+				_, targetPortStr, _ := net.SplitHostPort(remoteAddr)
+				targetPort, _ := strconv.Atoi(targetPortStr) // 将端口转为整数
+				// 计算目标端口所在的批次（从0开始计数）
+				currentBatch = (targetPort - minPort) / batchSize
+				// 确保不越界
+				if targetPort < minPort || targetPort > maxPort {
+					currentBatch = 0 // 如果端口不在范围内，默认从第一批开始
+				}
+			}
 
-				remoteNatIP, remoteNatPort, err1 := net.SplitHostPort(p2pInfo.RemoteNAT)
-				if err1 == nil && isRemoteNatPortChanged && !strings.HasPrefix(routeReason, "same") {
-					// 对方的内网端口和NAT端口不一致，在一段端口范围内尝试打洞
-					minPort, maxPort, _ := udpPunchPortRange(remoteNatPort)
-					fmt.Fprintf(os.Stderr, "Starting to send hole-punching packets to %s:%d-%d\n", remoteNatIP, minPort, maxPort)
-					for i := 0; i < 2; i++ {
-						for port := minPort; port <= maxPort; port++ {
-							addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(port))
-							peerAddr, _ := net.ResolveUDPAddr("udp", addrStr)
+			sendBatchPing := func() bool {
+				if batchSize <= 0 {
+					return false
+				}
+				startPort := minPort + (currentBatch * batchSize)
+				if startPort > maxPort {
+					startPort = minPort
+					currentBatch = 0
+				}
+				endPort := startPort + batchSize - 1
+				if endPort > maxPort {
+					endPort = maxPort
+				}
+
+				remoteNatIP, _, _ := net.SplitHostPort(remoteAddr)
+				select {
+				case <-ctxStopPunching.Done():
+					return false
+				case <-ctx.Done():
+					return false
+				default:
+					fmt.Fprintf(os.Stderr, "  ↑ Sending hole-punching packets(TTL=%d): ports %d-%d\n", ttl, startPort, endPort)
+					for port := startPort; port <= endPort; port++ {
+						addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(port))
+						peerAddr, _ := net.ResolveUDPAddr(network, addrStr)
+						uconn.WriteToUDP(punchPayload, peerAddr)
+					}
+				}
+				currentBatch++
+
+				return true
+			}
+
+			// 定义公共的PING发送函数
+			sendPing := func(i int) bool {
+				if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
+					errChan <- err
+					return false
+				}
+				fmt.Fprintf(os.Stderr, "  ↑ Sent PING(TTL=%d) (%d)\n", ttl, i+1)
+				return true
+			}
+
+			sendRDPPing := func() bool {
+				remoteNatIP, _, _ := net.SplitHostPort(remoteAddr)
+				select {
+				case <-ctxStopPunching.Done():
+					return false
+				case <-ctx.Done():
+					return false
+				default:
+					if len(randDstPorts) > 0 {
+						fmt.Fprintf(os.Stderr, "  ↑ Sending hole-punching packets(TTL=%d): 800 random dst ports\n", ttl)
+						for i := 0; i <= 800; i++ {
+							addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(randDstPorts[i]+2))
+							peerAddr, _ := net.ResolveUDPAddr(network, addrStr)
 							uconn.WriteToUDP(punchPayload, peerAddr)
 						}
 					}
 				}
-				for i := 0; i < count; i++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
-							errChan <- err
+				return true
+			}
+			sendRSPPing := func() bool {
+				const (
+					timeout       = 7 * time.Second
+					maxGoroutines = 800
+				)
+
+				gotCh := make(chan bool)
+				// 使用带缓冲的通道（容量1，只需要第一个成功的结果）
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+
+				var wg sync.WaitGroup
+				var once sync.Once
+				var once2 sync.Once
+
+				fmt.Fprintf(os.Stderr, "  ↑ Sending hole-punching packets(TTL=%d): 800 random src ports\n", ttl)
+
+				randSrcPorts := mathrand.New(mathrand.NewSource(secureSeed())).Perm(65535 - 1024)
+				for i, port := range randSrcPorts {
+					randSrcPorts[i] = port + 1024
+				}
+
+				for i := 0; i < maxGoroutines; i++ {
+					wg.Add(1)
+					go func(index int) {
+						defer wg.Done()
+
+						localAddr := &net.UDPAddr{
+							IP:   nil,
+							Port: randSrcPorts[index],
+						}
+						conn, err := net.ListenUDP(network, localAddr)
+						if err != nil {
 							return
 						}
-						fmt.Fprintf(os.Stderr, "  ↑ Sent PING (%d/%d)\n", i+1, count)
-						time.Sleep(1 * time.Second)
-					}
+						defer conn.Close()
+
+						// 发送打洞包
+						if _, err := conn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
+							return
+						}
+
+						// 读取响应
+						buf := make([]byte, 32)
+
+						deadline := time.Now().Add(5 * time.Second)
+						_ = conn.SetDeadline(deadline)
+						n, raddr, err := conn.ReadFromUDP(buf)
+						if err != nil {
+							///fmt.Fprintf(os.Stderr, "ReadFromUDP: %v\n", err)
+							return
+						}
+						if !bytes.Equal(buf[:n], punchPayload) {
+							//fmt.Fprintf(os.Stderr, "ReadFromUDP: invalid PING payload\n")
+							return
+						}
+
+						fmt.Fprintf(os.Stderr, "Received PING from peer (RSP)!\n")
+
+						// 只保留第一个成功的结果
+						laddr := conn.LocalAddr().(*net.UDPAddr)
+						once.Do(func() {
+							select {
+							case gotCh <- true:
+							default: // 防止阻塞
+							}
+						})
+						once2.Do(func() {
+							select {
+							case gotHoleCh <- AddrPair{laddr, raddr}:
+							default: // 防止阻塞
+							}
+						})
+					}(i)
 				}
+
+				// 等待第一个成功结果或超时
+				select {
+				case <-gotCh:
+					stopPunching()
+					return true
+				case <-ctx.Done():
+					return false
+				case <-time.After(timeout + 500*time.Millisecond): // 兜底超时
+					return false
+				}
+			}
+
+			if isClient {
+				// 客户端：立即发 ping
 			} else {
 				// 服务端：2秒后发 ping
 				time.Sleep(2 * time.Second)
-				for i := 0; i < (count - 2); i++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
-							errChan <- err
+			}
+			for i := 0; i < count; i++ {
+				if i > 0 {
+					time.Sleep(1 * time.Second)
+				}
+				select {
+				case <-ctxStopPunching.Done():
+					return
+				case <-ctx.Done():
+					return
+				default:
+					sendPing(i)
+					if randomSrcPort {
+						sendRSPPing()
+						time.Sleep(1 * time.Second)
+					} else if !inSameLAN && !punchingDisabled && remoteMaybeNAT4 && !brutelyGuess {
+						sendRDPPing()
+						//大批量发的话，多等1秒，等回复，如果有回复立刻终止，否则持续大量，即使这批打洞成功，却被下批打爆NAT的映射表
+						time.Sleep(1 * time.Second)
+					} else if !inSameLAN && !punchingDisabled && brutelyGuess {
+						if !sendBatchPing() {
 							return
 						}
-						fmt.Fprintf(os.Stderr, "  ↑ Sent PING (%d/%d)\n", i+1, count-2)
 						time.Sleep(1 * time.Second)
 					}
 				}
@@ -686,8 +939,19 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 
 		// 等待结果
 		select {
+		case addrPair := <-gotHoleCh:
+			buconn.Close()
+			uconn, err = net.ListenUDP(network, addrPair.Local)
+			if err != nil {
+				return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+			}
+			buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
+			fmt.Fprintf(os.Stderr, "P2P(UDP) connection established!\n")
+			SetUDPTTL(uconn, 64)
+			return buconn, isClient, sharedKey, nil
 		case <-recvChan:
-			fmt.Fprintf(os.Stderr, "UDP-P2P connection established!\n")
+			fmt.Fprintf(os.Stderr, "P2P(UDP) connection established!\n")
+			SetUDPTTL(uconn, 64)
 			return buconn, isClient, sharedKey, nil
 		case err := <-errChan:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -697,20 +961,22 @@ func Auto_P2P_UDP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 			buconn.Close()
 		}
 		fmt.Fprintf(os.Stderr, "\n")
+		cancel()
+		stopPunching()
 	}
-	return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed after 4 rounds")
+	return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed after %d rounds", maxRound)
 }
 
-func Auto_P2P_TCP_NAT_Traversal(sessionUid, turnServer, brokerServer string, needSharedKey bool) (net.Conn, bool, []byte, error) {
+func Auto_P2P_TCP_NAT_Traversal(network, sessionUid, turnServer, brokerServer string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
-	var conn net.Conn
-	for round := 1; round <= 4; round++ {
+	var errConn error
+	for round := 1; round <= maxRound; round++ {
 
-		fmt.Fprintf(os.Stderr, "=== Round %d: Trying TCP-P2P Connection ===\n", round)
+		fmt.Fprintf(os.Stderr, "=== Round %d: Trying P2P(%s) Connection ===\n", round, network)
 
 		// 1. 交换 NAT 信息
-		p2pInfo, err := Do_autoP2P("tcp", sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
+		p2pInfo, err := Do_autoP2P(network, sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("P2P info exchange failed: %v", err)
 		}
@@ -739,7 +1005,7 @@ func Auto_P2P_TCP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 		fmt.Fprintf(os.Stderr, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 
 		// 解析本地地址
-		localAddr, err := net.ResolveTCPAddr("tcp", p2pInfo.LocalLAN)
+		localAddr, err := net.ResolveTCPAddr(network, p2pInfo.LocalLAN)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
 		}
@@ -758,19 +1024,28 @@ func Auto_P2P_TCP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 		}
 
 		var listener net.Listener
+
+		lc := net.ListenConfig{
+			Control: ControlTCP,
+		}
+
+		var acceptedConn net.Conn
+		acceptChan := make(chan bool)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		listener, err = lc.Listen(ctx, network, localAddr.String())
+		if err == nil {
+			defer listener.Close()
+			go func() {
+				deadline := time.Now().Add(12 * time.Second)
+				listener.(*net.TCPListener).SetDeadline(deadline)
+				acceptedConn, _ = listener.Accept()
+				cancel()
+				acceptChan <- true
+			}()
+		}
+
 		if !isClient {
-			lc := net.ListenConfig{
-				Control: ControlTCP,
-			}
-			listener, err = lc.Listen(context.Background(), "tcp", localAddr.String())
-			if err != nil {
-				return nil, false, nil, fmt.Errorf("listen failed: %v", err)
-			}
-
-			// 设置accept超时
-			deadline := time.Now().Add(10 * time.Second)
-			listener.(*net.TCPListener).SetDeadline(deadline)
-
 			// NAT打洞时，服务端延迟发包
 			time.Sleep(2 * time.Second)
 		}
@@ -778,36 +1053,48 @@ func Auto_P2P_TCP_NAT_Traversal(sessionUid, turnServer, brokerServer string, nee
 		// 尝试主动连接
 		maxAttempts := 2 // 最多尝试 2 次
 		for attempt := 0; attempt < maxAttempts; attempt++ {
-			conn, err = dialer.Dial("tcp", remoteAddr)
+			conn, err := dialer.DialContext(ctx, network, remoteAddr)
 			if err == nil {
-				fmt.Fprintf(os.Stderr, "TCP-P2P connection established (dial)!\n")
+				if listener != nil {
+					listener.Close()
+					<-acceptChan
+					if acceptedConn != nil {
+						acceptedConn.Close()
+					}
+				}
+				fmt.Fprintf(os.Stderr, "P2P(TCP) connection established (dial)!\n")
 				return conn, isClient, sharedKey, nil
 			}
-			time.Sleep(1 * time.Second)
+			errConn = err
+			if attempt+1 < maxAttempts {
+				time.Sleep(1 * time.Second)
+			}
 		}
 
 		if listener != nil {
-			var err2 error
-			conn, err2 = listener.Accept()
 			listener.Close()
-			if err2 == nil {
+			<-acceptChan
+			if acceptedConn != nil {
 				// 检查是否是对端连接（仅比较 IP，忽略端口）
-				clientIP, _, err2 := net.SplitHostPort(conn.RemoteAddr().String())
+				clientIP, _, err2 := net.SplitHostPort(acceptedConn.RemoteAddr().String())
 				if err2 == nil {
 					expectedIP, _, _ := net.SplitHostPort(remoteAddr)
-					if clientIP == expectedIP {
-						fmt.Fprintf(os.Stderr, "TCP-P2P connection established (accept)!\n")
-						return conn, isClient, sharedKey, nil
+					if (clientIP == expectedIP) ||
+						(sameNAT && similarLAN && IsSameLAN(clientIP, expectedIP)) {
+						fmt.Fprintf(os.Stderr, "P2P(TCP) connection established (accept)!\n")
+						return acceptedConn, isClient, sharedKey, nil
+					} else {
+						err2 = fmt.Errorf("unexpected peer connection address")
 					}
 				}
-				conn.Close() // 不是目标连接，关闭
-				conn = nil
+				errConn = err2
 			}
 		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", errConn)
+		cancel()
 	}
 
-	return nil, false, nil, fmt.Errorf("P2P TCP Simultaneous Open failed after 4 rounds")
+	return nil, false, nil, fmt.Errorf("P2P TCP Simultaneous Open failed after %d rounds", maxRound)
 }
 
 func logStderr(msg string, args ...interface{}) {
