@@ -84,6 +84,7 @@ func init() {
 	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
 	flag.IntVar(&misc.PunchingShortTTL, "punch-short-ttl", misc.PunchingShortTTL, "")
 	flag.IntVar(&misc.PunchingBatchPortSize, "punch-batch", misc.PunchingBatchPortSize, "brutely guess, 0 is disabled")
+	flag.IntVar(&misc.PunchingRandomPortCount, "punch-random-count", misc.PunchingRandomPortCount, "")
 }
 
 func init_TLS(genCertForced bool) {
@@ -431,8 +432,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-bind and -l cannot be used together\n")
 		os.Exit(1)
 	}
-	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
-		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-kcp, -p2p-tcp, -p2p-ss) cannot be used together\n")
+	if *autoP2P != "" && (*udpProtocol || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+		fmt.Fprintf(os.Stderr, "-p2p and (-u, -p2p-kcp, -p2p-tcp, -p2p-ss) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *presharedKey != "" && *tlsRSACertEnabled {
@@ -824,7 +825,7 @@ func main() {
 		}
 		if strings.HasPrefix(network, "udp") {
 			configUDPConn(conn)
-			fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
 		} else {
 			fmt.Fprintf(os.Stderr, "Connected to: %s\n", net.JoinHostPort(host, port))
 		}
@@ -1569,7 +1570,7 @@ func do_P2P(network, sessionKey, stunServer string, tryDiffNetwork bool) (net.Co
 	if conn != nil {
 		if strings.HasPrefix(network, "udp") {
 			configUDPConn(conn)
-			fmt.Fprintf(os.Stderr, "UDP socket ready for: %s\n", conn.RemoteAddr().String())
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
 		} else {
 			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
 		}

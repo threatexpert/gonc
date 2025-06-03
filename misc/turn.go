@@ -34,9 +34,10 @@ var (
 	lastStunClientConn net.Conn
 	lastStunClientLock sync.Mutex
 
-	DebugServerRole       string
-	PunchingShortTTL      int = 5
-	PunchingBatchPortSize int = 0
+	DebugServerRole         string
+	PunchingShortTTL        int = 5
+	PunchingBatchPortSize   int = 0
+	PunchingRandomPortCount int = 600
 )
 
 func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (localaddress, nataddress string, err error) {
@@ -324,7 +325,7 @@ func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout ti
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Exchanging NAT address info...")
+		fmt.Fprintf(os.Stderr, "    Exchanging address info (using MQTT: %s)...", brokerServer)
 	}
 	remoteInfoRaw, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServer, timeout)
 	if err != nil {
@@ -576,6 +577,28 @@ func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.
 	return nil, false, fmt.Errorf("direct P2P connection failed after both TCP and UDP attempts")
 }
 
+func generateRandomPorts(count int) []int {
+	const (
+		minPort = 1024
+		maxPort = 65535
+	)
+
+	r := mathrand.New(mathrand.NewSource(secureSeed()))
+	ports := make([]int, count)
+	used := make(map[int]struct{}, count) // 哈希去重
+
+	for i := 0; i < count; {
+		port := minPort + r.Intn(maxPort-minPort)
+		if _, exists := used[port]; !exists {
+			used[port] = struct{}{}
+			ports[i] = port
+			i++
+		}
+	}
+
+	return ports
+}
+
 func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
@@ -625,7 +648,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 			if !localMaybeNAT4 && remoteMaybeNAT4 {
 				//如果本地不是对称型的，但远程像对称型的，使用小TTL值策略，仅为了本地NAT打开洞，而打洞包不触及对方NAT
 				ttl = PunchingShortTTL
-				randDstPorts = mathrand.New(mathrand.NewSource(secureSeed())).Perm(65535 - 1024)
+				randDstPorts = generateRandomPorts(PunchingRandomPortCount)
 			} else if localMaybeNAT4 && !remoteMaybeNAT4 {
 				randomSrcPort = true
 			} else if localMaybeNAT4 && remoteMaybeNAT4 {
@@ -639,20 +662,14 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 						punchingDisabled = true
 					}
 				} else {
-					//800个随机端口预测
+					//随机端口预测
 					if isClient {
 						ttl = PunchingShortTTL
-						randDstPorts = mathrand.New(mathrand.NewSource(secureSeed())).Perm(65535 - 1024)
+						randDstPorts = generateRandomPorts(PunchingRandomPortCount)
 					} else {
 						randomSrcPort = true
 					}
 				}
-			}
-		}
-		if len(randDstPorts) > 0 {
-			//本轮固定这800个随机数
-			for i, port := range randDstPorts {
-				randDstPorts[i] = port + 1024
 			}
 		}
 
@@ -724,7 +741,6 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				}
 				if bytes.Equal(buf[:n], punchPayload) {
 					stopPunching()
-					fmt.Fprintf(os.Stderr, "Received PING from peer!\n")
 					buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
 					SetUDPTTL(uconn, 64)
 					buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
@@ -739,7 +755,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 		// 写协程：按角色发包，类似TCP三次握手发送 SYN
 		go func() {
 			minPort := 1024
-			maxPort := 65534
+			maxPort := 65535
 			batchSize := batchPortSize
 			currentBatch := 0
 			if batchSize > 0 {
@@ -805,20 +821,20 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 					return false
 				default:
 					if len(randDstPorts) > 0 {
-						fmt.Fprintf(os.Stderr, "  ↑ Sending hole-punching packets(TTL=%d): 800 random dst ports\n", ttl)
-						for i := 0; i <= 800; i++ {
-							addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(randDstPorts[i]+2))
+						fmt.Fprintf(os.Stderr, "  ↑ Sending random dst ports hole-punching packets. TTL=%d; total=%d; ...", ttl, PunchingRandomPortCount)
+						for i := 0; i < PunchingRandomPortCount; i++ {
+							addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(randDstPorts[i]))
 							peerAddr, _ := net.ResolveUDPAddr(network, addrStr)
 							uconn.WriteToUDP(punchPayload, peerAddr)
 						}
+						fmt.Fprintf(os.Stderr, "completed.\n")
 					}
 				}
 				return true
 			}
 			sendRSPPing := func() bool {
 				const (
-					timeout       = 7 * time.Second
-					maxGoroutines = 800
+					timeout = 7 * time.Second
 				)
 
 				gotCh := make(chan bool)
@@ -830,77 +846,95 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				var once sync.Once
 				var once2 sync.Once
 
-				fmt.Fprintf(os.Stderr, "  ↑ Sending hole-punching packets(TTL=%d): 800 random src ports\n", ttl)
+				fmt.Fprintf(os.Stderr, "  ↑ Sending Random Src Ports hole-punching packets. TTL=%d; ", ttl)
 
-				randSrcPorts := mathrand.New(mathrand.NewSource(secureSeed())).Perm(65535 - 1024)
-				for i, port := range randSrcPorts {
-					randSrcPorts[i] = port + 1024
+				randSrcPorts := generateRandomPorts(PunchingRandomPortCount + 50)
+
+				// Pre-allocate a slice to store successful UDP connections
+				conns := make([]*net.UDPConn, 0, PunchingRandomPortCount)
+
+				// Try binding ports until we get enough successful connections
+				for _, port := range randSrcPorts {
+					localAddr := &net.UDPAddr{
+						IP:   nil,
+						Port: port,
+					}
+					conn, err := net.ListenUDP(network, localAddr)
+					if err != nil {
+						continue // Skip if port is occupied
+					}
+					SetUDPTTL(conn, ttl)
+					conns = append(conns, conn)
+					// Stop once we have enough successful binds
+					if len(conns) >= PunchingRandomPortCount {
+						break
+					}
+				}
+				fmt.Fprintf(os.Stderr, "total=%d !\n", len(conns))
+
+				// Now perform hole punching with the successfully bound ports
+				for _, conn := range conns {
+					// Send punch packet
+					if _, err := conn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
+						conn.Close()
+						continue
+					}
 				}
 
-				for i := 0; i < maxGoroutines; i++ {
+				for _, conn := range conns {
 					wg.Add(1)
-					go func(index int) {
+					go func(c *net.UDPConn) {
 						defer wg.Done()
+						defer c.Close()
 
-						localAddr := &net.UDPAddr{
-							IP:   nil,
-							Port: randSrcPorts[index],
-						}
-						conn, err := net.ListenUDP(network, localAddr)
-						if err != nil {
-							return
-						}
-						defer conn.Close()
-
-						// 发送打洞包
-						if _, err := conn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
-							return
-						}
-
-						// 读取响应
+						// Read response
+						var raddr *net.UDPAddr
 						buf := make([]byte, 32)
-
 						deadline := time.Now().Add(5 * time.Second)
-						_ = conn.SetDeadline(deadline)
-						n, raddr, err := conn.ReadFromUDP(buf)
-						if err != nil {
-							///fmt.Fprintf(os.Stderr, "ReadFromUDP: %v\n", err)
-							return
-						}
-						if !bytes.Equal(buf[:n], punchPayload) {
-							//fmt.Fprintf(os.Stderr, "ReadFromUDP: invalid PING payload\n")
-							return
+						_ = c.SetDeadline(deadline)
+
+						for {
+							n, ra, err := c.ReadFromUDP(buf)
+							if err != nil {
+								return
+							}
+							if bytes.Equal(buf[:n], punchPayload) {
+								raddr = ra
+								break
+							}
 						}
 
-						fmt.Fprintf(os.Stderr, "Received PING from peer (RSP)!\n")
-
-						// 只保留第一个成功的结果
-						laddr := conn.LocalAddr().(*net.UDPAddr)
+						// Only keep the first successful result
+						laddr := c.LocalAddr().(*net.UDPAddr)
+						c.Close() //协程中立刻关闭socket，保证主程序能绑定到这地址上
 						once.Do(func() {
 							select {
 							case gotCh <- true:
-							default: // 防止阻塞
+							default:
 							}
 						})
 						once2.Do(func() {
 							select {
 							case gotHoleCh <- AddrPair{laddr, raddr}:
-							default: // 防止阻塞
+							default:
 							}
 						})
-					}(i)
+					}(conn)
 				}
 
 				// 等待第一个成功结果或超时
+				result := false
 				select {
 				case <-gotCh:
 					stopPunching()
-					return true
+					result = true
 				case <-ctx.Done():
-					return false
 				case <-time.After(timeout + 500*time.Millisecond): // 兜底超时
-					return false
 				}
+				for _, conn := range conns {
+					conn.Close()
+				}
+				return result
 			}
 
 			if isClient {
@@ -946,7 +980,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
 			}
 			buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
-			fmt.Fprintf(os.Stderr, "P2P(UDP) connection established!\n")
+			fmt.Fprintf(os.Stderr, "P2P(UDP) connection established (RSP)!\n")
 			SetUDPTTL(uconn, 64)
 			return buconn, isClient, sharedKey, nil
 		case <-recvChan:
