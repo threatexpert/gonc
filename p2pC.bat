@@ -14,7 +14,7 @@ if "%~1"=="" (
 echo ________________________________
 echo Running command at %TIME%
 
-gonc.exe -mqtt-push hello -p2p "@%~1" -exec "-app-mux -l 9998"
+gonc.exe -mqtt-push hello -p2p "@%~1" -exec "-app-mux -l 9998" -progress
 
 timeout /t 10 >nul
 goto loop
