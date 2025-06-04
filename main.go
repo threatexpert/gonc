@@ -395,7 +395,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.6beta")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.6")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -1062,9 +1062,11 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			return
 		}
 
-		if strings.TrimPrefix(args[0], "-") == "app-mux" {
-			Appp_mux_main(conn, args[1:])
-			return
+		if strings.TrimLeft(args[0], "-") == "app-mux" {
+			pipeConn := misc.NewPipeConn(conn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			go App_mux_main(pipeConn, args[1:])
 		} else {
 
 			// 创建命令

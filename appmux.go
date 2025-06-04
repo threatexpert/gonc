@@ -267,7 +267,7 @@ func mux_main() {
 	}
 }
 
-func Appp_mux_main(conn net.Conn, args []string) {
+func App_mux_main(conn net.Conn, args []string) {
 	appMode := ""
 	host := ""
 	port := ""

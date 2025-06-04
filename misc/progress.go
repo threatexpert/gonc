@@ -2,6 +2,8 @@ package misc
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"time"
 )
 
@@ -80,4 +82,60 @@ func FormatBytes(bytes int64) string {
 		value /= 1024.0
 	}
 	return fmt.Sprintf("%.1f YiB", value)
+}
+
+type PipeConn struct {
+	net.Conn
+	In, in   io.ReadCloser
+	Out, out io.WriteCloser
+	closeCh  chan struct{}
+}
+
+func NewPipeConn(originalConn net.Conn) *PipeConn {
+	inReader, inWriter := io.Pipe()
+	outReader, outWriter := io.Pipe()
+
+	return &PipeConn{
+		Conn:    originalConn,
+		in:      inReader,
+		Out:     inWriter,
+		In:      outReader,
+		out:     outWriter,
+		closeCh: make(chan struct{}),
+	}
+}
+
+// 实现 net.Conn 接口
+func (p *PipeConn) Read(b []byte) (n int, err error) {
+	return p.in.Read(b)
+}
+
+func (p *PipeConn) Write(b []byte) (n int, err error) {
+	return p.out.Write(b)
+}
+
+func (p *PipeConn) Close() error {
+	close(p.closeCh)
+	p.in.Close()
+	if c, ok := p.out.(io.Closer); ok {
+		c.Close()
+	}
+	return nil
+}
+
+// 保持其他方法（使用原始连接）
+func (p *PipeConn) LocalAddr() net.Addr {
+	return p.Conn.LocalAddr()
+}
+func (p *PipeConn) RemoteAddr() net.Addr {
+	return p.Conn.RemoteAddr()
+}
+func (p *PipeConn) SetDeadline(t time.Time) error {
+	return p.Conn.SetDeadline(t)
+}
+func (p *PipeConn) SetReadDeadline(t time.Time) error {
+	return p.Conn.SetReadDeadline(t)
+}
+func (p *PipeConn) SetWriteDeadline(t time.Time) error {
+	return p.Conn.SetWriteDeadline(t)
 }
