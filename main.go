@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,7 @@ var (
 	MQTTPush          = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
 	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
 	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
+	useDNS            = flag.String("dns", "", "set DNS Server")
 )
 
 func init() {
@@ -564,6 +566,15 @@ func main() {
 
 	genCertForced := *presharedKey != ""
 	init_TLS(genCertForced)
+
+	if *useDNS != "" {
+		setDns(*useDNS)
+	}
+	if isAndroid() {
+		if *useDNS == "" {
+			setDns("8.8.8.8:53")
+		}
+	}
 
 	if P2PSessionKey != "" {
 		if *keepOpen {
@@ -1644,4 +1655,27 @@ func ReadPSKFile(filepath string) (string, error) {
 		return "", err
 	}
 	return "", nil // 空文件返回空字符串
+}
+
+func setDns(address2 string) {
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: time.Second * 5,
+			}
+			if strings.Contains(address2, ":") {
+				if _, _, err := net.SplitHostPort(address2); err != nil {
+					address2 = net.JoinHostPort(address2, "53")
+				}
+			} else {
+				address2 = net.JoinHostPort(address2, "53")
+			}
+			return d.DialContext(ctx, network, address2)
+		},
+	}
+}
+
+func isAndroid() bool {
+	return runtime.GOOS == "android"
 }

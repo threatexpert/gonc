@@ -47,6 +47,11 @@ SET GOARCH=arm64
 SET CGO_ENABLED=0
 go build -buildvcs=false -ldflags="-s -w -buildid=" -trimpath -o bin/%app%_%GOOS%_%GOARCH%
 
+SET GOOS=android
+SET GOARCH=arm64
+SET CGO_ENABLED=0
+go build -buildvcs=false -ldflags="-s -w -buildid=" -trimpath -o bin/%app%_%GOOS%_%GOARCH%
+
 SET GOOS=darwin
 SET GOARCH=amd64
 SET CGO_ENABLED=0
