@@ -36,7 +36,6 @@ var (
 
 	DebugServerRole         string
 	PunchingShortTTL        int = 5
-	PunchingBatchPortSize   int = 0
 	PunchingRandomPortCount int = 600
 )
 
@@ -602,8 +601,10 @@ func generateRandomPorts(count int) []int {
 func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
-	var count = 12
-	var batchPortSize = PunchingBatchPortSize
+	var count = 10
+	const (
+		RPP_TIMEOUT = 7
+	)
 	punchPayload := []byte(deriveKeyForPayload(sessionUid))
 	for round := 1; round <= maxRound; round++ {
 
@@ -639,54 +640,33 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 		localMaybeNAT4 := !isSamePort(p2pInfo.LocalLAN, p2pInfo.LocalNAT)
 		remoteMaybeNAT4 := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
 
-		brutelyGuess := false
-		punchingDisabled := false
 		randomSrcPort := false
 		ttl := 64
 		randDstPorts := []int{}
 		if !inSameLAN {
 			if !localMaybeNAT4 && remoteMaybeNAT4 {
-				//如果本地不是对称型的，但远程像对称型的，使用小TTL值策略，仅为了本地NAT打开洞，而打洞包不触及对方NAT
-				ttl = PunchingShortTTL
+				//C->S
 				randDstPorts = generateRandomPorts(PunchingRandomPortCount)
 			} else if localMaybeNAT4 && !remoteMaybeNAT4 {
+				//S->C
 				randomSrcPort = true
 			} else if localMaybeNAT4 && remoteMaybeNAT4 {
-				//经过NAT端口都变了，看起来都像是对称型的，但并不一定，假如有一端的NAT3就有可能成功
-				if batchPortSize > 0 {
-					//暴力递增测试端口
-					if isClient {
-						brutelyGuess = true
-						ttl = PunchingShortTTL
-					} else {
-						punchingDisabled = true
-					}
+				if isClient {
+					randDstPorts = generateRandomPorts(PunchingRandomPortCount)
 				} else {
-					//随机端口预测
-					if isClient {
-						ttl = PunchingShortTTL
-						randDstPorts = generateRandomPorts(PunchingRandomPortCount)
-					} else {
-						randomSrcPort = true
-					}
+					randomSrcPort = true
 				}
 			}
 		}
 
 		if !inSameLAN && (localMaybeNAT4 || remoteMaybeNAT4) {
-			if batchPortSize > 0 {
-				count = (65535/batchPortSize)*3 + 6
-			} else {
-				count = 18
+			if isClient {
+				//只有先发包的，适合用小ttl值。
+				ttl = PunchingShortTTL
 			}
+			count = 4 + RPP_TIMEOUT*2
 		} else {
-			count = 12
-		}
-		if count < 8 {
 			count = 8
-		}
-		if count > 60 {
-			count = 60
 		}
 
 		localAddr, err := net.ResolveUDPAddr(network, p2pInfo.LocalLAN)
@@ -710,7 +690,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 
 		// 启动读写协程
 		ctxStopPunching, stopPunching := context.WithCancel(context.Background())
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
+		ctxRound, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
 		defer cancel()
 		defer stopPunching()
 
@@ -739,6 +719,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 					errChan <- err
 					return
 				}
+
 				if bytes.Equal(buf[:n], punchPayload) {
 					stopPunching()
 					buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
@@ -754,53 +735,6 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 
 		// 写协程：按角色发包，类似TCP三次握手发送 SYN
 		go func() {
-			minPort := 1024
-			maxPort := 65535
-			batchSize := batchPortSize
-			currentBatch := 0
-			if batchSize > 0 {
-				_, targetPortStr, _ := net.SplitHostPort(remoteAddr)
-				targetPort, _ := strconv.Atoi(targetPortStr) // 将端口转为整数
-				// 计算目标端口所在的批次（从0开始计数）
-				currentBatch = (targetPort - minPort) / batchSize
-				// 确保不越界
-				if targetPort < minPort || targetPort > maxPort {
-					currentBatch = 0 // 如果端口不在范围内，默认从第一批开始
-				}
-			}
-
-			sendBatchPing := func() bool {
-				if batchSize <= 0 {
-					return false
-				}
-				startPort := minPort + (currentBatch * batchSize)
-				if startPort > maxPort {
-					startPort = minPort
-					currentBatch = 0
-				}
-				endPort := startPort + batchSize - 1
-				if endPort > maxPort {
-					endPort = maxPort
-				}
-
-				remoteNatIP, _, _ := net.SplitHostPort(remoteAddr)
-				select {
-				case <-ctxStopPunching.Done():
-					return false
-				case <-ctx.Done():
-					return false
-				default:
-					fmt.Fprintf(os.Stderr, "  ↑ Sending hole-punching packets(TTL=%d): ports %d-%d\n", ttl, startPort, endPort)
-					for port := startPort; port <= endPort; port++ {
-						addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(port))
-						peerAddr, _ := net.ResolveUDPAddr(network, addrStr)
-						uconn.WriteToUDP(punchPayload, peerAddr)
-					}
-				}
-				currentBatch++
-
-				return true
-			}
 
 			// 定义公共的PING发送函数
 			sendPing := func(i int) bool {
@@ -817,7 +751,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				select {
 				case <-ctxStopPunching.Done():
 					return false
-				case <-ctx.Done():
+				case <-ctxRound.Done():
 					return false
 				default:
 					if len(randDstPorts) > 0 {
@@ -832,19 +766,14 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				}
 				return true
 			}
-			sendRSPPing := func() bool {
-				const (
-					timeout = 7 * time.Second
-				)
-
+			sendRSPPing := func(timeout time.Duration) bool {
 				gotCh := make(chan bool)
 				// 使用带缓冲的通道（容量1，只需要第一个成功的结果）
-				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				ctxRSP, cancel := context.WithTimeout(context.Background(), timeout)
 				defer cancel()
 
 				var wg sync.WaitGroup
 				var once sync.Once
-				var once2 sync.Once
 
 				fmt.Fprintf(os.Stderr, "  ↑ Sending Random Src Ports hole-punching packets. TTL=%d; ", ttl)
 
@@ -855,11 +784,12 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 
 				// Try binding ports until we get enough successful connections
 				for _, port := range randSrcPorts {
-					localAddr := &net.UDPAddr{
-						IP:   nil,
+					sa := &net.UDPAddr{
+						IP:   localAddr.IP,
 						Port: port,
+						Zone: localAddr.Zone,
 					}
-					conn, err := net.ListenUDP(network, localAddr)
+					conn, err := net.ListenUDP(network, sa)
 					if err != nil {
 						continue // Skip if port is occupied
 					}
@@ -887,38 +817,42 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 						defer wg.Done()
 						defer c.Close()
 
-						// Read response
-						var raddr *net.UDPAddr
+						// 读取响应
 						buf := make([]byte, 32)
 						deadline := time.Now().Add(5 * time.Second)
 						_ = c.SetDeadline(deadline)
 
 						for {
-							n, ra, err := c.ReadFromUDP(buf)
+							n, raddr, err := c.ReadFromUDP(buf)
 							if err != nil {
-								return
+								return // 超时或读取错误
 							}
-							if bytes.Equal(buf[:n], punchPayload) {
-								raddr = ra
-								break
-							}
-						}
 
-						// Only keep the first successful result
-						laddr := c.LocalAddr().(*net.UDPAddr)
-						c.Close() //协程中立刻关闭socket，保证主程序能绑定到这地址上
-						once.Do(func() {
-							select {
-							case gotCh <- true:
-							default:
+							// 检查是否为有效打洞包
+							if !bytes.Equal(buf[:n], punchPayload) {
+								continue
 							}
-						})
-						once2.Do(func() {
-							select {
-							case gotHoleCh <- AddrPair{laddr, raddr}:
-							default:
-							}
-						})
+
+							// 避免回复多个成功打出的洞
+							// 只有第一个成功的协程会执行后续操作
+							once.Do(func() {
+								// 标记成功并发送确认包
+								SetUDPTTL(c, 64)
+								_, _ = c.WriteToUDP(punchPayload, raddr)
+								time.Sleep(250 * time.Millisecond)
+								_, _ = c.WriteToUDP(punchPayload, raddr)
+
+								// 获取本地地址并传递结果
+								laddr := c.LocalAddr().(*net.UDPAddr)
+								c.Close() // 通知gotHoleCh前确保socket关闭，这样那边确保可以绑定在此地址上
+								select {
+								case gotHoleCh <- AddrPair{laddr, raddr}:
+								default:
+								}
+								gotCh <- true
+							})
+							break
+						}
 					}(conn)
 				}
 
@@ -928,7 +862,8 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				case <-gotCh:
 					stopPunching()
 					result = true
-				case <-ctx.Done():
+				case <-ctxRSP.Done():
+				case <-ctxRound.Done():
 				case <-time.After(timeout + 500*time.Millisecond): // 兜底超时
 				}
 				for _, conn := range conns {
@@ -950,23 +885,24 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 				select {
 				case <-ctxStopPunching.Done():
 					return
-				case <-ctx.Done():
+				case <-ctxRound.Done():
 					return
 				default:
-					sendPing(i)
-					if randomSrcPort {
-						sendRSPPing()
-						time.Sleep(1 * time.Second)
-					} else if !inSameLAN && !punchingDisabled && remoteMaybeNAT4 && !brutelyGuess {
-						sendRDPPing()
-						//大批量发的话，多等1秒，等回复，如果有回复立刻终止，否则持续大量，即使这批打洞成功，却被下批打爆NAT的映射表
-						time.Sleep(1 * time.Second)
-					} else if !inSameLAN && !punchingDisabled && brutelyGuess {
-						if !sendBatchPing() {
-							return
+					if i < 3 {
+						//前面几次用普通方式打洞
+						sendPing(i)
+					} else {
+						if randomSrcPort {
+							sendRSPPing(RPP_TIMEOUT * time.Second)
+						} else if len(randDstPorts) > 0 {
+							sendRDPPing()
+							//大批量发的话，多等等，等回复，如果有回复立刻终止，否则持续大量，即使这批打洞成功，却被下批打爆NAT的映射表
+							time.Sleep(RPP_TIMEOUT / 2 * time.Second)
+						} else {
+							sendPing(i)
 						}
-						time.Sleep(1 * time.Second)
 					}
+
 				}
 			}
 		}()
@@ -990,7 +926,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 		case err := <-errChan:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			buconn.Close()
-		case <-ctx.Done():
+		case <-ctxRound.Done():
 			fmt.Fprintf(os.Stderr, "Round %d timeout (%ds)\n", round, count)
 			buconn.Close()
 		}

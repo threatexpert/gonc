@@ -83,7 +83,6 @@ func init() {
 	flag.StringVar(&misc.TopicExchange, "mqtt-nat-topic", misc.TopicExchange, "")
 	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
 	flag.IntVar(&misc.PunchingShortTTL, "punch-short-ttl", misc.PunchingShortTTL, "")
-	flag.IntVar(&misc.PunchingBatchPortSize, "punch-batch", misc.PunchingBatchPortSize, "brutely guess, 0 is disabled")
 	flag.IntVar(&misc.PunchingRandomPortCount, "punch-random-count", misc.PunchingRandomPortCount, "")
 }
 
