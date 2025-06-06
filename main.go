@@ -81,6 +81,8 @@ var (
 )
 
 func init() {
+	flag.StringVar(runCmd, "e", "", "alias for -exec")
+	flag.BoolVar(progressEnabled, "P", false, "alias for -progress")
 	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
 	flag.StringVar(&misc.TopicExchange, "mqtt-nat-topic", misc.TopicExchange, "")
 	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
@@ -397,7 +399,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.6")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.7beta")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -433,8 +435,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-bind and -l cannot be used together\n")
 		os.Exit(1)
 	}
-	if *autoP2P != "" && (*udpProtocol || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
-		fmt.Fprintf(os.Stderr, "-p2p and (-u, -p2p-kcp, -p2p-tcp, -p2p-ss) cannot be used together\n")
+	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-kcp, -p2p-tcp, -p2p-ss) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *presharedKey != "" && *tlsRSACertEnabled {
@@ -499,11 +501,18 @@ func main() {
 		}
 	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
 		*listenMode = false
-		if *autoP2P != "" {
+		if *autoP2P != "" && !*udpProtocol {
 			network = "any"
 			P2PSessionKey = *autoP2P
 			tryDiffNetwork = true
 			*tlsEnabled = true //-p2p 默认开启tls安全通信
+		} else if *autoP2P != "" && *udpProtocol {
+			P2PSessionKey = *autoP2P
+			tryDiffNetwork = false
+			*tlsEnabled = true //-p2p 默认开启tls安全通信
+			*kcpEnabled = true //需要kcp实现稳定传输
+			*udpProtocol = true
+			network = "udp"
 		} else if *autoP2PKCP != "" {
 			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PKCP
