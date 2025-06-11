@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -29,11 +30,12 @@ import (
 )
 
 var (
-	tls_cert_EC         *tls.Certificate = nil
-	tls_cert_RSA        *tls.Certificate = nil
-	sessionReady                         = false
-	sessionSharedKey    []byte           = nil
-	secureStreamEnabled                  = false
+	tls_cert_EC                *tls.Certificate = nil
+	tls_cert_RSA               *tls.Certificate = nil
+	sessionReady                                = false
+	sessionSharedKey           []byte           = nil
+	secureStreamEnabled                         = false
+	goroutineConnectionCounter int32            = 0
 	// 定义命令行参数
 	socks5Addr        = flag.String("s5", "", "ip:port (SOCKS5 proxy)")
 	auth              = flag.String("auth", "", "user:password for SOCKS5 proxy")
@@ -349,12 +351,24 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 					h := elapsed / 3600
 					m := (elapsed % 3600) / 60
 					s := elapsed % 60
-					fmt.Fprintf(os.Stderr,
-						"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \r",
-						misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
-						misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
-						h, m, s,
-					)
+					connCount := atomic.LoadInt32(&goroutineConnectionCounter)
+					if connCount > 1 {
+						fmt.Fprintf(os.Stderr,
+							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %d | %02d:%02d:%02d        \r",
+							misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
+							misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
+							connCount,
+							h, m, s,
+						)
+					} else {
+						fmt.Fprintf(os.Stderr,
+							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \r",
+							misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
+							misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
+							h, m, s,
+						)
+					}
+
 				}
 
 			case <-done:
@@ -382,7 +396,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.7beta")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.7")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -975,6 +989,8 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	defer conn.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	defer atomic.AddInt32(&goroutineConnectionCounter, -1)
+	atomic.AddInt32(&goroutineConnectionCounter, 1)
 
 	configTCPKeepalive(conn)
 

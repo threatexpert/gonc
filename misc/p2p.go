@@ -41,7 +41,7 @@ var (
 
 // GetPublicIP 获取公网IP，返回第一个成功响应的STUN服务器的结果
 func GetPublicIP(network, bind string, stunServers []string, timeout time.Duration) (index int, localAddr, natAddr string, err error) {
-	// 1. 修改 result 结构体以包含连接和客户端
+	// 1. result 结构体包含连接和客户端
 	type result struct {
 		index  int
 		local  string
@@ -52,7 +52,6 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	// defer cancel() 仍然是一个好习惯，作为最终的保障
 	defer cancel()
 
 	results := make(chan result, len(stunServers))
@@ -95,6 +94,7 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 			addr = strings.TrimPrefix(rawAddr, "tcp://")
 		}
 
+		//选择匹配network的stun服务器
 		if scheme != "" && scheme != netProto {
 			continue
 		}
@@ -105,11 +105,13 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 
 			// 检查 context 是否已经被取消，避免不必要的拨号
 			if ctx.Err() != nil {
+				//fmt.Fprintf(os.Stderr, "Err: %s ...\n", stunAddr)
 				return
 			}
 
 			useNetwork, laddr, err := resolveAddr(netProto)
 			if err != nil {
+				//fmt.Fprintf(os.Stderr, "stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				results <- result{err: fmt.Errorf("resolve local addr: %v", err)}
 				return
 			}
@@ -122,16 +124,26 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 				dialer.Control = ControlUDP
 			}
 
-			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s\n", useNetwork, stunAddr)
+			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s ...\n", useNetwork, stunAddr)
 			conn, err := dialer.DialContext(ctx, useNetwork, stunAddr)
 			if err != nil {
+				//fmt.Fprintf(os.Stderr, "STUN dial failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				// 如果 context 被取消，错误会是 "context canceled"
 				results <- result{err: fmt.Errorf("STUN dial failed: %v", err)}
 				return
 			}
+			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s OK\n", useNetwork, stunAddr)
+
+			//这个conn不能defer Close，后面它可能是要保活的tcp。
+			//为了打洞的TCP在程序结束后该端口不出现TIME_WAIT，方便再次复用端口。使用策略：
+			// 1）并发多个stun查询的tcp，除了第一个成功的要保留，其他程序主动要关闭的可以SetLinger(0)就不会出现TIME_WAIT。
+			// 2）第一个成功stun查询的TCP不主动关闭（主动正常关闭一定会有TIME_WAIT），要用Read等待的方式保活，可以做可以在程序退出时触发系统RST，RST就不会出现TIME_WAIT.
+			//    但如果对方主动挥手，可能打开的洞还在通讯，这边只能正常关闭，不能SetLinger(0)避免RST导致打开的tcp的洞失效。
+			// 3) 程序再次重新打洞时，上次第一个成功stun查询的TCP要SetLinger(0)主动关闭
 
 			client, err := stun.NewClient(conn)
 			if err != nil {
+				//fmt.Fprintf(os.Stderr, "STUN NewClient failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				conn.Close()
 				results <- result{err: fmt.Errorf("STUN NewClient failed: %v", err)}
 				return
@@ -141,6 +153,8 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 			var callErr error
 
 			req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+
+			//fmt.Fprintf(os.Stderr, "stun do request: %s://%s\n", useNetwork, stunAddr)
 
 			// client.Do 不直接支持 context，但拨号阶段已经支持了。
 			// STUN 请求通常很快，超时主要由外层 context 控制。
@@ -153,13 +167,19 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 			})
 
 			if err != nil {
+				//fmt.Fprintf(os.Stderr, "STUN Do failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
+				client.Close() //前面不能用defer Close，要自己Close
 				results <- result{err: fmt.Errorf("STUN Do failed: %v", err)}
 				return
 			}
 			if callErr != nil {
+				//fmt.Fprintf(os.Stderr, "STUN response error: %s://%s err: %v\n", useNetwork, stunAddr, callErr)
+				client.Close()
 				results <- result{err: fmt.Errorf("STUN response error: %v", callErr)}
 				return
 			}
+
+			//fmt.Fprintf(os.Stderr, "stun result: %s://%s(%s) %s\n", useNetwork, stunAddr, conn.RemoteAddr().String(), xorAddr.String())
 
 			// 2. 将成功的结果（包括连接和客户端）发送到 channel
 			// 注意：UDP连接是无状态的，不需要保留。TCP连接需要保留用于打洞。
@@ -173,6 +193,11 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 			}
 
 		}(i, addr)
+
+		if bind != "" && !strings.HasSuffix(bind, ":0") && strings.HasPrefix(netProto, "udp") {
+			//由于UDP SO_REUSEADDR明确端口的话，只有一个能收到回复数据，所以只选第一个可用的stunServer
+			break
+		}
 	}
 
 	go func() {
@@ -195,6 +220,7 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 								tcpConn.SetLinger(0) // 立即关闭，发送 RST
 							}
 						}
+						//fmt.Fprintf(os.Stderr, "stun close: %s\n", r.conn.RemoteAddr().String())
 						r.client.Close()
 					}
 				}
@@ -247,6 +273,7 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 									tcpConn.SetLinger(0) // 立即关闭，发送 RST
 								}
 							}
+							//fmt.Fprintf(os.Stderr, "stun close: %s\n", otherResult.conn.RemoteAddr().String())
 							otherResult.client.Close()
 						}
 					}
@@ -393,7 +420,6 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid string, brokerServers []string
 	recvRemoteData := make(chan recvPayload, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 	defer func() {
 		clientsMu.Lock()
 		for _, c := range clients {
@@ -402,6 +428,7 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid string, brokerServers []string
 		clientsMu.Unlock()
 		time.Sleep(500 * time.Millisecond)
 	}()
+	defer cancel() //放后面，因为要比上面的协程先执行，想实现cancel后不会有新的添加到clients
 
 	ready := make(chan struct{}, 1)
 	fail := make(chan struct{}, len(brokerServers))
@@ -442,6 +469,11 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid string, brokerServers []string
 			}
 
 			clientsMu.Lock()
+			if ctx.Err() != nil {
+				clientsMu.Unlock()
+				client.Disconnect(250)
+				return
+			}
 			clients = append(clients, client)
 			clientsMu.Unlock()
 
