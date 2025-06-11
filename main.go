@@ -25,7 +25,6 @@ import (
 
 	"github.com/pion/dtls/v3"
 	"github.com/xtaci/kcp-go/v5"
-	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 )
 
@@ -62,13 +61,15 @@ var (
 	keepOpen          = flag.Bool("keep-open", false, "keep listening after client disconnects")
 	enablePty         = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
 	term_oldstat      *term.State
-	useTurn           = flag.Bool("turn", false, "use STUN to discover public IP")
-	turnServer        = flag.String("turnsrv", "turn.cloudflare.com:3478", "turn server, others: stunserver2025.stunprotocol.org:3478 ; stun.l.google.com:19302 (UDP only)")
+	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
+	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,stunserver2025.stunprotocol.org:3478", "stun servers")
+	STUNServers       []string
 	peer              = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
 	appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
 	keepAlive         = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
 	punchData         = flag.String("punchdata", "ping\n", "UDP punch payload")
-	MQTTServer        = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883", "MQTT server, others: tcp://broker.emqx.io:1883 ; tcp://test.mosquitto.org:1883")
+	MQTTServers       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
+	MQTTBrokerServers []string
 	autoP2P           = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
 	autoP2PKCP        = flag.String("p2p-kcp", "", "P2P session key, kcp over udp, will be retried up to 3 times upon failure.")
 	autoP2PTCP        = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
@@ -315,38 +316,20 @@ func do_DTLS(conn net.Conn) net.Conn {
 	return dtlsConn
 }
 
-func createDialer() proxy.Dialer {
-	var err error
-	// 如果指定了socks5代理
+func createClientDialer() *Socks5Client {
 	if *socks5Addr != "" {
-		// 设置SOCKS5代理
-		var socks5Dialer proxy.Dialer
-		if *auth != "" {
-			// 如果指定了认证信息
-			authParts := strings.SplitN(*auth, ":", 2)
-			if len(authParts) != 2 {
-				fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
-				os.Exit(1)
-			}
-
-			// 创建SOCKS5代理客户端并进行认证
-			socks5Dialer, err = proxy.SOCKS5("tcp", *socks5Addr, &proxy.Auth{
-				User:     authParts[0],
-				Password: authParts[1],
-			}, proxy.Direct)
-		} else {
-			// 不使用认证
-			socks5Dialer, err = proxy.SOCKS5("tcp", *socks5Addr, nil, proxy.Direct)
-		}
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Create socks5 client failed: %v\n", err)
+		authParts := strings.SplitN(*auth, ":", 2)
+		if len(authParts) == 2 {
+			return NewSocks5Client(*socks5Addr, authParts[0], authParts[1])
+		} else if *auth != "" {
+			fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
 			os.Exit(1)
 		}
-
-		return socks5Dialer
+		return NewSocks5Client(*socks5Addr, "", "") // 无认证
 	} else {
-		return &net.Dialer{}
+		// 如果没有指定SOCKS5代理，则返回一个模拟的直接连接客户端
+		// 实际应用中，这里可能返回一个包装了 net.Dialer 的结构
+		return &Socks5Client{Socks5Addr: ""} // 代表直连
 	}
 }
 
@@ -415,6 +398,9 @@ func main() {
 		return
 	}
 
+	MQTTBrokerServers = parseMultiItems(*MQTTServers)
+	STUNServers = parseMultiItems(*stunSrv)
+
 	if *sendfile != "" && *runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-sendfile and -exec cannot be used together\n")
 		os.Exit(1)
@@ -427,8 +413,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-bind and -s5 cannot be used together\n")
 		os.Exit(1)
 	}
-	if *socks5Addr != "" && *udpProtocol {
-		fmt.Fprintf(os.Stderr, "UDP over SOCKS5 is not supported\n")
+	if *socks5Addr != "" && *useSTUN {
+		fmt.Fprintf(os.Stderr, "-turn and -s5 cannot be used together\n")
 		os.Exit(1)
 	}
 	if *localbind != "" && *listenMode {
@@ -500,6 +486,10 @@ func main() {
 			os.Exit(1)
 		}
 	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+		if *socks5Addr != "" {
+			fmt.Fprintf(os.Stderr, "INFO: -s5 is ignored with p2p\n")
+			*socks5Addr = ""
+		}
 		*listenMode = false
 		if *autoP2P != "" && !*udpProtocol {
 			network = "any"
@@ -598,7 +588,7 @@ func main() {
 			}
 
 			for {
-				conn, err = do_P2P_multistuns(network, P2PSessionKey, tryDiffNetwork)
+				conn, err = do_P2P(network, P2PSessionKey, STUNServers, tryDiffNetwork)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 					time.Sleep(10 * time.Second)
@@ -608,7 +598,7 @@ func main() {
 				time.Sleep(2 * time.Second)
 			}
 		} else {
-			conn, err = do_P2P_multistuns(network, P2PSessionKey, tryDiffNetwork)
+			conn, err = do_P2P(network, P2PSessionKey, STUNServers, tryDiffNetwork)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 				os.Exit(1)
@@ -619,7 +609,7 @@ func main() {
 		}
 	}
 
-	dialer := createDialer()
+	dialer := createClientDialer()
 
 	if *listenMode {
 		// 监听模式
@@ -632,7 +622,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			if *useTurn {
+			if *useSTUN {
 				err = ShowPublicIP(network, addr.String())
 				if err != nil {
 					panic(err)
@@ -702,7 +692,7 @@ func main() {
 			var listener net.Listener
 			var stopSynTrigger bool = false
 			lc := net.ListenConfig{}
-			if *peer != "" || *useTurn {
+			if *peer != "" || *useSTUN {
 				lc.Control = misc.ControlTCP
 			}
 			listener, err = lc.Listen(context.Background(), network, listenAddr)
@@ -711,7 +701,7 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stderr, "Listening TCP on %s\n", listener.Addr().String())
-			if *useTurn {
+			if *useSTUN {
 				err = ShowPublicIP(network, listener.Addr().String())
 				if err != nil {
 					panic(err)
@@ -808,7 +798,7 @@ func main() {
 			}
 		}
 
-		if *useTurn {
+		if *useSTUN {
 			if *localbind == "" {
 				panic("-turn need be with -bind while connecting")
 			}
@@ -1414,9 +1404,9 @@ func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInte
 }
 
 func ShowPublicIP(network, bind string) error {
-	_, nata, err := misc.GetPublicIP(network, bind, *turnServer, 3*time.Second)
+	index, _, nata, err := misc.GetPublicIP(network, bind, STUNServers, 7*time.Second)
 	if err == nil {
-		fmt.Fprintf(os.Stderr, "Public Address: %s\n", nata)
+		fmt.Fprintf(os.Stderr, "Public Address: %s (via %s)\n", nata, STUNServers[index])
 	}
 
 	return err
@@ -1427,7 +1417,7 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	var err error
 
 	if *MQTTWait != "" {
-		msg, err = misc.MqttWait(sessionKey, *MQTTServer, 10*time.Minute)
+		msg, err = misc.MqttWait(sessionKey, MQTTBrokerServers, 10*time.Minute)
 		if err != nil {
 			return fmt.Errorf("mqtt-wait: %v", err)
 		}
@@ -1437,7 +1427,7 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	}
 
 	if *MQTTPush != "" {
-		err = misc.MqttPush(*MQTTPush, sessionKey, *MQTTServer)
+		err = misc.MqttPush(*MQTTPush, sessionKey, MQTTBrokerServers)
 		if err != nil {
 			return fmt.Errorf("mqtt-push: %v", err)
 		}
@@ -1445,36 +1435,7 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	return nil
 }
 
-func do_P2P_multistuns(network, sessionKey string, tryDiffNetwork bool) (net.Conn, error) {
-	if len(*turnServer) == 0 {
-		return nil, fmt.Errorf("empty stunservers list")
-	}
-
-	var lastErr error
-	stunsServers := strings.Split(*turnServer, ",")
-	for _, stun := range stunsServers {
-		stun = strings.TrimSpace(stun)
-		if stun == "" {
-			continue
-		}
-
-		conn, err := do_P2P(network, sessionKey, stun, tryDiffNetwork)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-	}
-
-	if lastErr != nil {
-		if len(stunsServers) == 1 {
-			return nil, lastErr
-		}
-		return nil, fmt.Errorf("all STUN servers failed, last error: %w", lastErr)
-	}
-	return nil, fmt.Errorf("no valid STUN servers provided")
-}
-
-func do_P2P(network, sessionKey, stunServer string, tryDiffNetwork bool) (net.Conn, error) {
+func do_P2P(network, sessionKey string, stunServers []string, tryDiffNetwork bool) (net.Conn, error) {
 	var err, err2 error
 	var conn net.Conn
 	var isRoleClient bool
@@ -1484,7 +1445,7 @@ func do_P2P(network, sessionKey, stunServer string, tryDiffNetwork bool) (net.Co
 		if err != nil {
 			return nil, err
 		}
-		conn, isRoleClient, err = misc.Easy_P2P(network, sessionKey, stunServer, *MQTTServer)
+		conn, isRoleClient, err = misc.Easy_P2P(network, sessionKey, stunServers, MQTTBrokerServers)
 		if err != nil {
 			return nil, err
 		}
@@ -1513,20 +1474,20 @@ func do_P2P(network, sessionKey, stunServer string, tryDiffNetwork bool) (net.Co
 			return nil, err
 		}
 		if network == "udp6" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, true, 2)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServers, MQTTBrokerServers, true, 2)
 			if err != nil {
 				return nil, err
 			}
 		} else if network == "udp4" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, true, 4)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServers, MQTTBrokerServers, true, 4)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal("udp6", sessionKey, stunServer, *MQTTServer, true, 2)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal("udp6", sessionKey, stunServers, MQTTBrokerServers, true, 2)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_UDP_NAT_Traversal("udp4", sessionKey, stunServer, *MQTTServer, true, 4)
+				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_UDP_NAT_Traversal("udp4", sessionKey, stunServers, MQTTBrokerServers, true, 4)
 				if err2 != nil {
 					//返回udp4的err
 					return nil, err
@@ -1552,20 +1513,20 @@ func do_P2P(network, sessionKey, stunServer string, tryDiffNetwork bool) (net.Co
 			return nil, err
 		}
 		if network == "tcp6" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 2)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 2)
 			if err != nil {
 				return nil, err
 			}
 		} else if network == "tcp4" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 4)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 4)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal("tcp6", sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 2)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal("tcp6", sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 2)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_TCP_NAT_Traversal("tcp4", sessionKey, stunServer, *MQTTServer, secureStreamEnabled, 4)
+				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_TCP_NAT_Traversal("tcp4", sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 4)
 				if err2 != nil {
 					//返回tcp4的err
 					return nil, err
@@ -1687,4 +1648,16 @@ func setDns(address2 string) {
 
 func isAndroid() bool {
 	return runtime.GOOS == "android"
+}
+
+func parseMultiItems(s string) []string {
+	servers := strings.Split(s, ",")
+	var result []string
+	for _, srv := range servers {
+		trimmed := strings.TrimSpace(srv)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }

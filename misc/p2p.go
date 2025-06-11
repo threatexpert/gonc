@@ -13,7 +13,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"net"
@@ -21,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -39,102 +39,225 @@ var (
 	PunchingRandomPortCount int = 600
 )
 
-func GetPublicIP(network, bind, turnServer string, timeout time.Duration) (localaddress, nataddress string, err error) {
-	lastStunClientLock.Lock()
-	defer lastStunClientLock.Unlock()
+// GetPublicIP 获取公网IP，返回第一个成功响应的STUN服务器的结果
+func GetPublicIP(network, bind string, stunServers []string, timeout time.Duration) (index int, localAddr, natAddr string, err error) {
+	// 1. 修改 result 结构体以包含连接和客户端
+	type result struct {
+		index  int
+		local  string
+		nat    string
+		err    error
+		client *stun.Client
+		conn   net.Conn
+	}
 
-	if lastStunClient != nil {
-		if tcpConn, ok := lastStunClientConn.(*net.TCPConn); ok {
-			tcpConn.SetLinger(0) // 立即关闭，发送 RST
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// defer cancel() 仍然是一个好习惯，作为最终的保障
+	defer cancel()
+
+	results := make(chan result, len(stunServers))
+	var wg sync.WaitGroup
+
+	netLower := strings.ToLower(network)
+	netProto := "udp"
+	if strings.HasPrefix(netLower, "tcp") {
+		netProto = "tcp"
+	}
+	isIPv6 := strings.HasSuffix(netLower, "6")
+
+	resolveAddr := func(proto string) (string, net.Addr, error) {
+		var network string
+		if proto == "tcp" {
+			network = "tcp4"
+			if isIPv6 {
+				network = "tcp6"
+			}
+			addr, err := net.ResolveTCPAddr(network, bind)
+			return network, addr, err
 		}
-		lastStunClient.Close()
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	var laddr net.Addr
-
-	if network == "tcp" || network == "udp" {
-		//传参不明确时统一用ipv4
-		network += "4"
-	}
-
-	switch {
-	case strings.HasPrefix(network, "tcp"):
-		laddr, err = net.ResolveTCPAddr(network, bind)
-		if err != nil {
-			return "", "", fmt.Errorf("resolve local tcp addr failed: %v", err)
+		network = "udp4"
+		if isIPv6 {
+			network = "udp6"
 		}
-	case strings.HasPrefix(network, "udp"):
-		laddr, err = net.ResolveUDPAddr(network, bind)
-		if err != nil {
-			return "", "", fmt.Errorf("resolve local udp addr failed: %v", err)
+		addr, err := net.ResolveUDPAddr(network, bind)
+		return network, addr, err
+	}
+
+	for i, rawAddr := range stunServers {
+		scheme := ""
+		addr := rawAddr
+
+		if strings.HasPrefix(rawAddr, "udp://") {
+			scheme = "udp"
+			addr = strings.TrimPrefix(rawAddr, "udp://")
+		} else if strings.HasPrefix(rawAddr, "tcp://") {
+			scheme = "tcp"
+			addr = strings.TrimPrefix(rawAddr, "tcp://")
 		}
-	default:
-		return "", "", fmt.Errorf("unsupported network: %s", network)
-	}
 
-	d := &net.Dialer{
-		LocalAddr: laddr,
-		Timeout:   timeout,
-	}
-
-	switch {
-	case strings.HasPrefix(network, "tcp"):
-		d.Control = ControlTCP
-	case strings.HasPrefix(network, "udp"):
-		d.Control = ControlUDP
-	}
-
-	conn, err := d.Dial(network, turnServer)
-	if err != nil {
-		return "", "", fmt.Errorf("STUN dial failed: %v", err)
-	}
-
-	c, err := stun.NewClient(conn)
-	if err != nil {
-		conn.Close()
-		return "", "", fmt.Errorf("STUN NewClient failed: %v", err)
-	}
-
-	message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-	var xorAddr stun.XORMappedAddress
-	var err2 error
-	if err := c.Do(message, func(res stun.Event) {
-		if res.Error != nil {
-			err2 = fmt.Errorf("STUN error: %v", res.Error)
-			return
+		if scheme != "" && scheme != netProto {
+			continue
 		}
-		// 解析XOR-MAPPED-ADDRESS属性
-		if err := xorAddr.GetFrom(res.Message); err != nil {
-			err2 = fmt.Errorf("failed to get XOR-MAPPED-ADDRESS: %v", err)
-			return
+
+		wg.Add(1)
+		go func(index int, stunAddr string) {
+			defer wg.Done()
+
+			// 检查 context 是否已经被取消，避免不必要的拨号
+			if ctx.Err() != nil {
+				return
+			}
+
+			useNetwork, laddr, err := resolveAddr(netProto)
+			if err != nil {
+				results <- result{err: fmt.Errorf("resolve local addr: %v", err)}
+				return
+			}
+
+			// 为拨号器创建一个带 context 的超时
+			dialer := &net.Dialer{LocalAddr: laddr}
+			if strings.HasPrefix(useNetwork, "tcp") {
+				dialer.Control = ControlTCP
+			} else {
+				dialer.Control = ControlUDP
+			}
+
+			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s\n", useNetwork, stunAddr)
+			conn, err := dialer.DialContext(ctx, useNetwork, stunAddr)
+			if err != nil {
+				// 如果 context 被取消，错误会是 "context canceled"
+				results <- result{err: fmt.Errorf("STUN dial failed: %v", err)}
+				return
+			}
+
+			client, err := stun.NewClient(conn)
+			if err != nil {
+				conn.Close()
+				results <- result{err: fmt.Errorf("STUN NewClient failed: %v", err)}
+				return
+			}
+
+			var xorAddr stun.XORMappedAddress
+			var callErr error
+
+			req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+
+			// client.Do 不直接支持 context，但拨号阶段已经支持了。
+			// STUN 请求通常很快，超时主要由外层 context 控制。
+			err = client.Do(req, func(e stun.Event) {
+				if e.Error != nil {
+					callErr = e.Error
+				} else if err := xorAddr.GetFrom(e.Message); err != nil {
+					callErr = err
+				}
+			})
+
+			if err != nil {
+				results <- result{err: fmt.Errorf("STUN Do failed: %v", err)}
+				return
+			}
+			if callErr != nil {
+				results <- result{err: fmt.Errorf("STUN response error: %v", callErr)}
+				return
+			}
+
+			// 2. 将成功的结果（包括连接和客户端）发送到 channel
+			// 注意：UDP连接是无状态的，不需要保留。TCP连接需要保留用于打洞。
+			// 这里我们统一将 client 和 conn 传出，由主循环决定如何处理。
+			results <- result{
+				index:  i,
+				local:  conn.LocalAddr().String(),
+				nat:    xorAddr.String(),
+				client: client,
+				conn:   conn,
+			}
+
+		}(i, addr)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// 3. for-select 循环
+	for {
+		select {
+		case <-ctx.Done():
+			// 超时或被主动取消。
+			// 启动一个 goroutine 来排空 channel，确保所有子 goroutine 都能退出。
+			go func() {
+				for r := range results {
+					// 丢弃所有剩余结果
+					if r.client != nil {
+						if r.conn != nil {
+							if tcpConn, ok := r.conn.(*net.TCPConn); ok {
+								tcpConn.SetLinger(0) // 立即关闭，发送 RST
+							}
+						}
+						r.client.Close()
+					}
+				}
+			}()
+			return -1, "", "", fmt.Errorf("timeout or cancelled while waiting for STUN response")
+
+		case r, ok := <-results:
+			if !ok {
+				// Channel 已关闭，说明所有 goroutine 都已执行完毕且无一成功。
+				return -1, "", "", fmt.Errorf("all STUN servers failed")
+			}
+
+			if r.err == nil {
+				// **** 找到第一个成功者 ****
+
+				// a. 立即通知其他 goroutine 停止
+				cancel()
+
+				// b. 如果是 TCP，执行你保存连接的逻辑
+				if netProto == "tcp" {
+					lastStunClientLock.Lock()
+					if lastStunClient != nil {
+						if tcpConn, ok := lastStunClientConn.(*net.TCPConn); ok {
+							_ = tcpConn.SetLinger(0)
+						}
+						lastStunClient.Close()
+					}
+					// 重要：接管获胜的 client 和 conn，防止它们被 defer client.Close() 关闭
+					lastStunClient = r.client
+					lastStunClientConn = r.conn
+					lastStunClientLock.Unlock()
+
+					// 启动你的连接保活/监听关闭的 goroutine
+					go func(tc net.Conn, sc *stun.Client) {
+						buf := make([]byte, 1)
+						// 这个 Read 会一直阻塞，直到远端关闭连接或发生错误
+						_, _ = tc.Read(buf)
+						// 读取到数据或错误后，关闭客户端
+						sc.Close()
+					}(r.conn, r.client)
+				}
+				// 对于UDP，我们什么都不用做，它的连接会在 goroutine 结束时被 defer client.Close() 关闭
+
+				// c. 启动清理 goroutine，排空 channel，关闭其他可能成功的 TCP 连接
+				go func() {
+					for otherResult := range results {
+						if otherResult.client != nil {
+							if otherResult.conn != nil {
+								if tcpConn, ok := otherResult.conn.(*net.TCPConn); ok {
+									tcpConn.SetLinger(0) // 立即关闭，发送 RST
+								}
+							}
+							otherResult.client.Close()
+						}
+					}
+				}()
+
+				// d. 返回成功结果
+				return r.index, r.local, r.nat, nil
+			}
+			// 如果 r.err != nil，忽略该错误结果，继续等待下一个
 		}
-	}); err != nil {
-		c.Close()
-		return "", "", fmt.Errorf("STUN Do failed: %v", err)
 	}
-	if err2 != nil {
-		c.Close()
-		return "", "", err2
-	}
-
-	//tcp不关闭连接，保持连接可能有助于NAT穿透，如果有连接关闭了可能NAT打开的洞也关闭
-	if strings.HasPrefix(network, "tcp") {
-		lastStunClient = c
-		lastStunClientConn = conn
-		go func(tc net.Conn, sc *stun.Client) {
-			buf := make([]byte, 1)
-			_, _ = tc.Read(buf)
-			//如果对方挥手，我即时挥手，避免RST导致NAT打开的洞也关闭
-			//如果程序中断，本地会发出RST，没有 TIME_WAIT，这有助于立刻重新绑定到原地址
-			sc.Close()
-		}(conn, c)
-	} else {
-		c.Close()
-	}
-
-	return conn.LocalAddr().String(), xorAddr.String(), nil
 }
 
 type P2PAddressInfo struct {
@@ -214,71 +337,6 @@ func deriveKeyForPayload(uid string) string {
 	return hex.EncodeToString(h.Sum(nil))[:8]
 }
 
-func MQTT_Exchange_Symmetric(sendData, sessionUid, brokerServer string, timeout time.Duration) (recvData string, err error) {
-	var qos byte = 2
-	topic := TopicExchange + deriveKeyForTopic("mqtt-topic-gonc-ex", sessionUid)
-
-	opts := mqtt.NewClientOptions().AddBroker(brokerServer)
-	opts.SetClientID(deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid) + fmt.Sprint(time.Now().UnixNano()))
-	client := mqtt.NewClient(opts)
-
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		return "", token.Error()
-	}
-	defer func() {
-		client.Disconnect(250)             // 等待最多 250ms 尝试发送未完成的消息
-		time.Sleep(500 * time.Millisecond) // 再额外等 500ms，确保清理后台 goroutine
-	}()
-	recvRemoteData := make(chan string, 1)
-
-	// 订阅
-	if token := client.Subscribe(topic, qos, func(_ mqtt.Client, msg mqtt.Message) {
-		recvRemoteData <- string(msg.Payload())
-	}); token.Wait() && token.Error() != nil {
-		return "", token.Error()
-	}
-
-	//发布数据
-	if token := client.Publish(topic, qos, false, sendData); token.Wait() && token.Error() != nil {
-		return "", token.Error()
-	}
-	stopPublish := make(chan struct{})
-	defer close(stopPublish)
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopPublish:
-				return
-			case <-ticker.C:
-				client.Publish(topic, qos, false, sendData)
-			}
-		}
-	}()
-
-	var remoteData string
-	gotRemote := false
-	timeoutTimer := time.NewTimer(timeout)
-	defer timeoutTimer.Stop()
-
-	for !gotRemote {
-		select {
-		case remoteData = <-recvRemoteData:
-			if remoteData != sendData {
-				gotRemote = true
-				token := client.Unsubscribe(topic)
-				token.Wait()
-				client.Publish(topic, qos, false, sendData)
-			}
-		case <-timeoutTimer.C:
-			return "", errors.New("timeout waiting for remote data exchange")
-		}
-	}
-
-	return remoteData, nil
-}
-
 func deriveKey(salt, uid string) [32]byte {
 	salt0 := "nc-p2p-tool"
 	h := sha256.New()
@@ -288,7 +346,173 @@ func deriveKey(salt, uid string) [32]byte {
 	return sha256.Sum256(h.Sum(nil))
 }
 
-func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout time.Duration, needSharedKey, verb bool) (*P2PAddressInfo, error) {
+func publishAtLeastN(clients []mqtt.Client, topic string, qos byte, payload string, minSuccess int) {
+	var wg sync.WaitGroup
+	successCh := make(chan struct{}, len(clients))
+
+	for _, c := range clients {
+		wg.Add(1)
+		go func(client mqtt.Client) {
+			defer wg.Done()
+			token := client.Publish(topic, qos, false, payload)
+			if token.Wait() && token.Error() == nil {
+				successCh <- struct{}{}
+			}
+		}(c)
+	}
+
+	go func() {
+		wg.Wait()
+		close(successCh)
+	}()
+
+	// 等待至少 minSuccess 个成功或者所有尝试完成
+	count := 0
+	for range successCh {
+		count++
+		if count >= minSuccess {
+			break
+		}
+	}
+}
+
+func MQTT_Exchange_Symmetric(sendData, sessionUid string, brokerServers []string, timeout time.Duration) (recvData string, recvIndex int, err error) {
+	var qos byte = 1
+	topic := TopicExchange + deriveKeyForTopic("mqtt-topic-gonc-ex", sessionUid)
+
+	myClientIDPrefix := deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid)
+	uidNano := fmt.Sprint(time.Now().UnixNano())
+
+	type recvPayload struct {
+		data  string
+		index int
+	}
+
+	var clients []mqtt.Client
+	var clientsMu sync.Mutex
+	recvRemoteData := make(chan recvPayload, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	defer func() {
+		clientsMu.Lock()
+		for _, c := range clients {
+			c.Disconnect(250)
+		}
+		clientsMu.Unlock()
+		time.Sleep(500 * time.Millisecond)
+	}()
+
+	ready := make(chan struct{}, 1)
+	fail := make(chan struct{}, len(brokerServers))
+
+	for i, server := range brokerServers {
+		go func(brokerAddr string, index int) {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			opts := mqtt.NewClientOptions().
+				AddBroker(brokerAddr).
+				SetClientID(fmt.Sprintf("%s-%d-%s", myClientIDPrefix, index, uidNano)).
+				SetConnectTimeout(5 * time.Second)
+
+			client := mqtt.NewClient(opts)
+			if token := client.Connect(); token.Wait() && token.Error() != nil {
+				select {
+				case fail <- struct{}{}:
+				case <-ctx.Done():
+				}
+				return
+			}
+
+			if token := client.Subscribe(topic, qos, func(_ mqtt.Client, msg mqtt.Message) {
+				data := string(msg.Payload())
+				if data != sendData {
+					recvRemoteData <- recvPayload{data, index}
+				}
+			}); token.Wait() && token.Error() != nil {
+				select {
+				case fail <- struct{}{}:
+				case <-ctx.Done():
+				}
+				return
+			}
+
+			clientsMu.Lock()
+			clients = append(clients, client)
+			clientsMu.Unlock()
+
+			select {
+			case ready <- struct{}{}:
+			case <-ctx.Done():
+			}
+		}(server, i)
+	}
+
+	// 等待第一个成功连接或全部失败
+	successOrAllFail := make(chan struct{})
+	go func() {
+		failCount := 0
+		for {
+			select {
+			case <-ready:
+				successOrAllFail <- struct{}{}
+				return
+			case <-fail:
+				failCount++
+				if failCount == len(brokerServers) {
+					successOrAllFail <- struct{}{}
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-successOrAllFail:
+	case <-ctx.Done():
+	}
+
+	if len(clients) == 0 {
+		return "", -1, fmt.Errorf("failed to connect to any MQTT broker")
+	}
+
+	// 广播数据
+	publishAtLeastN(clients, topic, qos, sendData, 2)
+
+	// 定时重发 goroutine
+	stopPublish := make(chan struct{})
+	defer close(stopPublish)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPublish:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				publishAtLeastN(clients, topic, qos, sendData, 2)
+			}
+		}
+	}()
+
+	select {
+	case r := <-recvRemoteData:
+		publishAtLeastN(clients, topic, qos, sendData, 2)
+		return r.data, r.index, nil
+	case <-ctx.Done():
+		return "", -1, fmt.Errorf("timeout waiting for remote data exchange")
+	}
+}
+
+func Do_autoP2P(network, sessionUid string, stunServers, brokerServers []string, timeout time.Duration, needSharedKey, verb bool) (*P2PAddressInfo, error) {
 
 	var err, pubIPErr error
 	var priv *ecdsa.PrivateKey
@@ -296,16 +520,16 @@ func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout ti
 	myKey := deriveKey(network, sessionUid)
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Getting local & public IP (using STUN server: %s)...", turnServer)
+		fmt.Fprintf(os.Stderr, "    Getting local & public IP...")
 	}
-	localAddr, natAddr, pubIPErr := GetPublicIP(network, "", turnServer, 5*time.Second)
+	stunIndex, localAddr, natAddr, pubIPErr := GetPublicIP(network, "", stunServers, 7*time.Second)
 	if pubIPErr != nil {
 		if verb {
 			fmt.Fprintf(os.Stderr, "Failed\n")
 		}
 	} else {
 		if verb {
-			fmt.Fprintf(os.Stderr, "OK\n")
+			fmt.Fprintf(os.Stderr, "OK (via %s)\n", stunServers[stunIndex])
 		}
 	}
 	//即使GetPublicIP失败了，localAddr和natAddr为空时也通过MQTT告诉对方
@@ -324,9 +548,9 @@ func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout ti
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Exchanging address info (using MQTT: %s)...", brokerServer)
+		fmt.Fprintf(os.Stderr, "    Exchanging address info...")
 	}
-	remoteInfoRaw, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServer, timeout)
+	remoteInfoRaw, srvIndex, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServers, timeout)
 	if err != nil {
 		if verb {
 			fmt.Fprintf(os.Stderr, "Failed\n")
@@ -334,7 +558,7 @@ func Do_autoP2P(network, sessionUid, turnServer, brokerServer string, timeout ti
 		return nil, err
 	}
 	if verb {
-		fmt.Fprintf(os.Stderr, "OK\n")
+		fmt.Fprintf(os.Stderr, "OK (via %s)\n", brokerServers[srvIndex])
 	}
 
 	if pubIPErr != nil {
@@ -509,7 +733,7 @@ func p2pCanDirect(p2pInfo *P2PAddressInfo) bool {
 	return true
 }
 
-func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.Conn, bool, error) {
+func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (net.Conn, bool, error) {
 	var conn net.Conn
 	var isRoleClient bool
 	var p2pInfo *P2PAddressInfo
@@ -525,7 +749,7 @@ func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.
 		finetwork += "4"
 	}
 
-	p2pInfo, err_tcp6 = Do_autoP2P(finetwork, sessionUid, turnServer, brokerServer, 25*time.Second, false, true)
+	p2pInfo, err_tcp6 = Do_autoP2P(finetwork, sessionUid, stunServers, brokerServers, 25*time.Second, false, true)
 	if err_tcp6 == nil {
 		fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT)
 		fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
@@ -536,8 +760,8 @@ func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.
 				tcp6Tried = true
 			}
 			time.Sleep(3 * time.Second)
-			conn, isRoleClient, _, err_tcp6 = Auto_P2P_TCP_NAT_Traversal(finetwork, sessionUid,
-				turnServer, brokerServer, false, 2)
+			conn, isRoleClient, _, err_tcp6 = Auto_P2P_TCP_NAT_Traversal(finetwork, sessionUid, p2pInfo,
+				stunServers, brokerServers, false, 2)
 			if err_tcp6 == nil {
 				return conn, isRoleClient, nil
 			}
@@ -556,8 +780,8 @@ func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.
 	if network == "any" || strings.HasSuffix(network, "4") {
 		if finetwork == "tcp6" && !tcp4Tried && !tcp6Tried {
 			//如果是没有共同的IPv6的条件，则尝试IPv4的tcp
-			conn, isRoleClient, _, err_tcp4 = Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid,
-				turnServer, brokerServer, false, 2)
+			conn, isRoleClient, _, err_tcp4 = Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid, nil,
+				stunServers, brokerServers, false, 2)
 			if err_tcp4 == nil {
 				return conn, isRoleClient, nil
 			}
@@ -566,7 +790,7 @@ func Easy_P2P(network, sessionUid, turnServer string, brokerServer string) (net.
 		}
 
 		conn, isRoleClient, _, err_udp = Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid,
-			turnServer, brokerServer, false, 2)
+			stunServers, brokerServers, false, 2)
 		if err_udp == nil {
 			return conn, isRoleClient, nil
 		}
@@ -598,7 +822,7 @@ func generateRandomPorts(count int) []int {
 	return ports
 }
 
-func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, stunServers, brokerServers []string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 10
@@ -611,7 +835,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 		fmt.Fprintf(os.Stderr, "=== Round %d: Trying P2P(%s) Connection ===\n", round, network)
 
 		// 交换 NAT 信息
-		p2pInfo, err := Do_autoP2P(network, sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
+		p2pInfo, err := Do_autoP2P(network, sessionUid, stunServers, brokerServers, 25*time.Second, needSharedKey, true)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("P2P info exchange failed: %v", err)
 		}
@@ -937,19 +1161,24 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid, turnServer, brokerServer st
 	return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed after %d rounds", maxRound)
 }
 
-func Auto_P2P_TCP_NAT_Traversal(network, sessionUid, turnServer, brokerServer string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
+func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, stunServers, brokerServers []string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
-	var errConn error
+	var err, errConn error
 	for round := 1; round <= maxRound; round++ {
 
 		fmt.Fprintf(os.Stderr, "=== Round %d: Trying P2P(%s) Connection ===\n", round, network)
 
 		// 1. 交换 NAT 信息
-		p2pInfo, err := Do_autoP2P(network, sessionUid, turnServer, brokerServer, 25*time.Second, needSharedKey, true)
-		if err != nil {
-			return nil, false, nil, fmt.Errorf("P2P info exchange failed: %v", err)
+		if round == 1 && p2pInfo != nil {
+			//使用外面传进来的p2pInfo
+		} else {
+			p2pInfo, err = Do_autoP2P(network, sessionUid, stunServers, brokerServers, 25*time.Second, needSharedKey, true)
+			if err != nil {
+				return nil, false, nil, fmt.Errorf("P2P info exchange failed: %v", err)
+			}
 		}
+
 		if needSharedKey {
 			sharedKey = p2pInfo.SharedKey[:]
 		}
@@ -1073,97 +1302,173 @@ func logStderr(msg string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, msg, args...)
 }
 
-func MqttWait(sessionUid, brokerServer string, timeout time.Duration) (string, error) {
+func MqttWait(sessionUid string, brokerServers []string, timeout time.Duration) (string, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topic := TopicExchangeWait + uid
-	logStderr("Waiting for event on topic: %s\n", topic)
+	logStderr("Waiting for event on topic: %s across %d servers\n", topic, len(brokerServers))
 
 	msgReceived := make(chan string, 1)
+	var clients []mqtt.Client
+	var clientsMutex sync.Mutex
 
-	opts := mqtt.NewClientOptions().
-		AddBroker(brokerServer).
-		SetClientID(deriveKeyForTopic("mqtt-topic-gonc-waiter", sessionUid)).
-		SetAutoReconnect(true).
-		SetConnectRetry(true).
-		SetConnectRetryInterval(3 * time.Second).
-		SetOnConnectHandler(func(c mqtt.Client) {
-			if token := c.Subscribe(topic, 0, func(client mqtt.Client, msg mqtt.Message) {
-				select {
-				case msgReceived <- string(msg.Payload()):
-				default:
-				}
-			}); token.Wait() && token.Error() != nil {
-				logStderr("Failed to re-subscribe on connect: %v\n", token.Error())
+	baseClientID := deriveKeyForTopic("mqtt-topic-gonc-waiter", sessionUid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for i, server := range brokerServers {
+		go func(brokerAddr string, clientIndex int) {
+			opts := mqtt.NewClientOptions().
+				AddBroker(brokerAddr).
+				SetClientID(fmt.Sprintf("%s-%d", baseClientID, clientIndex)).
+				SetAutoReconnect(true).
+				SetConnectRetry(true).
+				SetConnectRetryInterval(3 * time.Second).
+				SetOnConnectHandler(func(c mqtt.Client) {
+					if token := c.Subscribe(topic, 1, func(client mqtt.Client, msg mqtt.Message) {
+						select {
+						case msgReceived <- string(msg.Payload()):
+							cancel() // 通知其他协程停止工作
+						default:
+							// 已经接收到一条消息，忽略重复
+						}
+					}); token.Wait() && token.Error() != nil {
+						logStderr("Failed to subscribe to topic %s on %s: %v\n", topic, brokerAddr, token.Error())
+					} else {
+						logStderr("Subscribed to topic %s on %s\n", topic, brokerAddr)
+					}
+				}).
+				SetConnectionLostHandler(func(c mqtt.Client, err error) {
+					logStderr("MQTT connection lost from %s: %v\n", brokerAddr, err)
+				})
+
+			client := mqtt.NewClient(opts)
+
+			// 连接 MQTT
+			if token := client.Connect(); token.Wait() && token.Error() == nil {
+				clientsMutex.Lock()
+				clients = append(clients, client)
+				clientsMutex.Unlock()
+
+				// 监听 context.Done() 退出信号，防止 goroutine 悬挂
+				go func() {
+					<-ctx.Done()
+					if client.IsConnected() {
+						client.Disconnect(250)
+					}
+				}()
 			} else {
-				logStderr("Subscribed (or re-subscribed) to topic: %v\n", topic)
+				logStderr("MQTT connect to %s failed: %v\n", brokerAddr, token.Error())
 			}
-		}).
-		SetConnectionLostHandler(func(c mqtt.Client, err error) {
-			logStderr("MQTT connection lost: %v\n", err)
-		})
-
-	client := mqtt.NewClient(opts)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		return "", fmt.Errorf("MQTT connect failed: %w", token.Error())
+		}(server, i)
 	}
-	defer func() {
-		client.Disconnect(250)             // 等待最多 250ms 尝试发送未完成的消息
-		time.Sleep(500 * time.Millisecond) // 再额外等 500ms，确保清理后台 goroutine
-	}()
 
-	myKey := deriveKey("hello", sessionUid)
-	var payloadRaw string
-	var plain []byte
-	var err error
+	// 等待消息或超时（context 有超时时间）
+	var (
+		payloadRaw string
+		plain      []byte
+		err        error
+	)
+
 	select {
 	case payloadRaw = <-msgReceived:
 		var remotePayload securePayload
 		err = json.Unmarshal([]byte(payloadRaw), &remotePayload)
 		if err != nil {
-			return "", err
+			break
 		}
+		myKey := deriveKey("hello", sessionUid)
 		plain, err = decryptAES(myKey[:], &remotePayload)
 		if err != nil {
-			return "", err
+			break
 		}
 		logStderr("Received event: %s\n", string(plain))
-	case <-time.After(timeout):
+	case <-ctx.Done():
 		return "", fmt.Errorf("timeout waiting for MQTT event")
 	}
 
-	return string(plain), nil
+	// 断开所有连接
+	clientsMutex.Lock()
+	for _, client := range clients {
+		client.Disconnect(250)
+	}
+	clientsMutex.Unlock()
+	time.Sleep(500 * time.Millisecond)
+
+	return string(plain), err
 }
 
-// MqttPush 连接到 MQTT 服务器并发送消息到指定 topic
-func MqttPush(msg, sessionUid, brokerServer string) error {
+func MqttPush(msg, sessionUid string, brokerServers []string) error {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topic := TopicExchangeWait + uid
 
-	fmt.Fprintf(os.Stderr, "MQTT: pushing to topic %s: %s\n", topic, msg)
-
-	opts := mqtt.NewClientOptions().
-		AddBroker(brokerServer).
-		SetClientID(deriveKeyForTopic("mqtt-topic-gonc-push", sessionUid)).
-		SetConnectTimeout(5 * time.Second)
-
-	client := mqtt.NewClient(opts)
-
-	token := client.Connect()
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("MQTT connect failed: %v", token.Error())
-	}
-	defer client.Disconnect(250)
+	fmt.Fprintf(os.Stderr, "MQTT: Pushing to topic %s across %d servers: %s\n", topic, len(brokerServers), msg)
 
 	myKey := deriveKey("hello", sessionUid)
-
 	encPayload, _ := encryptAES(myKey[:], []byte(msg))
 	encPayloadBytes, _ := json.Marshal(encPayload)
+	payload := string(encPayloadBytes)
 
-	pub := client.Publish(topic, 1, false, string(encPayloadBytes))
-	if pub.Wait() && pub.Error() != nil {
-		return fmt.Errorf("MQTT publish failed: %v", pub.Error())
+	var successCount int32
+	var wg sync.WaitGroup
+
+	errChan := make(chan struct{}, len(brokerServers)) // 用于通知“失败发生”
+	successNotify := make(chan struct{}, 1)            // 用于通知“至少两个成功”
+	var once sync.Once
+
+	for _, server := range brokerServers {
+		wg.Add(1)
+		go func(brokerAddr string) {
+			defer wg.Done()
+
+			opts := mqtt.NewClientOptions().
+				AddBroker(brokerAddr).
+				SetClientID(deriveKeyForTopic("mqtt-topic-gonc-push", sessionUid+brokerAddr)).
+				SetConnectTimeout(5 * time.Second)
+
+			client := mqtt.NewClient(opts)
+			token := client.Connect()
+			if token.Wait() && token.Error() != nil {
+				errChan <- struct{}{}
+				return
+			}
+			defer client.Disconnect(250)
+
+			pub := client.Publish(topic, 1, false, payload)
+			if pub.Wait() && pub.Error() != nil {
+				errChan <- struct{}{}
+				return
+			}
+
+			count := atomic.AddInt32(&successCount, 1)
+			if count >= 2 {
+				// 尝试通知主线程已有足够成功
+				once.Do(func() { successNotify <- struct{}{} })
+			}
+		}(server)
 	}
 
-	fmt.Fprintf(os.Stderr, "MQTT: pushed successfully\n")
+	// 等待两种情况之一：
+	// 1. 成功数达到 2（通过 successNotify）
+	// 2. 所有 goroutine 执行完（通过 wg.Wait）
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-successNotify:
+		// 足够成功，立即返回成功
+	case <-done:
+		// 所有完成后再检查是否成功
+	}
+
+	successes := int(atomic.LoadInt32(&successCount))
+	if successes == 0 {
+		return fmt.Errorf("failed to publish to any MQTT server")
+	}
+
+	fmt.Fprintf(os.Stderr, "MQTT: Push operation completed. Successes: %d\n", successes)
 	return nil
 }

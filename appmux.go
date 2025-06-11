@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/armon/go-socks5"
 	"github.com/hashicorp/yamux"
 	"github.com/xtaci/smux"
 )
@@ -60,14 +59,14 @@ type muxListener struct {
 }
 
 func (m *muxListener) Accept() (net.Conn, error) {
-	var stream io.ReadWriteCloser
+	var stream net.Conn
 	var err error
 
 	switch s := m.session.(type) {
 	case *yamux.Session:
 		stream, err = s.Accept()
 	case *smux.Session:
-		stream, err = s.Accept()
+		stream, err = s.AcceptStream()
 	default:
 		return nil, fmt.Errorf("unknown session type")
 	}
@@ -75,7 +74,7 @@ func (m *muxListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	return &streamWrapper{ReadWriteCloser: stream}, nil
+	return &streamWrapper{Conn: stream}, nil
 }
 
 func (m *muxListener) Close() error {
@@ -94,13 +93,13 @@ func (m *muxListener) Addr() net.Addr {
 }
 
 type streamWrapper struct {
-	io.ReadWriteCloser
+	net.Conn
 }
 
 func (s *streamWrapper) CloseWrite() error {
 	// 对于 yamux/smux，没有真实的 CloseWrite，只能 Close()
 	// 这样实现是为了让 proxy_copy 那边能继续收尾
-	return s.Close()
+	return s.Conn.Close()
 }
 
 // 实现 net.Conn 剩余方法：
@@ -114,16 +113,15 @@ func (s *streamWrapper) RemoteAddr() net.Addr {
 }
 
 func (s *streamWrapper) SetDeadline(t time.Time) error {
-	// yamux/smux 的 Stream 一般不支持 deadline，这里可 no-op
-	return nil
+	return s.Conn.SetDeadline(t)
 }
 
 func (s *streamWrapper) SetReadDeadline(t time.Time) error {
-	return nil
+	return s.Conn.SetReadDeadline(t)
 }
 
 func (s *streamWrapper) SetWriteDeadline(t time.Time) error {
-	return nil
+	return s.Conn.SetWriteDeadline(t)
 }
 
 func proxy_copy(dst io.WriteCloser, src io.Reader, errCh chan<- ChanError, id int) {
@@ -190,7 +188,7 @@ func mux_main() {
 
 	init_TLS(false)
 
-	dialer := createDialer()
+	dialer := createClientDialer()
 
 	switch *muxSessionMode {
 	case "connect":
@@ -203,12 +201,14 @@ func mux_main() {
 			if err != nil {
 				panic(err)
 			}
-			dialer = &net.Dialer{
+			d := &net.Dialer{
 				LocalAddr: localAddr,
 				Control:   misc.ControlTCP,
 			}
+			sessionConn, err = d.Dial("tcp", *muxSessionAddress)
+		} else {
+			sessionConn, err = dialer.Dial("tcp", *muxSessionAddress)
 		}
-		sessionConn, err = dialer.Dial("tcp", *muxSessionAddress)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Connect failed: %v\n", err)
 			os.Exit(1)
@@ -312,7 +312,7 @@ func handleMuxSession(cfg MuxSessionConfig) error {
 	case "forward":
 		return handleForwardMode(cfg)
 	case "socks5":
-		return handleSocks5Mode(cfg)
+		return handleSocks5uMode(cfg)
 	case "httpserver":
 		return handleHTTPServerMode(cfg)
 	default:
@@ -374,19 +374,25 @@ func handleListenMode(cfg MuxSessionConfig) error {
 		}
 
 		go func(c net.Conn) {
-			var stream io.ReadWriteCloser
+			defer c.Close()
+			var stream net.Conn
 			switch s := session.(type) {
 			case *yamux.Session:
 				stream, err = s.Open()
 			case *smux.Session:
-				stream, err = s.Open()
+				stream, err = s.OpenStream()
 			}
+			streamWithCloseWrite := &streamWrapper{Conn: stream}
+			defer streamWithCloseWrite.Close()
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "mux Open failed:", err)
-				c.Close()
 				return
 			}
-			handleProxy(c, stream)
+			if peerMode == "socks5" {
+				handleSocks5uProxy(c, streamWithCloseWrite)
+			} else {
+				handleProxy(c, streamWithCloseWrite)
+			}
 		}(conn)
 	}
 }
@@ -404,18 +410,18 @@ func handleForwardMode(cfg MuxSessionConfig) error {
 	fmt.Fprintln(os.Stderr, "forward ready on mux")
 
 	for {
-		var stream io.ReadWriteCloser
+		var stream net.Conn
 		switch s := session.(type) {
 		case *yamux.Session:
 			stream, err = s.Accept()
 		case *smux.Session:
-			stream, err = s.Accept()
+			stream, err = s.AcceptStream()
 		}
 		if err != nil {
 			return fmt.Errorf("accept mux stream failed: %v", err)
 		}
 
-		go func(s io.ReadWriteCloser) {
+		go func(s net.Conn) {
 			defer s.Close()
 			targetConn, err := net.Dial("tcp", net.JoinHostPort(cfg.Host, cfg.Port))
 			if err != nil {
@@ -424,29 +430,16 @@ func handleForwardMode(cfg MuxSessionConfig) error {
 			}
 			defer targetConn.Close()
 			handleProxy(s, targetConn)
-		}(&streamWrapper{ReadWriteCloser: stream})
+		}(&streamWrapper{Conn: stream})
 	}
 }
 
-func handleSocks5Mode(cfg MuxSessionConfig) error {
+func handleSocks5uMode(cfg MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
 		return err
 	}
 
-	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
-	if err != nil {
-		return err
-	}
-
-	logger := log.New(os.Stderr, "[socks5] ", log.LstdFlags)
-	conf := &socks5.Config{Logger: logger}
-	server, err := socks5.New(conf)
-	if err != nil {
-		return fmt.Errorf("create socks5 failed: %v", err)
-	}
-
-	fmt.Fprintln(os.Stderr, "SOCKS5 ready on mux")
-	return server.Serve(&muxListener{session})
+	return handleSocks5uModeForRemote(cfg)
 }
 
 func handleHTTPServerMode(cfg MuxSessionConfig) error {
@@ -464,12 +457,12 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 	fmt.Fprintln(os.Stderr, "httpserver ready on mux")
 
 	for {
-		var stream io.ReadWriteCloser
+		var stream net.Conn
 		switch s := session.(type) {
 		case *yamux.Session:
 			stream, err = s.Accept()
 		case *smux.Session:
-			stream, err = s.Accept()
+			stream, err = s.AcceptStream()
 		}
 		if err != nil {
 			return fmt.Errorf("accept mux stream failed: %v", err)
@@ -482,7 +475,7 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 				done: make(chan struct{}),
 			}
 			_ = http.Serve(listener, handler)
-		}(&streamWrapper{ReadWriteCloser: stream})
+		}(&streamWrapper{Conn: stream})
 	}
 }
 
