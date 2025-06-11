@@ -138,7 +138,7 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 			//为了打洞的TCP在程序结束后该端口不出现TIME_WAIT，方便再次复用端口。使用策略：
 			// 1）并发多个stun查询的tcp，除了第一个成功的要保留，其他程序主动要关闭的可以SetLinger(0)就不会出现TIME_WAIT。
 			// 2）第一个成功stun查询的TCP不主动关闭（主动正常关闭一定会有TIME_WAIT），要用Read等待的方式保活，可以做可以在程序退出时触发系统RST，RST就不会出现TIME_WAIT.
-			//    但如果对方主动挥手，可能打开的洞还在通讯，这边只能正常关闭，不能SetLinger(0)避免RST导致打开的tcp的洞失效。
+			//    但如果对方主动挥手，可能打开的洞还在通讯，这边被动正常关闭不会TIME_WAIT，不能SetLinger(0)避免RST导致打开的tcp的洞失效。
 			// 3) 程序再次重新打洞时，上次第一个成功stun查询的TCP要SetLinger(0)主动关闭
 
 			client, err := stun.NewClient(conn)
@@ -239,8 +239,8 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 				// a. 立即通知其他 goroutine 停止
 				cancel()
 
-				// b. 如果是 TCP，执行你保存连接的逻辑
-				if netProto == "tcp" {
+				// b. 如果是 TCP，且明确了端口，执行保存连接的逻辑
+				if bind != "" && !strings.HasSuffix(bind, ":0") && netProto == "tcp" {
 					lastStunClientLock.Lock()
 					if lastStunClient != nil {
 						if tcpConn, ok := lastStunClientConn.(*net.TCPConn); ok {
@@ -261,8 +261,13 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 						// 读取到数据或错误后，关闭客户端
 						sc.Close()
 					}(r.conn, r.client)
+				} else {
+					// 其他情况，例如TCP随机端口，或UDP，主动关闭
+					if tcpConn, ok := r.conn.(*net.TCPConn); ok {
+						tcpConn.SetLinger(0) // 立即关闭，发送 RST
+					}
+					r.client.Close()
 				}
-				// 对于UDP，我们什么都不用做，它的连接会在 goroutine 结束时被 defer client.Close() 关闭
 
 				// c. 启动清理 goroutine，排空 channel，关闭其他可能成功的 TCP 连接
 				go func() {
@@ -791,7 +796,6 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			} else if finetwork == "tcp6" {
 				tcp6Tried = true
 			}
-			time.Sleep(3 * time.Second)
 			conn, isRoleClient, _, err_tcp6 = Auto_P2P_TCP_NAT_Traversal(finetwork, sessionUid, p2pInfo,
 				stunServers, brokerServers, false, 2)
 			if err_tcp6 == nil {
