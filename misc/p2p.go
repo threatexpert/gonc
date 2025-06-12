@@ -961,6 +961,10 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	switch network {
 	case "any":
 		networksToTryStun = []string{"tcp6", "tcp4", "udp4"}
+	case "any6":
+		networksToTryStun = []string{"tcp6"}
+	case "any4":
+		networksToTryStun = []string{"tcp4", "udp4"}
 	case "tcp":
 		networksToTryStun = []string{"tcp6", "tcp4"}
 	case "udp":
@@ -986,8 +990,8 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	var p2pInfo *P2PAddressInfo
 	var ok, triedAtLeast bool
 
-	switch network {
-	case "any":
+	switch {
+	case strings.HasPrefix(network, "any"):
 		p2pInfo, ok = availableInfos["tcp6"]
 		if ok {
 			conn, isRoleClient, _, err_tcp6 := Auto_P2P_TCP_NAT_Traversal("tcp6", sessionUid, p2pInfo,
@@ -1021,7 +1025,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			triedAtLeast = true
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp)
 		}
-	case "tcp":
+	case network == "tcp":
 		p2pInfo, ok = availableInfos["tcp6"]
 		if ok {
 			conn, isRoleClient, _, err_tcp6 := Auto_P2P_TCP_NAT_Traversal("tcp6", sessionUid, p2pInfo,
@@ -1046,7 +1050,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			}
 		}
 
-	case "udp":
+	case network == "udp":
 		p2pInfo, ok = availableInfos["udp6"]
 		if ok {
 			conn, isRoleClient, _, err_udp6 := Auto_P2P_UDP_NAT_Traversal("udp6", sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
@@ -1069,13 +1073,13 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			}
 		}
 
-	case "tcp6", "tcp4":
+	case network == "tcp6" || network == "tcp4":
 		conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
 		if attemptErr == nil {
 			return conn, isRoleClient, nil
 		}
 		triedAtLeast = true
-	case "udp6", "udp4":
+	case network == "udp6" || network == "udp4":
 		conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
 		if attemptErr == nil {
 			return conn, isRoleClient, nil
