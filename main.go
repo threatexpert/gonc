@@ -1490,20 +1490,20 @@ func do_P2P(network, sessionKey string, stunServers []string, tryDiffNetwork boo
 			return nil, err
 		}
 		if network == "udp6" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServers, MQTTBrokerServers, true, 2)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, true, 2)
 			if err != nil {
 				return nil, err
 			}
 		} else if network == "udp4" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, stunServers, MQTTBrokerServers, true, 4)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, true, 4)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal("udp6", sessionKey, stunServers, MQTTBrokerServers, true, 2)
+			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal("udp6", sessionKey, nil, stunServers, MQTTBrokerServers, true, 2)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_UDP_NAT_Traversal("udp4", sessionKey, stunServers, MQTTBrokerServers, true, 4)
+				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_UDP_NAT_Traversal("udp4", sessionKey, nil, stunServers, MQTTBrokerServers, true, 4)
 				if err2 != nil {
 					//返回udp4的err
 					return nil, err
