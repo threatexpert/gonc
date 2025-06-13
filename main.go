@@ -64,7 +64,7 @@ var (
 	enablePty         = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
-	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,stunserver2025.stunprotocol.org:3478", "stun servers")
+	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443,freestun.net:3478", "stun servers")
 	STUNServers       []string
 	peer              = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
 	appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
