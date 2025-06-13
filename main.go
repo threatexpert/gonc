@@ -473,7 +473,6 @@ func main() {
 	var conn net.Conn
 	var network string
 	var P2PSessionKey string
-	var tryDiffNetwork bool
 	if *udpProtocol {
 		network = "udp"
 	} else {
@@ -508,17 +507,14 @@ func main() {
 		if *autoP2P != "" && !*udpProtocol {
 			network = "any"
 			P2PSessionKey = *autoP2P
-			tryDiffNetwork = true
 			*tlsEnabled = true //-p2p 默认开启tls安全通信
 		} else if *autoP2P != "" && *udpProtocol {
 			P2PSessionKey = *autoP2P
-			tryDiffNetwork = false
 			*tlsEnabled = true //-p2p 默认开启tls安全通信
 			*kcpEnabled = true //需要kcp实现稳定传输
 			*udpProtocol = true
 			network = "udp"
 		} else if *autoP2PKCP != "" {
-			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PKCP
 			*kcpEnabled = true
 			*udpProtocol = true
@@ -529,12 +525,10 @@ func main() {
 			// 	misc.DebugServerRole = "C"
 			// }
 		} else if *autoP2PTCP != "" {
-			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PTCP
 			*udpProtocol = false
 			network = "tcp"
 		} else if *autoP2PTCPSS != "" {
-			tryDiffNetwork = false
 			P2PSessionKey = *autoP2PTCPSS
 			*udpProtocol = false
 			secureStreamEnabled = true
@@ -602,7 +596,7 @@ func main() {
 			}
 
 			for {
-				conn, err = do_P2P(network, P2PSessionKey, STUNServers, tryDiffNetwork)
+				conn, err = do_P2P(network, P2PSessionKey, STUNServers)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 					time.Sleep(10 * time.Second)
@@ -612,14 +606,12 @@ func main() {
 				time.Sleep(2 * time.Second)
 			}
 		} else {
-			conn, err = do_P2P(network, P2PSessionKey, STUNServers, tryDiffNetwork)
+			conn, err = do_P2P(network, P2PSessionKey, STUNServers)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 				os.Exit(1)
 			}
-			if tryDiffNetwork {
-				network = conn.LocalAddr().Network()
-			}
+			network = conn.LocalAddr().Network()
 		}
 	}
 
@@ -1451,21 +1443,21 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	return nil
 }
 
-func do_P2P(network, sessionKey string, stunServers []string, tryDiffNetwork bool) (net.Conn, error) {
-	var err, err2 error
+func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) {
+	var err error
 	var conn net.Conn
 	var isRoleClient bool
 
-	if tryDiffNetwork {
-		err = Mqtt_ensure_ready(sessionKey)
-		if err != nil {
-			return nil, err
-		}
-		conn, isRoleClient, err = misc.Easy_P2P(network, sessionKey, stunServers, MQTTBrokerServers)
-		if err != nil {
-			return nil, err
-		}
+	err = Mqtt_ensure_ready(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	conn, isRoleClient, sessionSharedKey, err = misc.Easy_P2P(network, sessionKey, stunServers, MQTTBrokerServers)
+	if err != nil {
+		return nil, err
+	}
 
+	if strings.HasPrefix(network, "any") {
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			*udpProtocol = true
 			if isRoleClient {
@@ -1481,36 +1473,8 @@ func do_P2P(network, sessionKey string, stunServers []string, tryDiffNetwork boo
 			*kcpEnabled = false
 		}
 		*tlsEnabled = true
-		if isTLSEnabled() {
-			*tlsServerMode = !isRoleClient
-		}
+		*tlsServerMode = !isRoleClient
 	} else if strings.HasPrefix(network, "udp") {
-		err = Mqtt_ensure_ready(sessionKey)
-		if err != nil {
-			return nil, err
-		}
-		if network == "udp6" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, true, 2)
-			if err != nil {
-				return nil, err
-			}
-		} else if network == "udp4" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, true, 4)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_UDP_NAT_Traversal("udp6", sessionKey, nil, stunServers, MQTTBrokerServers, true, 2)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_UDP_NAT_Traversal("udp4", sessionKey, nil, stunServers, MQTTBrokerServers, true, 4)
-				if err2 != nil {
-					//返回udp4的err
-					return nil, err
-				}
-			}
-		}
-
 		*udpProtocol = true
 		if isRoleClient {
 			//client mode
@@ -1524,33 +1488,9 @@ func do_P2P(network, sessionKey string, stunServers []string, tryDiffNetwork boo
 			*tlsServerMode = !isRoleClient
 		}
 	} else if strings.HasPrefix(network, "tcp") {
-		err = Mqtt_ensure_ready(sessionKey)
-		if err != nil {
-			return nil, err
-		}
-		if network == "tcp6" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 2)
-			if err != nil {
-				return nil, err
-			}
-		} else if network == "tcp4" {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal(network, sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 4)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			conn, isRoleClient, sessionSharedKey, err = misc.Auto_P2P_TCP_NAT_Traversal("tcp6", sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 2)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				conn, isRoleClient, sessionSharedKey, err2 = misc.Auto_P2P_TCP_NAT_Traversal("tcp4", sessionKey, nil, stunServers, MQTTBrokerServers, secureStreamEnabled, 4)
-				if err2 != nil {
-					//返回tcp4的err
-					return nil, err
-				}
-			}
-		}
 		if secureStreamEnabled {
-			if sessionSharedKey == nil || len(sessionSharedKey) != 32 {
+			zeroBytes := make([]byte, 32)
+			if sessionSharedKey == nil || len(sessionSharedKey) != 32 || bytes.Equal(sessionSharedKey, zeroBytes) {
 				conn.Close()
 				return nil, fmt.Errorf("expect a 32 bytes session key")
 			}

@@ -550,104 +550,6 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid string, brokerServers []string
 	}
 }
 
-func Do_autoP2P(network, sessionUid string, stunServers, brokerServers []string, timeout time.Duration, needSharedKey, verb bool) (*P2PAddressInfo, error) {
-
-	var err, pubIPErr error
-	var priv *ecdsa.PrivateKey
-	var sharedKey [32]byte
-	myKey := deriveKey(network, sessionUid)
-
-	if verb {
-		fmt.Fprintf(os.Stderr, "    Getting local & public IP...")
-	}
-	stunIndex, localAddr, natAddr, pubIPErr := GetPublicIP(network, "", stunServers, 7*time.Second)
-	if pubIPErr != nil {
-		if verb {
-			fmt.Fprintf(os.Stderr, "Failed\n")
-		}
-	} else {
-		if verb {
-			fmt.Fprintf(os.Stderr, "OK (via %s)\n", stunServers[stunIndex])
-		}
-	}
-	//即使GetPublicIP失败了，localAddr和natAddr为空时也通过MQTT告诉对方
-	myInfo := map[string]string{"lan": localAddr, "nat": natAddr, "pk": ""}
-	if pubIPErr == nil && needSharedKey {
-		// ECC key gen
-		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			return nil, err
-		}
-		pubBytes := elliptic.Marshal(elliptic.P256(), priv.PublicKey.X, priv.PublicKey.Y)
-		myInfo["pk"] = base64.StdEncoding.EncodeToString(pubBytes)
-	}
-	infoBytes, _ := json.Marshal(myInfo)
-	encPayload, _ := encryptAES(myKey[:], infoBytes)
-	encPayloadBytes, _ := json.Marshal(encPayload)
-
-	if verb {
-		fmt.Fprintf(os.Stderr, "    Exchanging address info...")
-	}
-	remoteInfoRaw, srvIndex, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServers, timeout)
-	if err != nil {
-		if verb {
-			fmt.Fprintf(os.Stderr, "Failed\n")
-		}
-		return nil, err
-	}
-	if verb {
-		fmt.Fprintf(os.Stderr, "OK (via %s)\n", brokerServers[srvIndex])
-	}
-
-	if pubIPErr != nil {
-		return nil, pubIPErr
-	}
-
-	var remotePayload securePayload
-	err = json.Unmarshal([]byte(remoteInfoRaw), &remotePayload)
-	if err != nil {
-		return nil, err
-	}
-	plain, err := decryptAES(myKey[:], &remotePayload)
-	if err != nil {
-		return nil, err
-	}
-	var remoteInfo map[string]string
-	err = json.Unmarshal(plain, &remoteInfo)
-	if err != nil {
-		return nil, err
-	}
-	lan, ok1 := remoteInfo["lan"]
-	nat, ok2 := remoteInfo["nat"]
-	remotePubRaw, ok3 := remoteInfo["pk"]
-	if !ok1 || !ok2 || !ok3 {
-		return nil, fmt.Errorf("missing required remote address fields from peer")
-	}
-	if lan == "" || nat == "" {
-		return nil, fmt.Errorf("the peer did not provide LAN or NAT %s address", network)
-	}
-	if needSharedKey {
-		if len(remotePubRaw) == 0 {
-			return nil, fmt.Errorf("missing pk field from peer")
-		}
-		remotePubBytes, err := base64.StdEncoding.DecodeString(remotePubRaw)
-		if err != nil {
-			return nil, err
-		}
-		x, y := elliptic.Unmarshal(elliptic.P256(), remotePubBytes)
-		sharedX, _ := priv.PublicKey.Curve.ScalarMult(x, y, priv.D.Bytes())
-		sharedKey = sha256.Sum256(sharedX.Bytes())
-	}
-
-	return &P2PAddressInfo{
-		LocalLAN:  localAddr,
-		LocalNAT:  natAddr,
-		RemoteLAN: lan,
-		RemoteNAT: nat,
-		SharedKey: sharedKey,
-	}, nil
-}
-
 // ipInfo 用于在并发协程中保存 GetPublicIP 的结果
 type ipInfo struct {
 	localAddr string
@@ -671,7 +573,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 	var wg sync.WaitGroup
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Getting local & public IP for %v...\n", networks)
+		fmt.Fprintf(os.Stderr, "    Getting local & public IP ...")
 	}
 
 	// **步骤 1: 并发获取所有网络类型的公网IP地址**
@@ -695,6 +597,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 	}
 
 	// 汇总所有成功获取到的地址
+	nets := make([]string, 0, len(myAddrResults)) // 预分配容量
 	hasSuccessfulLookup := false
 	for net, info := range myAddrResults {
 		if info.err == nil && info.localAddr != "" && info.natAddr != "" {
@@ -702,13 +605,21 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 				"lan": info.localAddr,
 				"nat": info.natAddr,
 			}
+			nets = append(nets, net)
 			hasSuccessfulLookup = true
 		}
 	}
 
 	// 如果所有网络类型都获取地址失败，则没有必要继续
 	if !hasSuccessfulLookup {
+		if verb {
+			fmt.Fprintf(os.Stderr, "Failed\n")
+		}
 		return nil, fmt.Errorf("failed to get any local/NAT address from STUN servers")
+	} else {
+		if verb {
+			fmt.Fprintf(os.Stderr, "OK (Got %s).\n", strings.Join(nets, ","))
+		}
 	}
 
 	var priv *ecdsa.PrivateKey
@@ -733,7 +644,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 
 	// **步骤 3: 通过 Broker 交换信息**
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Exchanging address info via broker...")
+		fmt.Fprintf(os.Stderr, "    Exchanging address info ...")
 	}
 	remoteInfoRaw, srvIndex, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServers, timeout)
 	if err != nil {
@@ -805,6 +716,15 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 	}
 
 	return finalResults, nil
+}
+
+func Do_autoP2P(network string, sessionUid string, stunServers, brokerServers []string, timeout time.Duration, needSharedKey, verb bool) (*P2PAddressInfo, error) {
+	p2pInfos, err := Do_autoP2PEx([]string{network}, sessionUid, stunServers, brokerServers, timeout, needSharedKey, verb)
+	if err != nil {
+		return nil, err
+	}
+
+	return p2pInfos[0], nil
 }
 
 // 提取 IP（去掉端口）
@@ -937,9 +857,7 @@ func p2pCanDirect(p2pInfo *P2PAddressInfo, ensureEasy bool) bool {
 }
 
 func p2pInfoPrint(p2pInfo *P2PAddressInfo) {
-	if p2pInfo.Network != "" {
-		fmt.Printf("  - %-14s: %s\n", "Network", p2pInfo.Network)
-	}
+	fmt.Fprintf(os.Stderr, "  - %-14s: %s\n", "Network", p2pInfo.Network)
 	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT)
 	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
 }
@@ -955,7 +873,7 @@ func p2pInfoMap(infos []*P2PAddressInfo) map[string]*P2PAddressInfo {
 	return m
 }
 
-func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (net.Conn, bool, error) {
+func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (net.Conn, bool, []byte, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	var networksToTryStun []string
 	switch network {
@@ -972,16 +890,16 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	case "tcp6", "tcp4", "udp6", "udp4":
 		networksToTryStun = []string{network}
 	default:
-		return nil, false, fmt.Errorf("unsupported network type: '%s'", network)
+		return nil, false, nil, fmt.Errorf("unsupported network type: '%s'", network)
 	}
 
 	fmt.Fprintf(os.Stderr, "=== Checking NAT reachability ===\n")
 
 	// --- 2. Get address information for all required networks in one go ---
-	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, stunServers, brokerServers, 25*time.Second, false, true)
+	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, stunServers, brokerServers, 25*time.Second, true, true)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
-		return nil, false, fmt.Errorf("failed to get P2P address info: %w", err)
+		return nil, false, nil, fmt.Errorf("failed to get P2P address info: %w", err)
 	}
 	// Convert the result slice to a map for O(1) lookups.
 	availableInfos := p2pInfoMap(p2pInfos)
@@ -997,7 +915,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			conn, isRoleClient, _, err_tcp6 := Auto_P2P_TCP_NAT_Traversal("tcp6", sessionUid, p2pInfo,
 				stunServers, brokerServers, false, 1)
 			if err_tcp6 == nil {
-				return conn, isRoleClient, nil
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
 			triedAtLeast = true
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp6)
@@ -1008,7 +926,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 				conn, isRoleClient, _, err_tcp4 := Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid, p2pInfo,
 					stunServers, brokerServers, false, 1)
 				if err_tcp4 == nil {
-					return conn, isRoleClient, nil
+					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 				}
 				triedAtLeast = true
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp4)
@@ -1020,7 +938,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			conn, isRoleClient, _, err_udp := Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid, p2pInfo,
 				stunServers, brokerServers, false, 2)
 			if err_udp == nil {
-				return conn, isRoleClient, nil
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
 			triedAtLeast = true
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp)
@@ -1031,7 +949,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			conn, isRoleClient, _, err_tcp6 := Auto_P2P_TCP_NAT_Traversal("tcp6", sessionUid, p2pInfo,
 				stunServers, brokerServers, false, 1)
 			if err_tcp6 == nil {
-				return conn, isRoleClient, nil
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
 			triedAtLeast = true
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp6)
@@ -1042,7 +960,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 				conn, isRoleClient, _, err_tcp4 := Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid, p2pInfo,
 					stunServers, brokerServers, false, 1)
 				if err_tcp4 == nil {
-					return conn, isRoleClient, nil
+					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 				}
 				triedAtLeast = true
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp4)
@@ -1055,7 +973,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 		if ok {
 			conn, isRoleClient, _, err_udp6 := Auto_P2P_UDP_NAT_Traversal("udp6", sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
 			if err_udp6 == nil {
-				return conn, isRoleClient, nil
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
 			triedAtLeast = true
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp6)
@@ -1065,7 +983,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			if ok {
 				conn, isRoleClient, _, err_udp4 := Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
 				if err_udp4 == nil {
-					return conn, isRoleClient, nil
+					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 				}
 				triedAtLeast = true
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp4)
@@ -1074,19 +992,27 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 		}
 
 	case network == "tcp6" || network == "tcp4":
-		conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
-		if attemptErr == nil {
-			return conn, isRoleClient, nil
+		p2pInfo, ok = availableInfos[network]
+		if ok {
+			conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+			if attemptErr == nil {
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
+			}
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
+			triedAtLeast = true
 		}
-		triedAtLeast = true
 	case network == "udp6" || network == "udp4":
-		conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
-		if attemptErr == nil {
-			return conn, isRoleClient, nil
+		p2pInfo, ok = availableInfos[network]
+		if ok {
+			conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+			if attemptErr == nil {
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
+			}
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
+			triedAtLeast = true
 		}
-		triedAtLeast = true
 	default:
-		return nil, false, fmt.Errorf("unsupported network type: '%s'", network)
+		return nil, false, nil, fmt.Errorf("unsupported network type: '%s'", network)
 	}
 
 	if !triedAtLeast {
@@ -1096,13 +1022,15 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 				if strings.HasPrefix(netType, "tcp") {
 					conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(netType, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
 					if attemptErr == nil {
-						return conn, isRoleClient, nil
+						return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 					}
+					fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
 				} else if strings.HasPrefix(netType, "udp") {
 					conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(netType, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
 					if attemptErr == nil {
-						return conn, isRoleClient, nil
+						return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 					}
+					fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
 				} else {
 					continue
 				}
@@ -1110,7 +1038,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 		}
 	}
 
-	return nil, false, fmt.Errorf("direct P2P connection failed")
+	return nil, false, nil, fmt.Errorf("direct P2P connection failed")
 }
 
 func generateRandomPorts(count int) []int {
@@ -1201,12 +1129,11 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				}
 			}
 		}
-
+		if isClient {
+			//只有先发包的，适合用小ttl值。
+			ttl = PunchingShortTTL
+		}
 		if !inSameLAN && (localMaybeNAT4 || remoteMaybeNAT4) {
-			if isClient {
-				//只有先发包的，适合用小ttl值。
-				ttl = PunchingShortTTL
-			}
 			count = 4 + RPP_TIMEOUT*2
 		} else {
 			count = 8
