@@ -360,8 +360,24 @@ func handleListenMode(cfg MuxSessionConfig) error {
 				ln.Close()
 				return
 			}
-			time.Sleep(time.Second)
+			time.Sleep(1 * time.Second)
 		}
+	}()
+	//监测session的连接状态，对端不应该Open流，所以Accept返回可能是连接异常。
+	go func() {
+		var stream net.Conn
+		var err error
+		switch s := session.(type) {
+		case *yamux.Session:
+			stream, err = s.Accept()
+		case *smux.Session:
+			stream, err = s.AcceptStream()
+		}
+		sessErr = fmt.Errorf("mux session unexpected behavior: %v", err)
+		if err == nil {
+			stream.Close()
+		}
+		ln.Close()
 	}()
 
 	for {
@@ -376,18 +392,19 @@ func handleListenMode(cfg MuxSessionConfig) error {
 		go func(c net.Conn) {
 			defer c.Close()
 			var stream net.Conn
+			var err error
 			switch s := session.(type) {
 			case *yamux.Session:
 				stream, err = s.Open()
 			case *smux.Session:
 				stream, err = s.OpenStream()
 			}
-			streamWithCloseWrite := &streamWrapper{Conn: stream}
-			defer streamWithCloseWrite.Close()
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "mux Open failed:", err)
 				return
 			}
+			streamWithCloseWrite := &streamWrapper{Conn: stream}
+			defer streamWithCloseWrite.Close()
 			if peerMode == "socks5" {
 				handleSocks5uProxy(c, streamWithCloseWrite)
 			} else {

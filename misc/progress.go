@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -86,9 +87,10 @@ func FormatBytes(bytes int64) string {
 
 type PipeConn struct {
 	net.Conn
-	In, in   io.ReadCloser
-	Out, out io.WriteCloser
-	closeCh  chan struct{}
+	In, in    io.ReadCloser
+	Out, out  io.WriteCloser
+	closeCh   chan struct{}
+	closeOnce sync.Once
 }
 
 func NewPipeConn(originalConn net.Conn) *PipeConn {
@@ -115,7 +117,7 @@ func (p *PipeConn) Write(b []byte) (n int, err error) {
 }
 
 func (p *PipeConn) Close() error {
-	close(p.closeCh)
+	p.closeOnce.Do(func() { close(p.closeCh) })
 	p.in.Close()
 	if c, ok := p.out.(io.Closer); ok {
 		c.Close()

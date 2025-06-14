@@ -460,9 +460,11 @@ func main() {
 	if *runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
 		*runCmd = fmt.Sprintf("-app-mux httpserver \"%s\"", escapedPath)
+		*MQTTWait = "hello"
 		*progressEnabled = true
 	} else if *appMuxDownload != "" {
 		*runCmd = fmt.Sprintf("-app-mux -l %s", *appMuxDownload)
+		*MQTTPush = "hello"
 	}
 	if *kcpEnabled || *kcpSEnabled {
 		*udpProtocol = true
@@ -1106,6 +1108,9 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
+			defer pipeConn.Close()
+			defer pipeConn.In.Close()
+			defer pipeConn.Out.Close()
 			go App_mux_main(pipeConn, args[1:])
 		} else {
 
