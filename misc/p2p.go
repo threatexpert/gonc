@@ -958,7 +958,7 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			p2pInfo, ok = availableInfos["tcp4"]
 			if ok {
 				conn, isRoleClient, _, err_tcp4 := Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid, p2pInfo,
-					stunServers, brokerServers, false, 1)
+					stunServers, brokerServers, false, 2)
 				if err_tcp4 == nil {
 					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 				}
@@ -971,7 +971,8 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	case network == "udp":
 		p2pInfo, ok = availableInfos["udp6"]
 		if ok {
-			conn, isRoleClient, _, err_udp6 := Auto_P2P_UDP_NAT_Traversal("udp6", sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+			conn, isRoleClient, _, err_udp6 := Auto_P2P_UDP_NAT_Traversal("udp6", sessionUid, p2pInfo,
+				stunServers, brokerServers, false, 1)
 			if err_udp6 == nil {
 				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
@@ -981,7 +982,8 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 		} else {
 			p2pInfo, ok = availableInfos["udp4"]
 			if ok {
-				conn, isRoleClient, _, err_udp4 := Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+				conn, isRoleClient, _, err_udp4 := Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid, p2pInfo,
+					stunServers, brokerServers, false, 2)
 				if err_udp4 == nil {
 					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 				}
@@ -994,7 +996,8 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	case network == "tcp6" || network == "tcp4":
 		p2pInfo, ok = availableInfos[network]
 		if ok {
-			conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+			conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(network, sessionUid, p2pInfo,
+				stunServers, brokerServers, false, 2)
 			if attemptErr == nil {
 				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
@@ -1004,7 +1007,8 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	case network == "udp6" || network == "udp4":
 		p2pInfo, ok = availableInfos[network]
 		if ok {
-			conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(network, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+			conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(network, sessionUid, p2pInfo,
+				stunServers, brokerServers, false, 2)
 			if attemptErr == nil {
 				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
@@ -1020,13 +1024,15 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 			p2pInfo, ok := availableInfos[netType]
 			if ok {
 				if strings.HasPrefix(netType, "tcp") {
-					conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(netType, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+					conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(netType, sessionUid, p2pInfo,
+						stunServers, brokerServers, false, 2)
 					if attemptErr == nil {
 						return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 					}
 					fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
 				} else if strings.HasPrefix(netType, "udp") {
-					conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(netType, sessionUid, p2pInfo, stunServers, brokerServers, false, 2)
+					conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(netType, sessionUid, p2pInfo,
+						stunServers, brokerServers, false, 2)
 					if attemptErr == nil {
 						return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 					}
