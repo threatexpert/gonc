@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +24,8 @@ import (
 
 	"gonc/misc"
 	"gonc/pty"
+
+	// _ "net/http/pprof"
 
 	"github.com/pion/dtls/v3"
 	"github.com/xtaci/kcp-go/v5"
@@ -39,7 +42,7 @@ var (
 	// 定义命令行参数
 	socks5Addr        = flag.String("s5", "", "ip:port (SOCKS5 proxy)")
 	auth              = flag.String("auth", "", "user:password for SOCKS5 proxy")
-	sendfile          = flag.String("sendfile", "", "path to file to send (optional)")
+	sendfile          = flag.String("send", "", "path to file to send (optional)")
 	tlsEnabled        = flag.Bool("tls", false, "Enable TLS connection")
 	tlsServerMode     = flag.Bool("tlsserver", false, "force as TLS server while connecting")
 	tls10_forced      = flag.Bool("tls10", false, "force negotiation to specify TLS version")
@@ -81,6 +84,8 @@ var (
 	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
 	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
 	useDNS            = flag.String("dns", "", "set DNS Server")
+	runAppFileServ    = flag.String("fileserver", "", "http server root directory")
+	appMuxDownload    = flag.String("download", "", "local listen port for fileserver")
 )
 
 func init() {
@@ -91,6 +96,7 @@ func init() {
 	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
 	flag.IntVar(&misc.PunchingShortTTL, "punch-short-ttl", misc.PunchingShortTTL, "")
 	flag.IntVar(&misc.PunchingRandomPortCount, "punch-random-count", misc.PunchingRandomPortCount, "")
+	flag.StringVar(runAppFileServ, "httpserver", "", "alias for -fileserver")
 }
 
 func init_TLS(genCertForced bool) {
@@ -396,9 +402,9 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.7")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.8")
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-sendfile path] [-tls] [-l] [-u] target_host target_port")
+	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
@@ -412,11 +418,11 @@ func main() {
 		return
 	}
 
-	MQTTBrokerServers = parseMultiItems(*MQTTServers)
-	STUNServers = parseMultiItems(*stunSrv)
+	MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
+	STUNServers = parseMultiItems(*stunSrv, true)
 
 	if *sendfile != "" && *runCmd != "" {
-		fmt.Fprintf(os.Stderr, "-sendfile and -exec cannot be used together\n")
+		fmt.Fprintf(os.Stderr, "-send and -exec cannot be used together\n")
 		os.Exit(1)
 	}
 	if *enablePty && *enableCRLF {
@@ -446,6 +452,17 @@ func main() {
 	if *useIPv4 && *useIPv6 {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
 		os.Exit(1)
+	}
+	if *runAppFileServ != "" && *appMuxDownload != "" {
+		fmt.Fprintf(os.Stderr, "-fileserver and -download cannot be used together\n")
+		os.Exit(1)
+	}
+	if *runAppFileServ != "" {
+		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
+		*runCmd = fmt.Sprintf("-app-mux httpserver \"%s\"", escapedPath)
+		*progressEnabled = true
+	} else if *appMuxDownload != "" {
+		*runCmd = fmt.Sprintf("-app-mux -l %s", *appMuxDownload)
 	}
 	if *kcpEnabled || *kcpSEnabled {
 		*udpProtocol = true
@@ -784,6 +801,11 @@ func main() {
 			}
 		}
 	} else if conn == nil {
+
+		// go func() {
+		// 	log.Println(http.ListenAndServe("localhost:6060", nil))
+		// }()
+
 		//主动连接模式
 		var localAddr net.Addr
 		var localTcpAddr *net.TCPAddr
@@ -1473,6 +1495,7 @@ func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) 
 			*kcpEnabled = false
 		}
 		*tlsEnabled = true
+		*tls13_forced = true
 		*tlsServerMode = !isRoleClient
 	} else if strings.HasPrefix(network, "udp") {
 		*udpProtocol = true
@@ -1500,6 +1523,7 @@ func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) 
 		*kcpEnabled = false
 		if isTLSEnabled() {
 			*tlsServerMode = !isRoleClient
+			*tls13_forced = true
 		}
 	} else {
 		return nil, fmt.Errorf("unexpected p2p mode")
@@ -1606,7 +1630,7 @@ func isAndroid() bool {
 	return runtime.GOOS == "android"
 }
 
-func parseMultiItems(s string) []string {
+func parseMultiItems(s string, randomize bool) []string {
 	servers := strings.Split(s, ",")
 	var result []string
 	for _, srv := range servers {
@@ -1614,6 +1638,10 @@ func parseMultiItems(s string) []string {
 		if trimmed != "" {
 			result = append(result, trimmed)
 		}
+	}
+	if randomize {
+		rand.Seed(time.Now().UnixNano())
+		rand.Shuffle(len(result), func(i, j int) { result[i], result[j] = result[j], result[i] })
 	}
 	return result
 }

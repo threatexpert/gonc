@@ -1,12 +1,23 @@
-go mod init gonc
+set app=gonc
+
+go mod init %app%
 go mod tidy
 
-set app=gonc
+
+SET GOOS=windows
+SET GOARCH=amd64
+SET CGO_ENABLED=0
+go build -buildvcs=false -ldflags="-s -w -buildid=" -trimpath -o bin/%app%.exe
 
 SET GOOS=windows
 SET GOARCH=386
 SET CGO_ENABLED=0
-go build -buildvcs=false -ldflags="-s -w -buildid=" -trimpath -o bin/gonc.exe
+go build -buildvcs=false -ldflags="-s -w -buildid=" -trimpath -o bin/%app%_%GOARCH%.exe
+
+SET GOOS=windows
+SET GOARCH=arm64
+SET CGO_ENABLED=0
+go build -buildvcs=false -ldflags="-s -w -buildid=" -trimpath -o bin/%app%_%GOARCH%.exe
 
 SET GOOS=linux
 SET GOARCH=amd64

@@ -70,7 +70,7 @@ golang版 netcat, 更方便的建立点对点通信。
 
 - 发送和统计传输速度，内置/dev/zero和/dev/urandom实现，这样windows下也可以用/dev/zero和/dev/urandom
 
-    `gonc.exe -sendfile /dev/zero -progress x.x.x.x 1234`
+    `gonc.exe -send /dev/zero -progress x.x.x.x 1234`
 
     `IN: 76.8 MiB (80543744 bytes), 3.3 MiB/s | OUT: 0.0 B (0 bytes), 0.0 B/s | 00:00:23`
 
@@ -88,11 +88,15 @@ golang版 netcat, 更方便的建立点对点通信。
 
     `gonc.exe -p2p randomString -exec "-app-mux socks5"`
 
-    或
-
-    `gonc.exe -p2p randomString -exec "-app-mux httpserver c:/RootDir"`
-
-
-    另一端(本机监听端口)，例如对端使用了httpserver参数，那么访问本机9999端口可实现浏览对端的文件列表
+    另一端(本机监听端口)
 
     `gonc.exe -p2p randomString -exec "-app-mux -l 9999"`
+
+
+    http文件服务器
+
+    `gonc.exe -p2p randomString -httpserver c:/RootDir`
+
+    另一端(本机监听端口)，那么浏览器访问本机9999端口可实现浏览对端的文件列表和下载文件
+
+    `gonc.exe -p2p randomString -download 9999"`
