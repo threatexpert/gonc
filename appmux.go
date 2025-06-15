@@ -18,10 +18,11 @@ import (
 )
 
 var (
-	muxSessionMode    = flag.String("mux-mode", "stdio", "connect | listen | stdio")
-	muxSessionAddress = flag.String("mux-address", "", "host:port (for connect or listen mode)")
-	muxEngine         = flag.String("mux-engine", "smux", "yamux | smux")
-	httpServeDir      = "."
+	muxSessionMode       = flag.String("mux-mode", "stdio", "connect | listen | stdio")
+	muxSessionAddress    = flag.String("mux-address", "", "host:port (for connect or listen mode)")
+	muxEngine            = flag.String("mux-engine", "smux", "yamux | smux")
+	httpServeDir         = "."
+	muxLastListenAddress = ""
 )
 
 type MuxSessionConfig struct {
@@ -337,6 +338,9 @@ func handleListenMode(cfg MuxSessionConfig) error {
 	}
 
 	laddr := cfg.Port
+	if muxLastListenAddress != "" {
+		laddr = muxLastListenAddress
+	}
 	if !strings.Contains(laddr, ":") {
 		laddr = "127.0.0.1:" + laddr
 	}
@@ -349,6 +353,9 @@ func handleListenMode(cfg MuxSessionConfig) error {
 	if peerMode == "httpserver" {
 		_, port, _ := net.SplitHostPort(ln.Addr().String())
 		fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser\n", port)
+	}
+	if cfg.Port == "0" {
+		muxLastListenAddress = ln.Addr().String()
 	}
 
 	// session health check

@@ -84,8 +84,10 @@ var (
 	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
 	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
 	useDNS            = flag.String("dns", "", "set DNS Server")
-	runAppFileServ    = flag.String("fileserver", "", "http server root directory")
-	appMuxDownload    = flag.String("download", "", "local listen port for fileserver")
+	runAppFileServ    = flag.String("httpserver", "", "http server root directory")
+	appMuxListenMode  = flag.Bool("httplocal", false, "local listen mode for fileserver")
+	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for fileserver")
+	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
 )
 
 func init() {
@@ -96,7 +98,9 @@ func init() {
 	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
 	flag.IntVar(&misc.PunchingShortTTL, "punch-short-ttl", misc.PunchingShortTTL, "")
 	flag.IntVar(&misc.PunchingRandomPortCount, "punch-random-count", misc.PunchingRandomPortCount, "")
-	flag.StringVar(runAppFileServ, "httpserver", "", "alias for -fileserver")
+	flag.BoolVar(appMuxListenMode, "socks5local", false, "")
+	flag.StringVar(appMuxListenOn, "socks5local-port", "", "")
+
 }
 
 func init_TLS(genCertForced bool) {
@@ -453,18 +457,34 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
 		os.Exit(1)
 	}
-	if *runAppFileServ != "" && *appMuxDownload != "" {
+	if *runAppFileServ != "" && (*appMuxListenMode || *appMuxListenOn != "") {
 		fmt.Fprintf(os.Stderr, "-fileserver and -download cannot be used together\n")
 		os.Exit(1)
 	}
 	if *runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
 		*runCmd = fmt.Sprintf("-app-mux httpserver \"%s\"", escapedPath)
-		*MQTTWait = "hello"
+		if *MQTTWait == "" {
+			*MQTTWait = "hello"
+		}
 		*progressEnabled = true
-	} else if *appMuxDownload != "" {
-		*runCmd = fmt.Sprintf("-app-mux -l %s", *appMuxDownload)
-		*MQTTPush = "hello"
+		*keepOpen = true
+	} else if *appMuxSocksMode {
+		*runCmd = "-app-mux socks5"
+		if *MQTTWait == "" {
+			*MQTTWait = "hello"
+		}
+		*progressEnabled = true
+		*keepOpen = true
+	} else if *appMuxListenMode || *appMuxListenOn != "" {
+		if *appMuxListenOn == "" {
+			*appMuxListenOn = "0"
+		}
+		*runCmd = fmt.Sprintf("-app-mux -l %s", *appMuxListenOn)
+		if *MQTTPush == "" {
+			*MQTTPush = "hello"
+		}
+		*keepOpen = true
 	}
 	if *kcpEnabled || *kcpSEnabled {
 		*udpProtocol = true
@@ -1462,18 +1482,59 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	}
 
 	if *MQTTPush != "" {
-		err = misc.MqttPush(*MQTTPush, sessionKey, MQTTBrokerServers)
+		err = misc.MqttPush(*MQTTPush, sessionKey, MQTTBrokerServers, true)
 		if err != nil {
 			return fmt.Errorf("mqtt-push: %v", err)
 		}
+
+		// Ensure stopMqttPushChan is properly initialized
+		select {
+		case <-stopMqttPushChan:
+			// If already closed, recreate the channel
+			stopMqttPushChan = make(chan struct{})
+		default:
+		}
+
+		// Start periodic push
+		go func() {
+			ticker := time.NewTicker(7 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					err := misc.MqttPush(*MQTTPush, sessionKey, MQTTBrokerServers, false)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "mqtt-push periodic error: %v\n", err)
+					}
+				case <-stopMqttPushChan:
+					return
+				}
+			}
+		}()
 	}
 	return nil
+}
+
+var stopMqttPushChan = make(chan struct{})
+
+func Mqtt_stop_pushing() {
+	if *MQTTPush == "" {
+		return
+	}
+	select {
+	case <-stopMqttPushChan:
+		// Already closed, do nothing
+	default:
+		close(stopMqttPushChan)
+	}
 }
 
 func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) {
 	var err error
 	var conn net.Conn
 	var isRoleClient bool
+	defer Mqtt_stop_pushing()
 
 	err = Mqtt_ensure_ready(sessionKey)
 	if err != nil {

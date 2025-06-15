@@ -1648,11 +1648,13 @@ func MqttWait(sessionUid string, brokerServers []string, timeout time.Duration) 
 	return string(plain), err
 }
 
-func MqttPush(msg, sessionUid string, brokerServers []string) error {
+func MqttPush(msg, sessionUid string, brokerServers []string, verb bool) error {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topic := TopicExchangeWait + uid
 
-	fmt.Fprintf(os.Stderr, "MQTT: Pushing to topic %s across %d servers: %s\n", topic, len(brokerServers), msg)
+	if verb {
+		fmt.Fprintf(os.Stderr, "MQTT: Pushing to topic %s across %d servers: %s\n", topic, len(brokerServers), msg)
+	}
 
 	myKey := deriveKey("hello", sessionUid)
 	encPayload, _ := encryptAES(myKey[:], []byte(msg))
@@ -1718,7 +1720,8 @@ func MqttPush(msg, sessionUid string, brokerServers []string) error {
 	if successes == 0 {
 		return fmt.Errorf("failed to publish to any MQTT server")
 	}
-
-	fmt.Fprintf(os.Stderr, "MQTT: Push operation completed. Successes: %d\n", successes)
+	if verb {
+		fmt.Fprintf(os.Stderr, "MQTT: Push operation completed. Successes: %d\n", successes)
+	}
 	return nil
 }
