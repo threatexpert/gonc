@@ -85,8 +85,8 @@ var (
 	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
 	useDNS            = flag.String("dns", "", "set DNS Server")
 	runAppFileServ    = flag.String("httpserver", "", "http server root directory")
-	appMuxListenMode  = flag.Bool("httplocal", false, "local listen mode for fileserver")
-	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for fileserver")
+	appMuxListenMode  = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
+	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for remote httpserver")
 	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
 )
 
@@ -100,7 +100,7 @@ func init() {
 	flag.IntVar(&misc.PunchingRandomPortCount, "punch-random-count", misc.PunchingRandomPortCount, "")
 	flag.BoolVar(appMuxListenMode, "socks5local", false, "")
 	flag.StringVar(appMuxListenOn, "socks5local-port", "", "")
-
+	flag.BoolVar(appMuxListenMode, "download", false, "alias for -httplocal")
 }
 
 func init_TLS(genCertForced bool) {
@@ -163,7 +163,7 @@ func do_TLS(conn net.Conn) net.Conn {
 		CipherSuites:             allCiphers,
 		InsecureSkipVerify:       true,             // 忽略证书验证（可选）
 		MinVersion:               tls.VersionTLS10, // 至少 TLSv1
-		MaxVersion:               tls.VersionTLS12, // 最大支持 TLSv1.2
+		MaxVersion:               tls.VersionTLS13, // 最大支持 TLSv1.3
 		PreferServerCipherSuites: true,             // 优先使用服务器的密码套件
 	}
 	if *tls10_forced {
@@ -179,8 +179,8 @@ func do_TLS(conn net.Conn) net.Conn {
 		tlsConfig.MaxVersion = tls.VersionTLS12
 	}
 	if *tls13_forced {
-		tlsConfig.MinVersion = 0x0304
-		tlsConfig.MaxVersion = 0x0304
+		tlsConfig.MinVersion = tls.VersionTLS13
+		tlsConfig.MaxVersion = tls.VersionTLS13
 	}
 	timeout_sec := 20
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
@@ -458,7 +458,7 @@ func main() {
 		os.Exit(1)
 	}
 	if *runAppFileServ != "" && (*appMuxListenMode || *appMuxListenOn != "") {
-		fmt.Fprintf(os.Stderr, "-fileserver and -download cannot be used together\n")
+		fmt.Fprintf(os.Stderr, "-httpserver and (-httplocal -download) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *runAppFileServ != "" {
