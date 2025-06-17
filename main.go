@@ -25,6 +25,7 @@ import (
 	"gonc/misc"
 	"gonc/pty"
 
+	// "net/http"
 	// _ "net/http/pprof"
 
 	"github.com/pion/dtls/v3"
@@ -39,6 +40,8 @@ var (
 	sessionSharedKey           []byte           = nil
 	secureStreamEnabled                         = false
 	goroutineConnectionCounter int32            = 0
+	udpOutputBlockSize         int              = 1320
+	kcpWindowSize              int              = 1500
 	// 定义命令行参数
 	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
 	proxyAddr         = flag.String("x", "", "ip:port for proxy_address")
@@ -103,6 +106,8 @@ func init() {
 	flag.BoolVar(appMuxListenMode, "socks5local", false, "")
 	flag.StringVar(appMuxListenOn, "socks5local-port", "", "")
 	flag.BoolVar(appMuxListenMode, "download", false, "alias for -httplocal")
+	flag.IntVar(&udpOutputBlockSize, "udp-size", udpOutputBlockSize, "")
+	flag.IntVar(&kcpWindowSize, "kcp-window-size", kcpWindowSize, "")
 }
 
 func init_TLS(genCertForced bool) {
@@ -429,7 +434,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.8")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9 beta")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -480,8 +485,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
 		os.Exit(1)
 	}
-	if *useUNIXdomain && (*useIPv6 || *useIPv4 || *useSTUN || *udpProtocol || *kcpEnabled || *kcpSEnabled || *peer != "" || *localbind != "") {
-		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -peer -bind) cannot be used together\n")
+	if *useUNIXdomain && (*useIPv6 || *useIPv4 || *useSTUN || *udpProtocol || *kcpEnabled || *kcpSEnabled || *peer != "" || *localbind != "" || *proxyAddr != "") {
+		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -peer -bind -x) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *runAppFileServ != "" && (*appMuxListenMode || *appMuxListenOn != "") {
@@ -955,12 +960,13 @@ func main() {
 }
 
 // 新增的copyWithProgress函数用于在数据传输时显示进度
-func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, stats *misc.ProgressStats) {
-	buf := make([]byte, blocksize)
+func copyWithProgress(dst io.Writer, src io.Reader, bufsize int, stats *misc.ProgressStats) {
+	reader := bufio.NewReaderSize(src, max(32*1024, bufsize))
+	buf := make([]byte, bufsize)
 	var n int
 	var err, err1 error
 	for {
-		n, err1 = src.Read(buf)
+		n, err1 = reader.Read(buf)
 		if err1 != nil && err1 != io.EOF {
 			fmt.Fprintf(os.Stderr, "Read error: %v\n", err1)
 			break
@@ -1078,6 +1084,12 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 
 	configTCPKeepalive(conn)
 
+	var bufsize int = 32 * 1024
+	blocksize := bufsize
+	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+		blocksize = udpOutputBlockSize
+	}
+
 	// 如果启用 TLS，优先使用TLS作为安全加密层
 	if isTLSEnabled() {
 		if *udpProtocol {
@@ -1138,10 +1150,6 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	var binaryMode = true
 	var cmd *exec.Cmd
 	var err error
-	var blocksize int = 32 * 1024
-	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-		blocksize = 1320
-	}
 
 	if *sendfile != "" {
 		// 如果指定了 sendfile 参数，发送指定的文件
@@ -1272,7 +1280,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(output, conn, blocksize, stats_in)
+		copyWithProgress(output, conn, bufsize, stats_in)
 		time.Sleep(1 * time.Second)
 	}()
 
@@ -1476,7 +1484,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 	}
 
 	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetWindowSize(512, 512)
+	sess.SetWindowSize(kcpWindowSize, kcpWindowSize)
 	sess.SetMtu(1400)
 
 	return sess
