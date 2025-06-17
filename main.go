@@ -57,6 +57,7 @@ var (
 	enableCRLF        = flag.Bool("C", false, "enable CRLF")
 	listenMode        = flag.Bool("l", false, "listen mode")
 	udpProtocol       = flag.Bool("u", false, "use UDP protocol")
+	useUNIXdomain     = flag.Bool("U", false, "Specifies to use UNIX-domain sockets.")
 	kcpEnabled        = flag.Bool("kcp", false, "use UDP+KCP protocol, -u can be omitted")
 	kcpSEnabled       = flag.Bool("kcps", false, "kcp server mode")
 	localbind         = flag.String("bind", "", "ip:port")
@@ -479,6 +480,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
 		os.Exit(1)
 	}
+	if *useUNIXdomain && (*useIPv6 || *useIPv4 || *useSTUN || *udpProtocol || *kcpEnabled || *kcpSEnabled || *peer != "" || *localbind != "") {
+		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -peer -bind) cannot be used together\n")
+		os.Exit(1)
+	}
 	if *runAppFileServ != "" && (*appMuxListenMode || *appMuxListenOn != "") {
 		fmt.Fprintf(os.Stderr, "-httpserver and (-httplocal -download) cannot be used together\n")
 		os.Exit(1)
@@ -536,13 +541,17 @@ func main() {
 	var P2PSessionKey string
 	if *udpProtocol {
 		network = "udp"
+	} else if *useUNIXdomain {
+		network = "unix"
 	} else {
 		network = "tcp"
 	}
-	if *useIPv4 {
-		network += "4"
-	} else if *useIPv6 {
-		network += "6"
+	if network != "unix" {
+		if *useIPv4 {
+			network += "4"
+		} else if *useIPv6 {
+			network += "6"
+		}
 	}
 
 	host := ""
@@ -552,6 +561,8 @@ func main() {
 		host = args[0]
 		port = args[1]
 	} else if len(args) == 1 && *listenMode {
+		port = args[0]
+	} else if len(args) == 1 && !*listenMode && *useUNIXdomain {
 		port = args[0]
 	} else if len(args) == 0 && *remoteAddr != "" {
 		host, port, err = net.SplitHostPort(*remoteAddr)
@@ -681,6 +692,13 @@ func main() {
 	if *listenMode {
 		// 监听模式
 		listenAddr := net.JoinHostPort(host, port)
+		if *useUNIXdomain {
+			listenAddr = port
+			err := cleanupUnixSocket(port)
+			if err != nil {
+				panic(err)
+			}
+		}
 		if *udpProtocol {
 			// 绑定UDP地址
 			addr, err := net.ResolveUDPAddr(network, listenAddr)
@@ -703,7 +721,7 @@ func main() {
 				os.Exit(1)
 			}
 			configUDPConn(uconn)
-			fmt.Fprintf(os.Stderr, "Listening UDP on %s\n", uconn.LocalAddr().String())
+			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 			if *keepOpen {
 				// 创建进度统计
@@ -755,7 +773,7 @@ func main() {
 				conn = buconn
 			}
 		} else {
-			//TCP listen
+			//TCP/unix listen
 			var listener net.Listener
 			var stopSynTrigger bool = false
 			lc := net.ListenConfig{}
@@ -767,7 +785,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "Listening TCP on %s\n", listener.Addr().String())
+			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
 			if *useSTUN {
 				err = ShowPublicIP(network, listener.Addr().String())
 				if err != nil {
@@ -830,7 +848,11 @@ func main() {
 						continue
 					}
 					stopSynTrigger = true
-					fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
+					if conn.LocalAddr().Network() == "unix" {
+						fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
+					} else {
+						fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
+					}
 					go handleConnection(conn, stats_in, stats_out)
 				}
 			} else {
@@ -841,7 +863,11 @@ func main() {
 				}
 				listener.Close()
 				stopSynTrigger = true
-				fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
+				if conn.LocalAddr().Network() == "unix" {
+					fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
+				} else {
+					fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
+				}
 			}
 		}
 	} else if conn == nil {
@@ -880,9 +906,9 @@ func main() {
 			}
 		}
 
-		if strings.HasPrefix(host, "/") || port == "unix" {
+		if *useUNIXdomain {
 			// Unix域套接字
-			conn, err = net.Dial("unix", host)
+			conn, err = net.Dial("unix", port)
 		} else {
 			// TCP/UDP 连接
 			if localAddr == nil {
@@ -904,11 +930,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		if strings.HasPrefix(network, "udp") {
+		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			configUDPConn(conn)
 			fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
 		} else {
-			fmt.Fprintf(os.Stderr, "Connected to: %s\n", net.JoinHostPort(host, port))
+			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
 		}
 	}
 
@@ -1732,4 +1758,27 @@ func parseMultiItems(s string, randomize bool) []string {
 		rand.Shuffle(len(result), func(i, j int) { result[i], result[j] = result[j], result[i] })
 	}
 	return result
+}
+
+// cleanupUnixSocket 检查指定路径的文件是否是Unix域套接字，如果是则删除它。
+func cleanupUnixSocket(path string) error {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		// 其他错误，例如权限问题
+		return fmt.Errorf("could not stat %s: %w", path, err)
+	}
+
+	// 检查文件类型是否为 Unix 域套接字
+	if fileInfo.Mode().Type() == os.ModeSocket {
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("failed to remove existing Unix socket %s: %w", path, err)
+		}
+	} else {
+		// 目标路径存在但不是 Unix 域套接字，应避免删除
+		return fmt.Errorf("path %s exists but is not a Unix socket (mode: %s), refusing to remove it", path, fileInfo.Mode().String())
+	}
+	return nil
 }

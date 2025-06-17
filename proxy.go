@@ -57,11 +57,9 @@ func (c *HttpConnectClient) Dial(network, address string) (net.Conn, error) {
 		Method: "CONNECT",
 		URL:    &url.URL{Opaque: address}, // Use Opaque for CONNECT
 		Host:   address,                   // Set Host header for CONNECT
+		Header: make(http.Header),
 	}
 	if c.Username != "" && c.Password != "" {
-		if connectReq.Header == nil {
-			connectReq.Header = make(http.Header)
-		}
 		connectReq.SetBasicAuth(c.Username, c.Password)
 	}
 
