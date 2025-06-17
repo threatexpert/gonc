@@ -269,6 +269,7 @@ func mux_main() {
 }
 
 func App_mux_main(conn net.Conn, args []string) {
+	defer conn.Close()
 	appMode := ""
 	host := ""
 	port := ""
