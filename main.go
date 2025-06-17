@@ -40,8 +40,9 @@ var (
 	secureStreamEnabled                         = false
 	goroutineConnectionCounter int32            = 0
 	// 定义命令行参数
-	socks5Addr        = flag.String("s5", "", "ip:port (SOCKS5 proxy)")
-	auth              = flag.String("auth", "", "user:password for SOCKS5 proxy")
+	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
+	proxyAddr         = flag.String("x", "", "ip:port for proxy_address")
+	auth              = flag.String("auth", "", "user:password for proxy")
 	sendfile          = flag.String("send", "", "path to file to send (optional)")
 	tlsEnabled        = flag.Bool("tls", false, "Enable TLS connection")
 	tlsServerMode     = flag.Bool("tlsserver", false, "force as TLS server while connecting")
@@ -328,20 +329,41 @@ func do_DTLS(conn net.Conn) net.Conn {
 	return dtlsConn
 }
 
-func createClientDialer() *Socks5Client {
-	if *socks5Addr != "" {
-		authParts := strings.SplitN(*auth, ":", 2)
-		if len(authParts) == 2 {
-			return NewSocks5Client(*socks5Addr, authParts[0], authParts[1])
-		} else if *auth != "" {
-			fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
-			os.Exit(1)
+func createClientDialer() *ProxyClient {
+	if *proxyAddr != "" {
+		user, pass := "", ""
+		if *auth != "" {
+			authParts := strings.SplitN(*auth, ":", 2)
+			if len(authParts) != 2 {
+				fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
+				os.Exit(1)
+			}
+			user, pass = authParts[0], authParts[1]
 		}
-		return NewSocks5Client(*socks5Addr, "", "") // 无认证
+		if *proxyProt == "" || *proxyProt == "5" {
+			client, err := NewProxyClient("socks5", *proxyAddr, user, pass)
+			if err != nil {
+				panic(err)
+			}
+			return client
+		} else if *proxyProt == "connect" {
+			client, err := NewProxyClient("http", *proxyAddr, user, pass)
+			if err != nil {
+				panic(err)
+			}
+			return client
+		} else {
+			fmt.Fprintf(os.Stderr, "Invalid proxy_protocol\n")
+			os.Exit(1)
+			return nil
+		}
 	} else {
-		// 如果没有指定SOCKS5代理，则返回一个模拟的直接连接客户端
-		// 实际应用中，这里可能返回一个包装了 net.Dialer 的结构
-		return &Socks5Client{Socks5Addr: ""} // 代表直连
+		// 如果没有指定代理，则返回一个模拟的直接连接客户端
+		client, err := NewProxyClient("", "", "", "")
+		if err != nil {
+			panic(err)
+		}
+		return client
 	}
 }
 
@@ -408,7 +430,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 func usage() {
 	fmt.Fprintln(os.Stderr, "go-netcat v1.8")
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "    gonc [-s5 socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
+	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
@@ -433,12 +455,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-pty and -C cannot be used together\n")
 		os.Exit(1)
 	}
-	if *socks5Addr != "" && *localbind != "" {
-		fmt.Fprintf(os.Stderr, "-bind and -s5 cannot be used together\n")
+	if *proxyAddr != "" && *localbind != "" {
+		fmt.Fprintf(os.Stderr, "-bind and -x cannot be used together\n")
 		os.Exit(1)
 	}
-	if *socks5Addr != "" && *useSTUN {
-		fmt.Fprintf(os.Stderr, "-turn and -s5 cannot be used together\n")
+	if *proxyAddr != "" && *useSTUN {
+		fmt.Fprintf(os.Stderr, "-turn and -x cannot be used together\n")
 		os.Exit(1)
 	}
 	if *localbind != "" && *listenMode {
@@ -538,9 +560,9 @@ func main() {
 			os.Exit(1)
 		}
 	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
-		if *socks5Addr != "" {
-			fmt.Fprintf(os.Stderr, "INFO: -s5 is ignored with p2p\n")
-			*socks5Addr = ""
+		if *proxyAddr != "" {
+			fmt.Fprintf(os.Stderr, "INFO: proxy is ignored with p2p\n")
+			*proxyAddr = ""
 		}
 		*listenMode = false
 		if *autoP2P != "" && !*udpProtocol {
