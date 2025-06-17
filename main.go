@@ -679,7 +679,11 @@ func main() {
 					time.Sleep(10 * time.Second)
 					continue
 				}
-				handleConnection(conn, stats_in, stats_out)
+				if *MQTTWait != "" {
+					go handleConnection(conn, stats_in, stats_out)
+				} else {
+					handleConnection(conn, stats_in, stats_out)
+				}
 				time.Sleep(2 * time.Second)
 			}
 		} else {
