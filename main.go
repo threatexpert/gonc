@@ -1664,7 +1664,7 @@ func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) 
 	}
 
 	if conn != nil {
-		if strings.HasPrefix(network, "udp") {
+		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			configUDPConn(conn)
 			fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
 		} else {
