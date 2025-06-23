@@ -316,7 +316,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 	}
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Getting public IP info ...")
+		fmt.Fprintf(os.Stderr, "    Getting local public IP info via %d STUN servers...", len(stunServers))
 	}
 
 	allResults, err := GetNetworksPublicIPs(networks, "", stunServers, 5*time.Second)
@@ -341,7 +341,8 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 			}
 		} else {
 			if verb {
-				fmt.Fprintf(os.Stderr, "OK (%s)\n", strings.Join(nets, ","))
+				fmt.Fprintf(os.Stderr, "OK\n")
+				addressesPrint(myInfoForExchange.Addresses)
 			}
 		}
 	}
@@ -362,7 +363,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
 	if verb {
-		fmt.Fprintf(os.Stderr, "    Exchanging address info ...")
+		fmt.Fprintf(os.Stderr, "    Exchanging address info with peer ...")
 	}
 	remoteInfoRaw, srvIndex, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, brokerServers, timeout)
 	if err != nil {
@@ -386,6 +387,10 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 	var remotePayload exchangePayload
 	if err = json.Unmarshal(plain, &remotePayload); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal remote exchange payload: %w", err)
+	}
+
+	if verb {
+		addressesPrint(remotePayload.Addresses)
 	}
 
 	var sharedKey [32]byte
@@ -474,6 +479,19 @@ func Do_autoP2P(network string, sessionUid string, stunServers, brokerServers []
 	}
 
 	return p2pInfos[0], nil
+}
+
+func addressesPrint(Addresses map[string]map[string]string) {
+	for net, info := range Addresses {
+		nattype := info["nattype"]
+		lan := info["lan"]
+		nat := info["nat"]
+		if lan == nat {
+			fmt.Fprintf(os.Stderr, "      %-5s: %s (%s)\n", net, nat, nattype)
+		} else {
+			fmt.Fprintf(os.Stderr, "      %-5s: LAN=%s | NAT=%s (%s)\n", net, lan, nat, nattype)
+		}
+	}
 }
 
 // 提取 IP（去掉端口）
@@ -626,13 +644,8 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 		// If we can't even get the address info, we can't proceed.
 		return nil, false, nil, fmt.Errorf("failed to exchange address info: %w", err)
 	}
+	// Do_autoP2PEx返回的p2pInfos是优先考虑建立TCP来排序的。
 	var p2pInfo *P2PAddressInfo
-
-	for _, p2pInfo = range p2pInfos {
-		p2pInfoPrint(p2pInfo)
-		fmt.Fprintf(os.Stderr, "\n")
-	}
-
 	for _, p2pInfo = range p2pInfos {
 		if strings.HasPrefix(p2pInfo.Network, "tcp") {
 			conn, isRoleClient, _, err2 := Auto_P2P_TCP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo,
@@ -688,7 +701,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	)
 	punchPayload := []byte(deriveKeyForPayload(sessionUid, true))
 
-	fmt.Fprintf(os.Stderr, "=== Trying P2P(%s) Connection ===\n", network)
+	fmt.Fprintf(os.Stderr, "=== Trying P2P Connection ===\n")
 
 	if needSharedKey {
 		sharedKey = p2pInfo.SharedKey[:]
@@ -1008,7 +1021,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		MaxWorkers = 800 // 控制并发量，避免过多文件描述符
 	)
 
-	fmt.Fprintf(os.Stderr, "=== Trying P2P(%s) Connection ===\n", network)
+	fmt.Fprintf(os.Stderr, "=== Trying P2P Connection ===\n")
 
 	if needSharedKey {
 		sharedKey = p2pInfo.SharedKey[:]
