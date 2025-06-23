@@ -72,7 +72,7 @@ var (
 	enablePty         = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
-	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443,freestun.net:3478", "stun servers")
+	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
 	STUNServers       []string
 	peer              = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
 	appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
@@ -434,7 +434,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9 beta")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -758,6 +758,10 @@ func main() {
 				}
 			} else {
 				if *peer != "" {
+					err = misc.SetUDPTTL(uconn, misc.PunchingShortTTL)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to set udp TTL: %v\n", err)
+					}
 					peerIP, startPort, endPort := parsePeerAddressRange(*peer)
 					data := []byte(*punchData)
 					for port := startPort; port <= endPort; port++ {
@@ -778,6 +782,7 @@ func main() {
 					fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 					os.Exit(1)
 				}
+				misc.SetUDPTTL(uconn, 64)
 				fmt.Fprintf(os.Stderr, "Received first UDP packet from %s\n", buconn.RemoteAddr().String())
 				conn = buconn
 			}
@@ -965,7 +970,10 @@ func main() {
 
 // 新增的copyWithProgress函数用于在数据传输时显示进度
 func copyWithProgress(dst io.Writer, src io.Reader, bufsize int, stats *misc.ProgressStats) {
-	reader := bufio.NewReaderSize(src, max(32*1024, bufsize))
+	if bufsize < 32*1024 {
+		bufsize = 32 * 1024
+	}
+	reader := bufio.NewReaderSize(src, bufsize)
 	buf := make([]byte, bufsize)
 	var n int
 	var err, err1 error

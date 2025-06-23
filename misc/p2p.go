@@ -17,6 +17,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,281 +25,26 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/pion/stun"
 )
 
 var (
-	TopicExchange      = "nat-exchange/"
-	TopicExchangeWait  = "nat-exchange-wait/"
-	lastStunClient     *stun.Client
-	lastStunClientConn net.Conn
-	lastStunClientLock sync.Mutex
+	TopicExchange     = "nat-exchange/"
+	TopicExchangeWait = "nat-exchange-wait/"
 
 	DebugServerRole         string
 	PunchingShortTTL        int = 5
 	PunchingRandomPortCount int = 600
 )
 
-// GetPublicIP 获取公网IP，返回第一个成功响应的STUN服务器的结果
-func GetPublicIP(network, bind string, stunServers []string, timeout time.Duration) (index int, localAddr, natAddr string, err error) {
-	// 1. result 结构体包含连接和客户端
-	type result struct {
-		index  int
-		local  string
-		nat    string
-		err    error
-		client *stun.Client
-		conn   net.Conn
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	results := make(chan result, len(stunServers))
-	var wg sync.WaitGroup
-
-	netLower := strings.ToLower(network)
-	netProto := "udp"
-	if strings.HasPrefix(netLower, "tcp") {
-		netProto = "tcp"
-	}
-	isIPv6 := strings.HasSuffix(netLower, "6")
-
-	resolveAddr := func(proto string) (string, net.Addr, error) {
-		var network string
-		if proto == "tcp" {
-			network = "tcp4"
-			if isIPv6 {
-				network = "tcp6"
-			}
-			addr, err := net.ResolveTCPAddr(network, bind)
-			return network, addr, err
-		}
-		network = "udp4"
-		if isIPv6 {
-			network = "udp6"
-		}
-		addr, err := net.ResolveUDPAddr(network, bind)
-		return network, addr, err
-	}
-
-	for i, rawAddr := range stunServers {
-		scheme := ""
-		addr := rawAddr
-
-		if strings.HasPrefix(rawAddr, "udp://") {
-			scheme = "udp"
-			addr = strings.TrimPrefix(rawAddr, "udp://")
-		} else if strings.HasPrefix(rawAddr, "tcp://") {
-			scheme = "tcp"
-			addr = strings.TrimPrefix(rawAddr, "tcp://")
-		}
-
-		//选择匹配network的stun服务器
-		if scheme != "" && scheme != netProto {
-			continue
-		}
-
-		wg.Add(1)
-		go func(index int, stunAddr string) {
-			defer wg.Done()
-
-			// 检查 context 是否已经被取消，避免不必要的拨号
-			if ctx.Err() != nil {
-				//fmt.Fprintf(os.Stderr, "Err: %s ...\n", stunAddr)
-				return
-			}
-
-			useNetwork, laddr, err := resolveAddr(netProto)
-			if err != nil {
-				//fmt.Fprintf(os.Stderr, "stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
-				results <- result{err: fmt.Errorf("resolve local addr: %v", err)}
-				return
-			}
-
-			// 为拨号器创建一个带 context 的超时
-			dialer := &net.Dialer{LocalAddr: laddr}
-			if strings.HasPrefix(useNetwork, "tcp") {
-				dialer.Control = ControlTCP
-			} else {
-				dialer.Control = ControlUDP
-			}
-
-			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s ...\n", useNetwork, stunAddr)
-			conn, err := dialer.DialContext(ctx, useNetwork, stunAddr)
-			if err != nil {
-				//fmt.Fprintf(os.Stderr, "STUN dial failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
-				// 如果 context 被取消，错误会是 "context canceled"
-				results <- result{err: fmt.Errorf("STUN dial failed: %v", err)}
-				return
-			}
-			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s OK\n", useNetwork, stunAddr)
-
-			//这个conn不能defer Close，后面它可能是要保活的tcp。
-			//为了打洞的TCP在程序结束后该端口不出现TIME_WAIT，方便再次复用端口。使用策略：
-			// 1）并发多个stun查询的tcp，除了第一个成功的要保留，其他程序主动要关闭的可以SetLinger(0)就不会出现TIME_WAIT。
-			// 2）第一个成功stun查询的TCP不主动关闭（主动正常关闭一定会有TIME_WAIT），要用Read等待的方式保活，可以做可以在程序退出时触发系统RST，RST就不会出现TIME_WAIT.
-			//    但如果对方主动挥手，可能打开的洞还在通讯，这边被动正常关闭不会TIME_WAIT，不能SetLinger(0)避免RST导致打开的tcp的洞失效。
-			// 3) 程序再次重新打洞时，上次第一个成功stun查询的TCP要SetLinger(0)主动关闭
-
-			client, err := stun.NewClient(conn)
-			if err != nil {
-				//fmt.Fprintf(os.Stderr, "STUN NewClient failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
-				conn.Close()
-				results <- result{err: fmt.Errorf("STUN NewClient failed: %v", err)}
-				return
-			}
-
-			var xorAddr stun.XORMappedAddress
-			var callErr error
-
-			req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-			//fmt.Fprintf(os.Stderr, "stun do request: %s://%s\n", useNetwork, stunAddr)
-
-			// client.Do 不直接支持 context，但拨号阶段已经支持了。
-			// STUN 请求通常很快，超时主要由外层 context 控制。
-			err = client.Do(req, func(e stun.Event) {
-				if e.Error != nil {
-					callErr = e.Error
-				} else if err := xorAddr.GetFrom(e.Message); err != nil {
-					callErr = err
-				}
-			})
-
-			if err != nil {
-				//fmt.Fprintf(os.Stderr, "STUN Do failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
-				client.Close() //前面不能用defer Close，要自己Close
-				results <- result{err: fmt.Errorf("STUN Do failed: %v", err)}
-				return
-			}
-			if callErr != nil {
-				//fmt.Fprintf(os.Stderr, "STUN response error: %s://%s err: %v\n", useNetwork, stunAddr, callErr)
-				client.Close()
-				results <- result{err: fmt.Errorf("STUN response error: %v", callErr)}
-				return
-			}
-
-			//fmt.Fprintf(os.Stderr, "stun result: %s://%s(%s) %s\n", useNetwork, stunAddr, conn.RemoteAddr().String(), xorAddr.String())
-
-			// 2. 将成功的结果（包括连接和客户端）发送到 channel
-			// 注意：UDP连接是无状态的，不需要保留。TCP连接需要保留用于打洞。
-			// 这里我们统一将 client 和 conn 传出，由主循环决定如何处理。
-			results <- result{
-				index:  i,
-				local:  conn.LocalAddr().String(),
-				nat:    xorAddr.String(),
-				client: client,
-				conn:   conn,
-			}
-
-		}(i, addr)
-
-		if bind != "" && !strings.HasSuffix(bind, ":0") && strings.HasPrefix(netProto, "udp") {
-			//由于UDP SO_REUSEADDR明确端口的话，只有一个能收到回复数据，所以只选第一个可用的stunServer
-			break
-		}
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// 3. for-select 循环
-	for {
-		select {
-		case <-ctx.Done():
-			// 超时或被主动取消。
-			// 启动一个 goroutine 来排空 channel，确保所有子 goroutine 都能退出。
-			go func() {
-				for r := range results {
-					// 丢弃所有剩余结果
-					if r.client != nil {
-						if r.conn != nil {
-							if tcpConn, ok := r.conn.(*net.TCPConn); ok {
-								tcpConn.SetLinger(0) // 立即关闭，发送 RST
-							}
-						}
-						//fmt.Fprintf(os.Stderr, "stun close: %s\n", r.conn.RemoteAddr().String())
-						r.client.Close()
-					}
-				}
-			}()
-			return -1, "", "", fmt.Errorf("timeout or cancelled while waiting for STUN response")
-
-		case r, ok := <-results:
-			if !ok {
-				// Channel 已关闭，说明所有 goroutine 都已执行完毕且无一成功。
-				return -1, "", "", fmt.Errorf("all STUN servers failed")
-			}
-
-			if r.err == nil {
-				// **** 找到第一个成功者 ****
-
-				// a. 立即通知其他 goroutine 停止
-				cancel()
-
-				// b. 如果是 TCP，且明确了端口，执行保存连接的逻辑
-				if bind != "" && !strings.HasSuffix(bind, ":0") && netProto == "tcp" {
-					lastStunClientLock.Lock()
-					if lastStunClient != nil {
-						if tcpConn, ok := lastStunClientConn.(*net.TCPConn); ok {
-							_ = tcpConn.SetLinger(0)
-						}
-						lastStunClient.Close()
-					}
-					// 重要：接管获胜的 client 和 conn，防止它们被 defer client.Close() 关闭
-					lastStunClient = r.client
-					lastStunClientConn = r.conn
-					lastStunClientLock.Unlock()
-
-					// 启动你的连接保活/监听关闭的 goroutine
-					go func(tc net.Conn, sc *stun.Client) {
-						buf := make([]byte, 1)
-						// 这个 Read 会一直阻塞，直到远端关闭连接或发生错误
-						_, _ = tc.Read(buf)
-						// 读取到数据或错误后，关闭客户端
-						sc.Close()
-					}(r.conn, r.client)
-				} else {
-					// 其他情况，例如TCP随机端口，或UDP，主动关闭
-					if tcpConn, ok := r.conn.(*net.TCPConn); ok {
-						tcpConn.SetLinger(0) // 立即关闭，发送 RST
-					}
-					r.client.Close()
-				}
-
-				// c. 启动清理 goroutine，排空 channel，关闭其他可能成功的 TCP 连接
-				go func() {
-					for otherResult := range results {
-						if otherResult.client != nil {
-							if otherResult.conn != nil {
-								if tcpConn, ok := otherResult.conn.(*net.TCPConn); ok {
-									tcpConn.SetLinger(0) // 立即关闭，发送 RST
-								}
-							}
-							//fmt.Fprintf(os.Stderr, "stun close: %s\n", otherResult.conn.RemoteAddr().String())
-							otherResult.client.Close()
-						}
-					}
-				}()
-
-				// d. 返回成功结果
-				return r.index, r.local, r.nat, nil
-			}
-			// 如果 r.err != nil，忽略该错误结果，继续等待下一个
-		}
-	}
-}
-
 type P2PAddressInfo struct {
-	Network   string
-	LocalLAN  string
-	LocalNAT  string
-	RemoteLAN string
-	RemoteNAT string
-	SharedKey [32]byte
+	Network       string
+	LocalLAN      string
+	LocalNAT      string
+	LocalNATType  string
+	RemoteLAN     string
+	RemoteNAT     string
+	RemoteNATType string
+	SharedKey     [32]byte
 }
 
 type securePayload struct {
@@ -363,11 +109,15 @@ func deriveKeyForTopic(salt, uid string) string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-func deriveKeyForPayload(uid string) string {
+func deriveKeyForPayload(uid string, ascii bool) string {
 	h := sha256.New()
 	h.Write([]byte("gonc-p2p-payload"))
 	h.Write([]byte(CalculateMD5(uid)))
-	return hex.EncodeToString(h.Sum(nil))[:8]
+	if ascii {
+		return hex.EncodeToString(h.Sum(nil))[:8]
+	} else {
+		return string(h.Sum(nil)[:8])
+	}
 }
 
 func deriveKey(salt, uid string) [32]byte {
@@ -550,83 +300,54 @@ func MQTT_Exchange_Symmetric(sendData, sessionUid string, brokerServers []string
 	}
 }
 
-// ipInfo 用于在并发协程中保存 GetPublicIP 的结果
-type ipInfo struct {
-	localAddr string
-	natAddr   string
-	err       error
-}
-
 // exchangePayload 是用于在 Broker 上交换的统一数据结构
 // 它包含了所有网络类型的地址信息和一个公钥
 type exchangePayload struct {
-	// 键是网络类型 (e.g., "tcp4"), 值是包含 lan 和 nat 地址的 map
+	// network -> {nattype, lan, nat}
 	Addresses map[string]map[string]string `json:"addrs"`
 	// 公钥的 Base64 编码字符串
 	PubKey string `json:"pk"`
 }
 
 func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServers []string, timeout time.Duration, needSharedKey, verb bool) ([]*P2PAddressInfo, error) {
-	// 定义要并发查询的网络类型
-	myAddrResults := make(map[string]ipInfo, len(networks))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
 
-	if verb {
-		fmt.Fprintf(os.Stderr, "    Getting local & public IP ...")
-	}
-
-	// **步骤 1: 并发获取所有网络类型的公网IP地址**
-	for _, network := range networks {
-		wg.Add(1)
-		go func(net string) {
-			defer wg.Done()
-			// 为 GetPublicIP 设置独立的超时，应小于总超时
-			_, local, nat, err := GetPublicIP(net, "", stunServers, 7*time.Second)
-
-			mu.Lock()
-			myAddrResults[net] = ipInfo{localAddr: local, natAddr: nat, err: err}
-			mu.Unlock()
-		}(network)
-	}
-	wg.Wait() // 等待所有 GetPublicIP 调用完成
-
-	// **步骤 2: 准备要交换的数据**
 	myInfoForExchange := exchangePayload{
 		Addresses: make(map[string]map[string]string),
 	}
 
-	// 汇总所有成功获取到的地址
-	nets := make([]string, 0, len(myAddrResults)) // 预分配容量
-	hasSuccessfulLookup := false
-	for net, info := range myAddrResults {
-		if info.err == nil && info.localAddr != "" && info.natAddr != "" {
-			myInfoForExchange.Addresses[net] = map[string]string{
-				"lan": info.localAddr,
-				"nat": info.natAddr,
-			}
-			nets = append(nets, net)
-			hasSuccessfulLookup = true
-		}
+	if verb {
+		fmt.Fprintf(os.Stderr, "    Getting public IP info ...")
 	}
 
-	// 如果所有网络类型都获取地址失败，则没有必要继续
-	if !hasSuccessfulLookup {
+	allResults, err := GetNetworksPublicIPs(networks, "", stunServers, 5*time.Second)
+	if err != nil {
 		if verb {
-			fmt.Fprintf(os.Stderr, "Failed\n")
+			fmt.Fprintln(os.Stderr, "Failed")
 		}
-		return nil, fmt.Errorf("failed to get any local/NAT address from STUN servers")
 	} else {
-		if verb {
-			fmt.Fprintf(os.Stderr, "OK (Got %s).\n", strings.Join(nets, ","))
+		analyzed := analyzeSTUNResults(allResults)
+		nets := []string{}
+		for _, item := range analyzed {
+			myInfoForExchange.Addresses[item.Network] = map[string]string{
+				"nattype": item.NATType,
+				"lan":     item.LAN,
+				"nat":     item.NAT,
+			}
+			nets = append(nets, item.Network)
+		}
+		if len(nets) == 0 {
+			if verb {
+				fmt.Fprintln(os.Stderr, "Failed")
+			}
+		} else {
+			if verb {
+				fmt.Fprintf(os.Stderr, "OK (%s)\n", strings.Join(nets, ","))
+			}
 		}
 	}
 
 	var priv *ecdsa.PrivateKey
-	var err error
-
-	// 如果需要共享密钥，则生成一对ECC密钥（只需一次）
-	if needSharedKey {
+	if needSharedKey && len(myInfoForExchange.Addresses) > 0 {
 		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate ECDSA key: %w", err)
@@ -635,14 +356,11 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 		myInfoForExchange.PubKey = base64.StdEncoding.EncodeToString(pubBytes)
 	}
 
-	// 使用一个固定的key来加密交换信息，这里用 sessionUid + "p2p"
-	// 注意：原函数 deriveKey 使用了 network，这里需要修改或统一
-	myKey := deriveKey("p2p-exchange", sessionUid)
+	myKey := deriveKey("p2p-exchange-v1.9", sessionUid)
 	infoBytes, _ := json.Marshal(myInfoForExchange)
 	encPayload, _ := encryptAES(myKey[:], infoBytes)
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
-	// **步骤 3: 通过 Broker 交换信息**
 	if verb {
 		fmt.Fprintf(os.Stderr, "    Exchanging address info ...")
 	}
@@ -657,17 +375,14 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 		fmt.Fprintf(os.Stderr, "OK (via %s)\n", brokerServers[srvIndex])
 	}
 
-	// **步骤 4: 解析对方的回复并计算共享密钥**
 	var remoteSecurePayload securePayload
 	if err = json.Unmarshal([]byte(remoteInfoRaw), &remoteSecurePayload); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal remote secure payload: %w", err)
 	}
-
 	plain, err := decryptAES(myKey[:], &remoteSecurePayload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt remote payload: %w", err)
 	}
-
 	var remotePayload exchangePayload
 	if err = json.Unmarshal(plain, &remotePayload); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal remote exchange payload: %w", err)
@@ -690,32 +405,64 @@ func Do_autoP2PEx(networks []string, sessionUid string, stunServers, brokerServe
 		sharedKey = sha256.Sum256(sharedX.Bytes())
 	}
 
-	// **步骤 5: 组合最终结果**
 	var finalResults []*P2PAddressInfo
-	// 遍历我们自己成功获取的地址
-	for net, myInfo := range myAddrResults {
-		if myInfo.err != nil {
-			continue // 跳过获取失败的网络类型
-		}
+	haveCommonNetwork := false
+
+	for net, myNetInfo := range myInfoForExchange.Addresses {
+		// 获取我们自己的地址组，支持多个地址
+		myNATType := myNetInfo["nattype"]
+		myLAN := myNetInfo["lan"]
+		myNAT := myNetInfo["nat"]
 
 		// 检查对方是否也返回了相同网络类型的信息
-		if remoteNetInfo, ok := remotePayload.Addresses[net]; ok {
-			finalResults = append(finalResults, &P2PAddressInfo{
-				Network:   net,
-				LocalLAN:  myInfo.localAddr,
-				LocalNAT:  myInfo.natAddr,
-				RemoteLAN: remoteNetInfo["lan"],
-				RemoteNAT: remoteNetInfo["nat"],
-				SharedKey: sharedKey, // 共享密钥对所有网络类型都是一样的
-			})
+		for rnet, remoteNetInfo := range remotePayload.Addresses {
+			if rnet != net {
+				continue
+			}
+			haveCommonNetwork = true
+			rNATType := remoteNetInfo["nattype"]
+			remoteLAN := remoteNetInfo["lan"]
+			remoteNAT := remoteNetInfo["nat"]
+
+			if myNATType == "symm" && rNATType == "symm" {
+				continue
+			}
+			if (myNATType != "easy" && myNATType != "hard" && myNATType != "symm") || (rNATType != "easy" && rNATType != "hard" && rNATType != "symm") {
+				continue
+			}
+
+			item := &P2PAddressInfo{
+				Network:       net,
+				LocalLAN:      myLAN,
+				LocalNAT:      myNAT,
+				LocalNATType:  myNATType,
+				RemoteLAN:     remoteLAN,
+				RemoteNAT:     remoteNAT,
+				RemoteNATType: rNATType,
+				SharedKey:     sharedKey,
+			}
+
+			if strings.HasPrefix(net, "tcp") {
+				sameNAT, similarLAN := CompareP2PAddresses(item)
+				if !sameNAT || !similarLAN {
+					if myNATType != "easy" && rNATType != "easy" {
+						continue
+					}
+				}
+			}
+
+			finalResults = append(finalResults, item)
+		}
+	}
+	if len(finalResults) == 0 {
+		if !haveCommonNetwork {
+			return nil, fmt.Errorf("no common usable network types with peer")
+		} else {
+			return nil, fmt.Errorf("no usable NAT types with peer")
 		}
 	}
 
-	if len(finalResults) == 0 {
-		return nil, fmt.Errorf("no common network types found with peer")
-	}
-
-	return finalResults, nil
+	return SortP2PAddressInfos(finalResults), nil
 }
 
 func Do_autoP2P(network string, sessionUid string, stunServers, brokerServers []string, timeout time.Duration, needSharedKey, verb bool) (*P2PAddressInfo, error) {
@@ -799,17 +546,6 @@ func CompareP2PAddresses(info *P2PAddressInfo) (sameNATIP bool, similarLAN bool)
 	return
 }
 
-func isSamePort(addr1, addr2 string) bool {
-	_, port1, err1 := net.SplitHostPort(addr1)
-	_, port2, err2 := net.SplitHostPort(addr2)
-
-	if err1 != nil || err2 != nil {
-		return false
-	}
-
-	return port1 == port2
-}
-
 func IsIPv6(addr string) bool {
 	ipStr, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -823,54 +559,41 @@ func SelectRole(p2pInfo *P2PAddressInfo) bool {
 	// if DebugServerRole != "" {
 	// 	return DebugServerRole == "C"
 	// }
-	return strings.Compare(CalculateMD5(p2pInfo.LocalLAN+p2pInfo.LocalNAT), CalculateMD5(p2pInfo.RemoteLAN+p2pInfo.RemoteNAT)) <= 0
-}
 
-func p2pCanDirect(p2pInfo *P2PAddressInfo, ensureEasy bool) bool {
+	//easy  -  easy		go Compare
+	//easy  -  hard		S - C
+	//easy  -  symm		S - C
 
-	if p2pInfo.LocalNAT == "" || p2pInfo.RemoteNAT == "" {
+	//hard  -  easy		C - S
+	//hard  -  hard		go Compare
+	//hard  -  symm		C - S
+
+	//symm  -  easy		C - S
+	//symm  -  hard		S - C
+
+	//return true meas C, false means S
+
+	if p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "hard" {
 		return false
-	}
-	if p2pInfo.LocalLAN == "" || p2pInfo.RemoteLAN == "" {
-		return false
-	}
-
-	sameNAT, similarLAN := CompareP2PAddresses(p2pInfo)
-	if sameNAT && similarLAN {
+	} else if p2pInfo.LocalNATType == "hard" && p2pInfo.RemoteNATType == "easy" {
 		return true
-	}
-
-	isLocalNatPortChanged := !isSamePort(p2pInfo.LocalLAN, p2pInfo.LocalNAT)
-	isRemoteNatPortChanged := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
-
-	if isLocalNatPortChanged && isRemoteNatPortChanged {
+	} else if p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "symm" {
 		return false
+	} else if p2pInfo.LocalNATType == "symm" && p2pInfo.RemoteNATType == "easy" {
+		return true
+	} else if p2pInfo.LocalNATType == "hard" && p2pInfo.RemoteNATType == "symm" {
+		return true
+	} else if p2pInfo.LocalNATType == "symm" && p2pInfo.RemoteNATType == "hard" {
+		return false
+	} else {
+		return strings.Compare(CalculateMD5(p2pInfo.LocalLAN+p2pInfo.LocalNAT), CalculateMD5(p2pInfo.RemoteLAN+p2pInfo.RemoteNAT)) <= 0
 	}
-
-	if ensureEasy {
-		if isLocalNatPortChanged || isRemoteNatPortChanged {
-			return false
-		}
-	}
-
-	return true
 }
 
 func p2pInfoPrint(p2pInfo *P2PAddressInfo) {
 	fmt.Fprintf(os.Stderr, "  - %-14s: %s\n", "Network", p2pInfo.Network)
-	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT)
-	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
-}
-
-// Helper function to convert the result slice from Do_autoP2PEx to a map for easy lookups.
-func p2pInfoMap(infos []*P2PAddressInfo) map[string]*P2PAddressInfo {
-	m := make(map[string]*P2PAddressInfo)
-	for _, info := range infos {
-		if info != nil {
-			m[info.Network] = info
-		}
-	}
-	return m
+	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT-%s)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT, p2pInfo.LocalNATType)
+	fmt.Fprintf(os.Stderr, "  - %-14s: %s (LAN) / %s (NAT-%s)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT, p2pInfo.RemoteNATType)
 }
 
 func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (net.Conn, bool, []byte, error) {
@@ -899,149 +622,33 @@ func Easy_P2P(network, sessionUid string, stunServers, brokerServers []string) (
 	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, stunServers, brokerServers, 25*time.Second, true, true)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
-		return nil, false, nil, fmt.Errorf("failed to get P2P address info: %w", err)
+		return nil, false, nil, fmt.Errorf("failed to exchange address info: %w", err)
 	}
-	// Convert the result slice to a map for O(1) lookups.
-	availableInfos := p2pInfoMap(p2pInfos)
-
-	// --- 3. Iterate through the ordered list and attempt connection ---
 	var p2pInfo *P2PAddressInfo
-	var ok, triedAtLeast bool
 
-	switch {
-	case strings.HasPrefix(network, "any"):
-		p2pInfo, ok = availableInfos["tcp6"]
-		if ok {
-			conn, isRoleClient, _, err_tcp6 := Auto_P2P_TCP_NAT_Traversal("tcp6", sessionUid, p2pInfo,
-				stunServers, brokerServers, false, 1)
-			if err_tcp6 == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-			}
-			triedAtLeast = true
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp6)
-			time.Sleep(1 * time.Second)
-		} else {
-			p2pInfo, ok = availableInfos["tcp4"]
-			if ok && p2pCanDirect(p2pInfo, true) {
-				conn, isRoleClient, _, err_tcp4 := Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid, p2pInfo,
-					stunServers, brokerServers, false, 1)
-				if err_tcp4 == nil {
-					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-				}
-				triedAtLeast = true
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp4)
-				time.Sleep(1 * time.Second)
-			}
-		}
-		p2pInfo, ok = availableInfos["udp4"]
-		if ok {
-			conn, isRoleClient, _, err_udp := Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid, p2pInfo,
-				stunServers, brokerServers, false, 2)
-			if err_udp == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-			}
-			triedAtLeast = true
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp)
-		}
-	case network == "tcp":
-		p2pInfo, ok = availableInfos["tcp6"]
-		if ok {
-			conn, isRoleClient, _, err_tcp6 := Auto_P2P_TCP_NAT_Traversal("tcp6", sessionUid, p2pInfo,
-				stunServers, brokerServers, false, 1)
-			if err_tcp6 == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-			}
-			triedAtLeast = true
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp6)
-			time.Sleep(1 * time.Second)
-		} else {
-			p2pInfo, ok = availableInfos["tcp4"]
-			if ok {
-				conn, isRoleClient, _, err_tcp4 := Auto_P2P_TCP_NAT_Traversal("tcp4", sessionUid, p2pInfo,
-					stunServers, brokerServers, false, 2)
-				if err_tcp4 == nil {
-					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-				}
-				triedAtLeast = true
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_tcp4)
-				time.Sleep(1 * time.Second)
-			}
-		}
-
-	case network == "udp":
-		p2pInfo, ok = availableInfos["udp6"]
-		if ok {
-			conn, isRoleClient, _, err_udp6 := Auto_P2P_UDP_NAT_Traversal("udp6", sessionUid, p2pInfo,
-				stunServers, brokerServers, false, 1)
-			if err_udp6 == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-			}
-			triedAtLeast = true
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp6)
-			time.Sleep(1 * time.Second)
-		} else {
-			p2pInfo, ok = availableInfos["udp4"]
-			if ok {
-				conn, isRoleClient, _, err_udp4 := Auto_P2P_UDP_NAT_Traversal("udp4", sessionUid, p2pInfo,
-					stunServers, brokerServers, false, 2)
-				if err_udp4 == nil {
-					return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-				}
-				triedAtLeast = true
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err_udp4)
-				time.Sleep(1 * time.Second)
-			}
-		}
-
-	case network == "tcp6" || network == "tcp4":
-		p2pInfo, ok = availableInfos[network]
-		if ok {
-			conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(network, sessionUid, p2pInfo,
-				stunServers, brokerServers, false, 2)
-			if attemptErr == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-			}
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
-			triedAtLeast = true
-		}
-	case network == "udp6" || network == "udp4":
-		p2pInfo, ok = availableInfos[network]
-		if ok {
-			conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(network, sessionUid, p2pInfo,
-				stunServers, brokerServers, false, 2)
-			if attemptErr == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-			}
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
-			triedAtLeast = true
-		}
-	default:
-		return nil, false, nil, fmt.Errorf("unsupported network type: '%s'", network)
+	for _, p2pInfo = range p2pInfos {
+		p2pInfoPrint(p2pInfo)
+		fmt.Fprintf(os.Stderr, "\n")
 	}
 
-	if !triedAtLeast {
-		for _, netType := range networksToTryStun {
-			p2pInfo, ok := availableInfos[netType]
-			if ok {
-				if strings.HasPrefix(netType, "tcp") {
-					conn, isRoleClient, _, attemptErr := Auto_P2P_TCP_NAT_Traversal(netType, sessionUid, p2pInfo,
-						stunServers, brokerServers, false, 2)
-					if attemptErr == nil {
-						return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-					}
-					fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
-				} else if strings.HasPrefix(netType, "udp") {
-					conn, isRoleClient, _, attemptErr := Auto_P2P_UDP_NAT_Traversal(netType, sessionUid, p2pInfo,
-						stunServers, brokerServers, false, 2)
-					if attemptErr == nil {
-						return conn, isRoleClient, p2pInfo.SharedKey[:], nil
-					}
-					fmt.Fprintf(os.Stderr, "ERROR: %v\n", attemptErr)
-				} else {
-					continue
-				}
+	for _, p2pInfo = range p2pInfos {
+		if strings.HasPrefix(p2pInfo.Network, "tcp") {
+			conn, isRoleClient, _, err2 := Auto_P2P_TCP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo,
+				stunServers, brokerServers, false, 1)
+			if err2 == nil {
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
+			err = err2
+		} else {
+			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo,
+				stunServers, brokerServers, false, 1)
+			if err2 == nil {
+				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
+			}
+			err = err2
 		}
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		time.Sleep(1 * time.Second)
 	}
 
 	return nil, false, nil, fmt.Errorf("direct P2P connection failed")
@@ -1077,7 +684,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	const (
 		RPP_TIMEOUT = 7
 	)
-	punchPayload := []byte(deriveKeyForPayload(sessionUid))
+	punchPayload := []byte(deriveKeyForPayload(sessionUid, true))
 	for round := 1; round <= maxRound; round++ {
 
 		fmt.Fprintf(os.Stderr, "=== Round %d: Trying P2P(%s) Connection ===\n", round, network)
@@ -1110,26 +717,23 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		inSameLAN := false
 		if sameNAT && similarLAN {
 			remoteAddr = p2pInfo.RemoteLAN // 同内网
-			routeReason = "same NAT & similar LAN"
+			routeReason = "same LAN"
 			inSameLAN = true
 		}
 
-		localMaybeNAT4 := !isSamePort(p2pInfo.LocalLAN, p2pInfo.LocalNAT)
-		remoteMaybeNAT4 := !isSamePort(p2pInfo.RemoteLAN, p2pInfo.RemoteNAT)
-
 		randomSrcPort := false
+		randomDstPort := false
 		ttl := 64
-		randDstPorts := []int{}
 		if !inSameLAN {
-			if !localMaybeNAT4 && remoteMaybeNAT4 {
-				//C->S
-				randDstPorts = generateRandomPorts(PunchingRandomPortCount)
-			} else if localMaybeNAT4 && !remoteMaybeNAT4 {
-				//S->C
+			if p2pInfo.LocalNATType == "easy" || p2pInfo.RemoteNATType != "easy" {
+				randomDstPort = true
+			} else if p2pInfo.LocalNATType != "easy" && p2pInfo.RemoteNATType == "easy" {
 				randomSrcPort = true
-			} else if localMaybeNAT4 && remoteMaybeNAT4 {
+			} else if p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy" {
+				//
+			} else {
 				if isClient {
-					randDstPorts = generateRandomPorts(PunchingRandomPortCount)
+					randomDstPort = true
 				} else {
 					randomSrcPort = true
 				}
@@ -1139,7 +743,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			//只有先发包的，适合用小ttl值。
 			ttl = PunchingShortTTL
 		}
-		if !inSameLAN && (localMaybeNAT4 || remoteMaybeNAT4) {
+		if !inSameLAN && (p2pInfo.LocalNATType != "easy" || p2pInfo.RemoteNATType != "easy") {
 			count = 4 + RPP_TIMEOUT*2
 		} else {
 			count = 8
@@ -1229,7 +833,8 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				case <-ctxRound.Done():
 					return false
 				default:
-					if len(randDstPorts) > 0 {
+					if randomDstPort {
+						randDstPorts := generateRandomPorts(PunchingRandomPortCount)
 						fmt.Fprintf(os.Stderr, "  ↑ Sending random dst ports hole-punching packets. TTL=%d; total=%d; ...", ttl, PunchingRandomPortCount)
 						for i := 0; i < PunchingRandomPortCount; i++ {
 							addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(randDstPorts[i]))
@@ -1369,7 +974,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 					} else {
 						if randomSrcPort {
 							sendRSPPing(RPP_TIMEOUT * time.Second)
-						} else if len(randDstPorts) > 0 {
+						} else if randomDstPort {
 							sendRDPPing()
 							//大批量发的话，多等等，等回复，如果有回复立刻终止，否则持续大量，即使这批打洞成功，却被下批打爆NAT的映射表
 							time.Sleep(RPP_TIMEOUT / 2 * time.Second)
@@ -1415,14 +1020,17 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, stunServers, brokerServers []string, needSharedKey bool, maxRound int) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
-	var err, errConn error
-	for round := 1; round <= maxRound; round++ {
+	var err error
+	const (
+		MaxWorkers = 800 // 控制并发量，避免过多文件描述符
+	)
 
+	for round := 1; round <= maxRound; round++ {
 		fmt.Fprintf(os.Stderr, "=== Round %d: Trying P2P(%s) Connection ===\n", round, network)
 
-		// 1. 交换 NAT 信息
+		// 1. Exchange NAT info
 		if round == 1 && p2pInfo != nil {
-			//使用外面传进来的p2pInfo
+			// Use provided p2pInfo
 		} else {
 			p2pInfo, err = Do_autoP2P(network, sessionUid, stunServers, brokerServers, 25*time.Second, needSharedKey, true)
 			if err != nil {
@@ -1433,117 +1041,301 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		if needSharedKey {
 			sharedKey = p2pInfo.SharedKey[:]
 		}
+
 		if round == 1 {
-			//第一轮确定当前彼此角色
 			isClient = SelectRole(p2pInfo)
 		} else {
 			isClient = !isClient
 		}
 
-		// 选择最佳目标地址（内网优先）
+		// Choose best target address (prioritize LAN)
 		sameNAT, similarLAN := CompareP2PAddresses(p2pInfo)
-		remoteAddr := p2pInfo.RemoteNAT // 默认公网
+		remoteAddr := p2pInfo.RemoteNAT
 		routeReason := "different network"
+		inSameLAN := false
 		if sameNAT && similarLAN {
-			remoteAddr = p2pInfo.RemoteLAN // 同内网
-			routeReason = "same NAT & similar LAN"
+			remoteAddr = p2pInfo.RemoteLAN // same LAN
+			routeReason = "same LAN"
+			inSameLAN = true
 		}
 
-		// 打印详细连接信息
-		p2pInfoPrint(p2pInfo)
-		fmt.Fprintf(os.Stderr, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
+		randomSrcPort := false
+		randomDstPort := false
+		if !inSameLAN {
+			if p2pInfo.LocalNATType == "easy" || p2pInfo.RemoteNATType != "easy" {
+				randomDstPort = true
+			} else if p2pInfo.LocalNATType != "easy" && p2pInfo.RemoteNATType == "easy" {
+				randomSrcPort = true
+			} else if p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy" {
+				//
+			} else {
+				if isClient {
+					randomDstPort = true
+				} else {
+					randomSrcPort = true
+				}
+			}
+		}
 
-		// 解析本地地址
+		// Resolve addresses
 		localAddr, err := net.ResolveTCPAddr(network, p2pInfo.LocalLAN)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
 		}
+		localNatAddr, err := net.ResolveTCPAddr(network, p2pInfo.LocalNAT)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
+		}
 
+		remoteLANAddr, err := net.ResolveTCPAddr(network, p2pInfo.RemoteLAN)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("failed to resolve remote address: %v", err)
+		}
+		remoteIP, remotePortStr, err := net.SplitHostPort(remoteAddr)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("invalid remote address: %v", err)
+		}
+
+		remotePortInt, err := strconv.Atoi(remotePortStr)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("invalid remote port: %v", err)
+		}
+
+		if !inSameLAN {
+			//easy 模式的tcp，换个内网端口在NAT上也应该会保持一样，因为之前这个端口连接过stun服务器，可能不久后会被STUN关闭（FIN或RST）都可能影响这个洞的其他会话。
+			if p2pInfo.LocalNATType == "easy" {
+				localAddr.Port = incPort(localAddr.Port, 100)
+				p2pInfo.LocalLAN = localAddr.String()
+
+				localNatAddr.Port = incPort(localNatAddr.Port, 100)
+				p2pInfo.LocalNAT = localNatAddr.String()
+			}
+
+			if p2pInfo.RemoteNATType == "easy" {
+				remoteLANAddr.Port = incPort(remoteLANAddr.Port, 100)
+				p2pInfo.RemoteLAN = remoteLANAddr.String()
+				remotePortInt = incPort(remotePortInt, 100)
+				remoteAddr = net.JoinHostPort(remoteIP, strconv.Itoa(remotePortInt))
+				p2pInfo.RemoteNAT = remoteAddr
+			}
+		}
+		// Print connection info
+		p2pInfoPrint(p2pInfo)
+		fmt.Fprintf(os.Stderr, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 		if isClient {
 			fmt.Fprintf(os.Stderr, "  - %-14s: connect start immediately\n", "Active Mode")
 		} else {
 			fmt.Fprintf(os.Stderr, "  - %-14s: connect start after 2s\n", "Passive Mode")
 		}
 
-		// 创建拨号器
-		dialer := &net.Dialer{
-			LocalAddr: localAddr,
-			Control:   ControlTCP,
-			Timeout:   6 * time.Second,
-		}
-
-		var listener net.Listener
-
-		lc := net.ListenConfig{
-			Control: ControlTCP,
-		}
-
-		var acceptedConn net.Conn
-		acceptChan := make(chan bool)
+		timeoutMax := 25
+		timeoutPerconn := 6
+		// Setup context and channels
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		listener, err = lc.Listen(ctx, network, localAddr.String())
-		if err == nil {
-			defer listener.Close()
-			go func() {
-				deadline := time.Now().Add(12 * time.Second)
-				listener.(*net.TCPListener).SetDeadline(deadline)
-				acceptedConn, _ = listener.Accept()
-				cancel()
-				acceptChan <- true
-			}()
+		type ConnWithTag struct {
+			Conn net.Conn
+			Tag  string
 		}
+		connChan := make(chan ConnWithTag, 1)
+		errChan := make(chan error, 1)
+		punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
 
+		// Start listener
+		lc := net.ListenConfig{Control: ControlTCP}
+		listener, err := lc.Listen(ctx, network, localAddr.String())
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("failed to listen: %v", err)
+		}
+		defer listener.Close()
+
+		// Start accepting connections in goroutine
+		go func() {
+			deadline := time.Now().Add(time.Duration(timeoutMax) * time.Second)
+			listener.(*net.TCPListener).SetDeadline(deadline)
+			conn, err := listener.Accept()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if !isClient {
+				buf := make([]byte, len(punchAckPayload))
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				n, readErr := conn.Read(buf)
+				if readErr != nil {
+					conn.Close()
+					errChan <- fmt.Errorf("failed to read punchAckPayload: %v", readErr)
+					return
+				}
+				if !bytes.Equal(buf[:n], punchAckPayload) {
+					conn.Close()
+					errChan <- fmt.Errorf("invalid punchAckPayload")
+					return
+				}
+				conn.SetReadDeadline(time.Time{})
+			}
+
+			// Verify the connection is from expected peer
+			clientIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+			if err == nil && (clientIP == remoteIP || (sameNAT && similarLAN && IsSameLAN(clientIP, remoteIP))) {
+				select {
+				case connChan <- ConnWithTag{Conn: conn, Tag: "accept"}:
+				default:
+					conn.Close()
+				}
+			} else {
+				conn.Close()
+				if err == nil {
+					err = fmt.Errorf("unexpected peer connection from %s", clientIP)
+				}
+				errChan <- err
+			}
+		}()
+
+		// Delay for passive side
 		if !isClient {
-			// NAT打洞时，服务端延迟发包
 			time.Sleep(2 * time.Second)
 		}
+		// Start concurrent dialing
+		go func() {
+			defer cancel()
 
-		// 尝试主动连接
-		maxAttempts := 2 // 最多尝试 2 次
-		for attempt := 0; attempt < maxAttempts; attempt++ {
-			conn, err := dialer.DialContext(ctx, network, remoteAddr)
-			if err == nil {
-				if listener != nil {
-					listener.Close()
-					<-acceptChan
-					if acceptedConn != nil {
-						acceptedConn.Close()
+			// Setup worker pool for concurrent dialing
+			var wg sync.WaitGroup
+			workerChan := make(chan struct{}, MaxWorkers) // Semaphore for limiting concurrency
+			var once sync.Once
+
+			// Function to try a single connection
+			tryConnect := func(targetAddr string, localAddr *net.TCPAddr, timeout_sec int, isClient bool, tag string) bool {
+				defer wg.Done()
+				<-workerChan // Release worker slot when done
+
+				select {
+				case <-ctx.Done():
+					return false
+				default:
+					dialer := &net.Dialer{
+						Timeout: time.Duration(timeout_sec) * time.Second,
+					}
+					if localAddr != nil {
+						dialer.Control = ControlTCP
+						dialer.LocalAddr = localAddr
+					}
+
+					conn, err := dialer.DialContext(ctx, network, targetAddr)
+					if err == nil {
+						if isClient {
+							var success bool
+							// 使用 sync.Once 确保只有一个连接可以发送 punchAckPayload
+							once.Do(func() {
+								_, writeErr := conn.Write(punchAckPayload)
+								if writeErr == nil {
+									success = true
+								}
+							})
+							if !success {
+								conn.Close()
+								return false
+							}
+						} else {
+							// 非 client 的连接需要等待一个 punchAckPayload 的回复，并确认使用这个 conn，其他的关闭
+							buf := make([]byte, len(punchAckPayload))
+							conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+							n, readErr := conn.Read(buf)
+							if readErr != nil || !bytes.Equal(buf[:n], punchAckPayload) {
+								conn.Close()
+								return false
+							}
+							conn.SetReadDeadline(time.Time{})
+						}
+
+						select {
+						case connChan <- ConnWithTag{Conn: conn, Tag: tag}:
+							cancel() // Cancel other attempts
+							return true
+						default:
+							conn.Close()
+						}
 					}
 				}
-				fmt.Fprintf(os.Stderr, "P2P(TCP) connection established (dial)!\n")
-				return conn, isClient, sharedKey, nil
+				return false
 			}
-			errConn = err
-			if attempt+1 < maxAttempts {
-				time.Sleep(1 * time.Second)
-			}
-		}
 
-		if listener != nil {
-			listener.Close()
-			<-acceptChan
-			if acceptedConn != nil {
-				// 检查是否是对端连接（仅比较 IP，忽略端口）
-				clientIP, _, err2 := net.SplitHostPort(acceptedConn.RemoteAddr().String())
-				if err2 == nil {
-					expectedIP, _, _ := net.SplitHostPort(remoteAddr)
-					if (clientIP == expectedIP) ||
-						(sameNAT && similarLAN && IsSameLAN(clientIP, expectedIP)) {
-						fmt.Fprintf(os.Stderr, "P2P(TCP) connection established (accept)!\n")
-						return acceptedConn, isClient, sharedKey, nil
-					} else {
-						err2 = fmt.Errorf("unexpected peer connection address")
+			//相同子网的，以及没有对称型的，就尝试一下直接连接
+			if inSameLAN || !(p2pInfo.LocalNATType == "symm" || p2pInfo.RemoteNATType == "symm") {
+				// First try direct connection
+				workerChan <- struct{}{}
+				wg.Add(1)
+				if tryConnect(remoteAddr, localAddr, timeoutPerconn, isClient, "dial") {
+					return
+				}
+			}
+
+			for i := 0; i < 3 && !(p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy"); i++ {
+				select {
+				case <-ctx.Done():
+					return
+				case connInfo := <-connChan:
+					// 有连接成功，直接转发回主流程
+					connChan <- connInfo
+					return
+				default:
+				}
+
+				// Try random destination ports if needed
+				if randomDstPort {
+					randDstPorts := generateRandomPorts(PunchingRandomPortCount)
+					fmt.Fprintf(os.Stderr, "  ↑ Trying %d Random Destination Ports concurrently...\n", len(randDstPorts))
+					for _, port := range randDstPorts {
+						select {
+						case <-ctx.Done():
+							return
+						case workerChan <- struct{}{}: // Acquire worker slot
+							wg.Add(1)
+							targetAddr := net.JoinHostPort(remoteIP, strconv.Itoa(port))
+							go tryConnect(targetAddr, localAddr, timeoutPerconn, isClient, "RDP")
+						}
 					}
 				}
-				errConn = err2
+
+				// Try random source ports if needed
+				if randomSrcPort {
+					fmt.Fprintf(os.Stderr, "  ↑ Trying %d Random Source Ports concurrently...\n", PunchingRandomPortCount)
+					for i := 0; i < PunchingRandomPortCount; i++ {
+						select {
+						case <-ctx.Done():
+							return
+						case workerChan <- struct{}{}: // Acquire worker slot
+							wg.Add(1)
+							go tryConnect(remoteAddr, nil, timeoutPerconn, isClient, "RSP")
+						}
+					}
+				}
+
+				// Wait for all workers to complete
+				wg.Wait()
 			}
+
+			errChan <- fmt.Errorf("all connection attempts failed")
+		}()
+
+		// Wait for results
+		select {
+		case connInfo := <-connChan:
+			conn := connInfo.Conn    // 获取实际的连接对象
+			connType := connInfo.Tag // 获取连接类型描述
+			fmt.Fprintf(os.Stderr, "P2P(TCP) connection established (%s)!\n", connType)
+			return conn, isClient, sharedKey, nil
+		case err := <-errChan:
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		case <-time.After(time.Duration(timeoutMax) * time.Second):
+			fmt.Fprintf(os.Stderr, "Round %d timeout\n", round)
 		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", errConn)
-		cancel()
+
+		fmt.Fprintf(os.Stderr, "\n")
 	}
 
-	return nil, false, nil, fmt.Errorf("P2P TCP Simultaneous Open failed after %d rounds", maxRound)
+	return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed after %d rounds", maxRound)
 }
 
 func logStderr(msg string, args ...interface{}) {
@@ -1724,4 +1516,91 @@ func MqttPush(msg, sessionUid string, brokerServers []string, verb bool) error {
 		fmt.Fprintf(os.Stderr, "MQTT: Push operation completed. Successes: %d\n", successes)
 	}
 	return nil
+}
+
+// getNetworkPriority assigns a numerical priority to network types. Higher value means higher priority.
+func getNetworkPriority(network string) int {
+	switch network {
+	case "tcp6":
+		return 4
+	case "tcp4":
+		return 3
+	case "udp6":
+		return 2
+	case "udp4":
+		return 1
+	default:
+		return 0 // Unknown network types have lowest priority
+	}
+}
+
+// getNATTypePriority assigns a numerical priority to NAT types. Higher value means higher priority.
+func getNATTypePriority(natType string) int {
+	switch natType {
+	case "easy":
+		return 3
+	case "hard":
+		return 2
+	case "symm":
+		return 1
+	default:
+		return 0 // Unknown NAT types have lowest priority
+	}
+}
+
+// SortP2PAddressInfos takes a slice of *P2PAddressInfo pointers, sorts it based on the specified
+// priority, and returns the sorted slice. The original slice is not modified.
+func SortP2PAddressInfos(addrs []*P2PAddressInfo) []*P2PAddressInfo {
+	// 创建一个副本进行排序，以避免修改原始切片（如果它被其他地方引用）。
+	// 如果你希望原地修改原始切片，可以跳过这一步，直接对 'addrs' 进行排序。
+	sortedAddrs := make([]*P2PAddressInfo, len(addrs))
+	copy(sortedAddrs, addrs)
+
+	// 使用 sort.Slice 对指针切片进行排序
+	sort.Slice(sortedAddrs, func(i, j int) bool {
+		a := sortedAddrs[i] // 'a' 是 *P2PAddressInfo
+		b := sortedAddrs[j] // 'b' 是 *P2PAddressInfo
+
+		// 优雅地处理潜在的 nil 指针：nil 指针优先级最低
+		if a == nil {
+			return false // b (非nil) 在 a (nil) 之前
+		}
+		if b == nil {
+			return true // a (非nil) 在 b (nil) 之前
+		}
+
+		// 1. 主要排序：按网络类型优先级
+		netPriorityA := getNetworkPriority(a.Network)
+		netPriorityB := getNetworkPriority(b.Network)
+
+		if netPriorityA != netPriorityB {
+			return netPriorityA > netPriorityB // 优先级高的在前
+		}
+
+		// 2. 次要排序：按 NAT 类型（如果网络类型相同）
+		// 结合本地和远程 NAT 类型的优先级分数
+		localNATPriorityA := getNATTypePriority(a.LocalNATType)
+		remoteNATPriorityA := getNATTypePriority(a.RemoteNATType)
+		combinedNATPriorityA := localNATPriorityA + remoteNATPriorityA
+
+		localNATPriorityB := getNATTypePriority(b.LocalNATType)
+		remoteNATPriorityB := getNATTypePriority(b.RemoteNATType)
+		combinedNATPriorityB := localNATPriorityB + remoteNATPriorityB
+
+		if combinedNATPriorityA != combinedNATPriorityB {
+			return combinedNATPriorityA > combinedNATPriorityB // 组合分数高的在前
+		}
+
+		// 如果所有优先级都相同，则保持稳定排序（sort.Slice 会自动处理）
+		return false
+	})
+
+	return sortedAddrs
+}
+
+func incPort(port, add int) int {
+	if port+add > 65535 {
+		return 1024 + (port+add)%65535
+	}
+	return port + add
 }
