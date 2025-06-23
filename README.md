@@ -39,7 +39,7 @@ golang版 netcat, 更方便的建立点对点通信。
 
 - 支持使用socks5代理
 
-    `gonc.exe -s5 s.s.s.s:port x.x.x.x 1234`
+    `gonc.exe -x s.s.s.s:port x.x.x.x 1234`
 
 - 反弹shell，类UNIX支持pseudo-terminal shell 
 
@@ -60,9 +60,9 @@ golang版 netcat, 更方便的建立点对点通信。
     `gonc -tls -pty -p2p-tcp randomString`
 
 
-- 还可以像socat那样建立左右两个通道转发数据
+- 还可以像socat那样建立左右两个通道转发数据(-exec参数值中的第一个.代表gonc自身路径)
 
-    `gonc.exe -keep-open -exec "./gonc -tls www.baidu.com 443" -l 8000`
+    `gonc.exe -keep-open -exec ". -tls www.baidu.com 443" -l 8000`
     
     另一端用
 
@@ -70,7 +70,7 @@ golang版 netcat, 更方便的建立点对点通信。
 
 - 发送和统计传输速度，内置/dev/zero和/dev/urandom实现，这样windows下也可以用/dev/zero和/dev/urandom
 
-    `gonc.exe -send /dev/zero -progress x.x.x.x 1234`
+    `gonc.exe -send /dev/zero -P x.x.x.x 1234`
 
     `IN: 76.8 MiB (80543744 bytes), 3.3 MiB/s | OUT: 0.0 B (0 bytes), 0.0 B/s | 00:00:23`
 
