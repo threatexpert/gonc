@@ -22,8 +22,8 @@ import (
 	"time"
 	"unicode"
 
+	"gonc/easyp2p"
 	"gonc/misc"
-	"gonc/pty"
 
 	// "net/http"
 	// _ "net/http/pprof"
@@ -73,13 +73,11 @@ var (
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
 	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
-	STUNServers       []string
 	peer              = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
 	appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
 	keepAlive         = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
 	punchData         = flag.String("punchdata", "ping\n", "UDP punch payload")
 	MQTTServers       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
-	MQTTBrokerServers []string
 	autoP2P           = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
 	autoP2PKCP        = flag.String("p2p-kcp", "", "P2P session key, kcp over udp, will be retried up to 3 times upon failure.")
 	autoP2PTCP        = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
@@ -99,10 +97,10 @@ func init() {
 	flag.StringVar(runCmd, "e", "", "alias for -exec")
 	flag.BoolVar(progressEnabled, "P", false, "alias for -progress")
 	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
-	flag.StringVar(&misc.TopicExchange, "mqtt-nat-topic", misc.TopicExchange, "")
-	flag.StringVar(&misc.TopicExchangeWait, "mqtt-wait-topic", misc.TopicExchangeWait, "")
-	flag.IntVar(&misc.PunchingShortTTL, "punch-short-ttl", misc.PunchingShortTTL, "")
-	flag.IntVar(&misc.PunchingRandomPortCount, "punch-random-count", misc.PunchingRandomPortCount, "")
+	flag.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
+	flag.StringVar(&easyp2p.TopicExchangeWait, "mqtt-wait-topic", easyp2p.TopicExchangeWait, "")
+	flag.IntVar(&easyp2p.PunchingShortTTL, "punch-short-ttl", easyp2p.PunchingShortTTL, "")
+	flag.IntVar(&easyp2p.PunchingRandomPortCount, "punch-random-count", easyp2p.PunchingRandomPortCount, "")
 	flag.BoolVar(appMuxListenMode, "socks5local", false, "")
 	flag.StringVar(appMuxListenOn, "socks5local-port", "", "")
 	flag.BoolVar(appMuxListenMode, "download", false, "alias for -httplocal")
@@ -251,7 +249,7 @@ func do_DTLS(conn net.Conn) net.Conn {
 	var err error
 	timeout_sec := 20
 
-	pktconn := misc.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
 
 	intervalChange := make(chan time.Duration, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
@@ -316,7 +314,7 @@ func do_DTLS(conn net.Conn) net.Conn {
 	firstRefusedLogged := false
 	for {
 		if err = dtlsConn.HandshakeContext(ctx); err != nil {
-			if misc.IsConnRefused(err) {
+			if easyp2p.IsConnRefused(err) {
 				if !firstRefusedLogged {
 					fmt.Fprintf(os.Stderr, "(ECONNREFUSED)...")
 					firstRefusedLogged = true
@@ -434,7 +432,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.0")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -450,8 +448,8 @@ func main() {
 		return
 	}
 
-	MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
-	STUNServers = parseMultiItems(*stunSrv, true)
+	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
+	easyp2p.STUNServers = parseMultiItems(*stunSrv, true)
 
 	if *sendfile != "" && *runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-send and -exec cannot be used together\n")
@@ -673,7 +671,7 @@ func main() {
 			}
 
 			for {
-				conn, err = do_P2P(network, P2PSessionKey, STUNServers)
+				conn, err = do_P2P(network, P2PSessionKey)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 					time.Sleep(10 * time.Second)
@@ -687,7 +685,7 @@ func main() {
 				time.Sleep(2 * time.Second)
 			}
 		} else {
-			conn, err = do_P2P(network, P2PSessionKey, STUNServers)
+			conn, err = do_P2P(network, P2PSessionKey)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 				os.Exit(1)
@@ -700,6 +698,12 @@ func main() {
 
 	if *listenMode {
 		// 监听模式
+		if port == "0" {
+			portInt, err := easyp2p.GetFreePort()
+			if err == nil {
+				port = strconv.Itoa(portInt)
+			}
+		}
 		listenAddr := net.JoinHostPort(host, port)
 		if *useUNIXdomain {
 			listenAddr = port
@@ -746,7 +750,7 @@ func main() {
 				for {
 					fmt.Fprintf(os.Stderr, "Waiting for initial UDP packet to establish session...\n")
 					uconn.SetReadDeadline(time.Time{})
-					buconn := misc.NewBoundUDPConn(uconn, "", true)
+					buconn := easyp2p.NewBoundUDPConn(uconn, "", true)
 					if err = buconn.WaitAndLockRemote(); err != nil {
 						fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 						os.Exit(1)
@@ -758,7 +762,7 @@ func main() {
 				}
 			} else {
 				if *peer != "" {
-					err = misc.SetUDPTTL(uconn, misc.PunchingShortTTL)
+					err = easyp2p.SetUDPTTL(uconn, easyp2p.PunchingShortTTL)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Failed to set udp TTL: %v\n", err)
 					}
@@ -777,12 +781,12 @@ func main() {
 						}
 					}
 				}
-				buconn := misc.NewBoundUDPConn(uconn, "", false)
+				buconn := easyp2p.NewBoundUDPConn(uconn, "", false)
 				if err = buconn.WaitAndLockRemote(); err != nil {
 					fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 					os.Exit(1)
 				}
-				misc.SetUDPTTL(uconn, 64)
+				easyp2p.SetUDPTTL(uconn, 64)
 				fmt.Fprintf(os.Stderr, "Received first UDP packet from %s\n", buconn.RemoteAddr().String())
 				conn = buconn
 			}
@@ -791,8 +795,14 @@ func main() {
 			var listener net.Listener
 			var stopSynTrigger bool = false
 			lc := net.ListenConfig{}
+			if *useSTUN {
+				err = ShowPublicIP(network, listenAddr)
+				if err != nil {
+					panic(err)
+				}
+			}
 			if *peer != "" || *useSTUN {
-				lc.Control = misc.ControlTCP
+				lc.Control = easyp2p.ControlTCP
 			}
 			listener, err = lc.Listen(context.Background(), network, listenAddr)
 			if err != nil {
@@ -800,12 +810,6 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
-			if *useSTUN {
-				err = ShowPublicIP(network, listener.Addr().String())
-				if err != nil {
-					panic(err)
-				}
-			}
 
 			if *peer != "" {
 				// 发起 outbound TCP SYN，触发 NAT 映射
@@ -816,7 +820,7 @@ func main() {
 						d := net.Dialer{
 							LocalAddr: laddr,
 							Timeout:   20 * time.Millisecond,
-							Control:   misc.ControlTCPTTL, //小ttl，通常到不了对端
+							Control:   easyp2p.ControlTCPTTL, //小ttl，通常到不了对端
 						}
 
 						peerIP, startPort, endPort := parsePeerAddressRange(*peer)
@@ -933,9 +937,9 @@ func main() {
 				}
 				switch {
 				case strings.HasPrefix(network, "tcp"):
-					dialer.Control = misc.ControlTCP
+					dialer.Control = easyp2p.ControlTCP
 				case strings.HasPrefix(network, "udp"):
-					dialer.Control = misc.ControlUDP
+					dialer.Control = easyp2p.ControlUDP
 				}
 				conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
 			}
@@ -946,9 +950,17 @@ func main() {
 		}
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			configUDPConn(conn)
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
+			if *proxyAddr == "" {
+				fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", net.JoinHostPort(host, port))
+			} else {
+				fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s\n", *proxyAddr, net.JoinHostPort(host, port))
+			}
 		} else {
-			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+			if *proxyAddr == "" {
+				fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+			} else {
+				fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), net.JoinHostPort(host, port))
+			}
 		}
 	}
 
@@ -1206,7 +1218,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			cmd = exec.Command(args[0], args[1:]...)
 
 			if *enablePty {
-				ptmx, err := pty.Start(cmd)
+				ptmx, err := misc.PtyStart(cmd)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Failed to start pty: %v", err)
 					return
@@ -1412,7 +1424,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 	// 启动 keepalive
 	startUDPKeepAlive(ctx, conn, []byte(*punchData), 2*time.Second, intervalChange)
 
-	pktconn := misc.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
 	if *listenMode || *kcpSEnabled {
 		if blockCrypt == nil {
 			fmt.Fprintf(os.Stderr, "Performing KCP-S handshake...")
@@ -1433,7 +1445,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 			for {
 				s, e := listener.AcceptKCP()
 				if e != nil {
-					if misc.IsConnRefused(e) {
+					if easyp2p.IsConnRefused(e) {
 						continue
 					}
 					errChan <- e
@@ -1527,9 +1539,9 @@ func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInte
 }
 
 func ShowPublicIP(network, bind string) error {
-	index, _, nata, err := misc.GetPublicIP(network, bind, STUNServers, 7*time.Second)
+	index, _, nata, err := easyp2p.GetPublicIP(network, bind, 7*time.Second)
 	if err == nil {
-		fmt.Fprintf(os.Stderr, "Public Address: %s (via %s)\n", nata, STUNServers[index])
+		fmt.Fprintf(os.Stderr, "Public Address: %s (via %s)\n", nata, easyp2p.STUNServers[index])
 	}
 
 	return err
@@ -1540,7 +1552,7 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	var err error
 
 	if *MQTTWait != "" {
-		msg, err = misc.MqttWait(sessionKey, MQTTBrokerServers, 10*time.Minute)
+		msg, err = easyp2p.MqttWait(sessionKey, 10*time.Minute, os.Stderr)
 		if err != nil {
 			return fmt.Errorf("mqtt-wait: %v", err)
 		}
@@ -1550,7 +1562,7 @@ func Mqtt_ensure_ready(sessionKey string) error {
 	}
 
 	if *MQTTPush != "" {
-		err = misc.MqttPush(*MQTTPush, sessionKey, MQTTBrokerServers, true)
+		err = easyp2p.MqttPush(*MQTTPush, sessionKey, os.Stderr)
 		if err != nil {
 			return fmt.Errorf("mqtt-push: %v", err)
 		}
@@ -1571,7 +1583,7 @@ func Mqtt_ensure_ready(sessionKey string) error {
 			for {
 				select {
 				case <-ticker.C:
-					err := misc.MqttPush(*MQTTPush, sessionKey, MQTTBrokerServers, false)
+					err := easyp2p.MqttPush(*MQTTPush, sessionKey, io.Discard)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "mqtt-push periodic error: %v\n", err)
 					}
@@ -1598,7 +1610,7 @@ func Mqtt_stop_pushing() {
 	}
 }
 
-func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) {
+func do_P2P(network, sessionKey string) (net.Conn, error) {
 	var err error
 	var conn net.Conn
 	var isRoleClient bool
@@ -1608,7 +1620,7 @@ func do_P2P(network, sessionKey string, stunServers []string) (net.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	conn, isRoleClient, sessionSharedKey, err = misc.Easy_P2P(network, sessionKey, stunServers, MQTTBrokerServers)
+	conn, isRoleClient, sessionSharedKey, err = easyp2p.Easy_P2P(network, sessionKey, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

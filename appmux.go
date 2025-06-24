@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"gonc/misc"
+	"gonc/easyp2p"
 	"io"
 	"log"
 	"net"
@@ -204,7 +204,7 @@ func mux_main() {
 			}
 			d := &net.Dialer{
 				LocalAddr: localAddr,
-				Control:   misc.ControlTCP,
+				Control:   easyp2p.ControlTCP,
 			}
 			sessionConn, err = d.Dial("tcp", *muxSessionAddress)
 		} else {

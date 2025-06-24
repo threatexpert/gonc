@@ -1304,10 +1304,8 @@ func (c *Socks5Client) Dial(network, address string) (net.Conn, error) {
 			if tcpRemoteAddr, ok := serverTCPConn.RemoteAddr().(*net.TCPAddr); ok {
 				actualSocks5ServerUDPAddr = tcpRemoteAddr.IP
 				actualSocks5ServerUDPPort = bindAddr.Port // 端口用响应中的端口
-				log.Printf("SOCKS5 server returned unspecified UDP address. Using TCP remote IP: %s:%d for association.", actualSocks5ServerUDPAddr, actualSocks5ServerUDPPort)
 			} else {
 				// 理论上不会发生，但以防万一
-				log.Printf("Warning: Could not get TCP remote address. Using bindAddr as is for UDP association.")
 				actualSocks5ServerUDPAddr = bindAddr.IP
 				actualSocks5ServerUDPPort = bindAddr.Port
 			}
@@ -1315,7 +1313,6 @@ func (c *Socks5Client) Dial(network, address string) (net.Conn, error) {
 			// 服务器返回了具体的 IP 地址，直接使用
 			actualSocks5ServerUDPAddr = bindAddr.IP
 			actualSocks5ServerUDPPort = bindAddr.Port
-			log.Printf("SOCKS5 server bound UDP to %s:%d for association.", actualSocks5ServerUDPAddr, actualSocks5ServerUDPPort)
 		}
 
 		// 4. 客户端本地 dialUDP 到 SOCKS5 服务器的 UDP 绑定地址
@@ -1337,15 +1334,12 @@ func (c *Socks5Client) Dial(network, address string) (net.Conn, error) {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("Recovered from panic in TCP control connection listener: %v", r)
 				}
 			}()
 			// io.Copy 阻塞直到 TCP 连接关闭或出错
 			_, err := io.Copy(io.Discard, serverTCPConn)
 			if err != nil && err != io.EOF {
-				log.Printf("SOCKS5 UDP ASSOCIATE control TCP connection error: %v", err)
 			}
-			log.Printf("SOCKS5 UDP ASSOCIATE control TCP connection closed. Initiating UDPWrapper Close.")
 			wrapper.Close() // 当 TCP 控制连接关闭时，关闭整个 UDP 客户端关联
 		}()
 

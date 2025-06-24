@@ -1,4 +1,4 @@
-package misc
+package easyp2p
 
 import (
 	"fmt"
@@ -21,9 +21,9 @@ func TestUDP1toN(t *testing.T) {
 	}
 	log.Printf("Shared UDPConn listening on %s", sharedUDPConn.LocalAddr().String())
 
-	logToStdout := NewCustomLogger(os.Stdout, LogLevelDebug)
+	logToStderr := log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
 	// 2. 使用这个共享的 UDPConn 初始化你的 UDPCustomDialer
-	dialer, err := NewUDPCustomDialer(sharedUDPConn, 1500, logToStdout)
+	dialer, err := NewUDPCustomDialer(sharedUDPConn, 1500, logToStderr)
 	if err != nil {
 		log.Fatalf("Failed to create custom dialer: %v", err)
 	}

@@ -1,9 +1,10 @@
-package misc
+package easyp2p
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -16,10 +17,18 @@ var (
 	lastStunClient     *stun.Client
 	lastStunClientConn net.Conn
 	lastStunClientLock sync.Mutex
+	STUNServers        []string = []string{
+		"tcp://turn.cloudflare.com:80",
+		"udp://turn.cloudflare.com:53",
+		"udp://stun.l.google.com:19302",
+		"udp://stun.miwifi.com:3478",
+		"global.turn.twilio.com:3478",
+		"stun.nextcloud.com:443",
+	}
 )
 
 // GetPublicIP 获取公网IP，返回第一个成功响应的STUN服务器的结果
-func GetPublicIP(network, bind string, stunServers []string, timeout time.Duration) (index int, localAddr, natAddr string, err error) {
+func GetPublicIP(network, bind string, timeout time.Duration) (index int, localAddr, natAddr string, err error) {
 	// 1. result 结构体包含连接和客户端
 	type result struct {
 		index  int
@@ -33,7 +42,7 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	results := make(chan result, len(stunServers))
+	results := make(chan result, len(STUNServers))
 	var wg sync.WaitGroup
 
 	netLower := strings.ToLower(network)
@@ -61,7 +70,7 @@ func GetPublicIP(network, bind string, stunServers []string, timeout time.Durati
 		return network, addr, err
 	}
 
-	for i, rawAddr := range stunServers {
+	for i, rawAddr := range STUNServers {
 		scheme := ""
 		addr := rawAddr
 
@@ -280,11 +289,11 @@ type STUNResult struct {
 // GetPublicIPs attempts to discover public IP addresses using STUN servers.
 // It collects as many unique NAT IP addresses (by IP address only, ignoring port)
 // as possible within the specified timeout, and returns all results (unique successful ones and errors).
-func GetPublicIPs(network, bind string, stunServers []string, timeout time.Duration, natIPUniq bool) ([]*STUNResult, error) {
+func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) ([]*STUNResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel() // Ensure cancel is called to release context resources
 
-	resultsChan := make(chan STUNResult, len(stunServers)) // Channel to collect results from goroutines
+	resultsChan := make(chan STUNResult, len(STUNServers)) // Channel to collect results from goroutines
 	var wg sync.WaitGroup                                  // WaitGroup to wait for all goroutines to finish
 
 	netLower := strings.ToLower(network)
@@ -304,7 +313,7 @@ func GetPublicIPs(network, bind string, stunServers []string, timeout time.Durat
 		}
 		defer sharedUDPConn.Close()
 
-		logDiscard := NewCustomLogger(io.Discard, LogLevelNone)
+		logDiscard := log.New(io.Discard, "", log.LstdFlags|log.Lshortfile)
 		UDPDialer, err = NewUDPCustomDialer(sharedUDPConn, 1500, logDiscard)
 		if err != nil {
 			return nil, err
@@ -329,7 +338,7 @@ func GetPublicIPs(network, bind string, stunServers []string, timeout time.Durat
 		return network, addr, err
 	}
 
-	for i, rawAddr := range stunServers {
+	for i, rawAddr := range STUNServers {
 		scheme := ""
 		addr := rawAddr
 
@@ -500,8 +509,8 @@ func GetPublicIPs(network, bind string, stunServers []string, timeout time.Durat
 	}
 }
 
-// getFreePort 尝试找到一个可同时绑定 TCP 和 UDP 的端口
-func getFreePort() (int, error) {
+// GetFreePort 尝试找到一个可同时绑定 TCP 和 UDP 的端口
+func GetFreePort() (int, error) {
 	const maxTry = 100
 
 	for i := 0; i < maxTry; i++ {
@@ -535,12 +544,12 @@ func getFreePort() (int, error) {
 	return 0, fmt.Errorf("no free TCP/UDP ports available")
 }
 
-func GetNetworksPublicIPs(networkList []string, bind string, stunServers []string, timeout time.Duration) ([]*STUNResult, error) {
+func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Duration) ([]*STUNResult, error) {
 	var wg sync.WaitGroup
 	resultsChan := make(chan []*STUNResult, len(networkList))
 	errorsChan := make(chan error, len(networkList))
 	if bind == "" {
-		port, err := getFreePort()
+		port, err := GetFreePort()
 		if err != nil {
 			return nil, err
 		}
@@ -551,7 +560,7 @@ func GetNetworksPublicIPs(networkList []string, bind string, stunServers []strin
 		wg.Add(1)
 		go func(network string) {
 			defer wg.Done()
-			results, err := GetPublicIPs(network, bind, stunServers, timeout, false)
+			results, err := GetPublicIPs(network, bind, timeout, false)
 			if err != nil {
 				errorsChan <- fmt.Errorf("network %s: %v", network, err)
 				return

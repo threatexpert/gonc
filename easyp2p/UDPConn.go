@@ -1,10 +1,11 @@
-package misc
+package easyp2p
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -230,7 +231,6 @@ func isTimeout(err error) bool {
 
 // ============================================================================
 // UDPCustomConn 和 UDPCustomDialer 的定义和方法与之前完全相同
-// 只是它们内部的 log.Println 调用都被替换成了 logger.Debug/Info/Warn/Error
 // 为了简洁，这里省略了它们的完整实现，假设它们已经包含了 CustomLogger 字段
 // 并在 NewUDPCustomDialer 和 UDPCustomConn 构造时传入了 logger。
 // ============================================================================
@@ -246,7 +246,7 @@ type UDPCustomConn struct {
 	deadlineMu    sync.RWMutex
 	readDeadline  time.Time
 	writeDeadline time.Time
-	logger        *CustomLogger // 添加日志器字段
+	logger        *log.Logger // 添加日志器字段
 	localIP       net.IP
 }
 
@@ -278,10 +278,10 @@ func (c *UDPCustomConn) Read(b []byte) (n int, err error) {
 		if timer != nil {
 			timer.Stop()
 		}
-		c.logger.Debug("Read from %s closed due to conn close.", c.RemoteAddr().String())
+		//c.logger.Printf("Read from %s closed due to conn close.", c.RemoteAddr().String())
 		return 0, net.ErrClosed
 	case <-timeoutCh:
-		c.logger.Debug("Read from %s timed out.", c.RemoteAddr().String())
+		//c.logger.Printf("Read from %s timed out.", c.RemoteAddr().String())
 		return 0, newTimeoutError("read", true)
 	}
 }
@@ -313,10 +313,10 @@ func (c *UDPCustomConn) Write(b []byte) (n int, err error) {
 		if timer != nil {
 			timer.Stop()
 		}
-		c.logger.Debug("Write to %s closed due to conn close.", c.RemoteAddr().String())
+		c.logger.Printf("Write to %s closed due to conn close.", c.RemoteAddr().String())
 		return 0, net.ErrClosed
 	case <-timeoutCh:
-		c.logger.Debug("Write to %s timed out.", c.RemoteAddr().String())
+		c.logger.Printf("Write to %s timed out.", c.RemoteAddr().String())
 		return 0, newTimeoutError("write", true)
 	}
 }
@@ -325,7 +325,7 @@ func (c *UDPCustomConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
 		c.dialer.removeConn(c.remoteAddr.String(), c)
-		c.logger.Info("Custom UDP Conn to %s closed.", c.remoteAddr.String())
+		c.logger.Printf("Custom UDP Conn to %s closed.", c.remoteAddr.String())
 	})
 	return nil
 }
@@ -384,11 +384,11 @@ type UDPCustomDialer struct {
 	maxPacketSize int
 	closed        chan struct{}
 	wg            sync.WaitGroup
-	logger        *CustomLogger // 添加日志器字段
+	logger        *log.Logger // 添加日志器字段
 }
 
 // NewUDPCustomDialer 创建一个新的 UDPCustomDialer。
-func NewUDPCustomDialer(localUDPConn *net.UDPConn, maxPacketSize int, logger *CustomLogger) (*UDPCustomDialer, error) {
+func NewUDPCustomDialer(localUDPConn *net.UDPConn, maxPacketSize int, logger *log.Logger) (*UDPCustomDialer, error) {
 	if localUDPConn == nil {
 		return nil, fmt.Errorf("localUDPConn cannot be nil")
 	}
@@ -403,7 +403,7 @@ func NewUDPCustomDialer(localUDPConn *net.UDPConn, maxPacketSize int, logger *Cu
 
 	d.wg.Add(1)
 	go d.readLoop()
-	d.logger.Info("UDPCustomDialer initialized on %s", localUDPConn.LocalAddr().String())
+	d.logger.Printf("UDPCustomDialer initialized on %s", localUDPConn.LocalAddr().String())
 	return d, nil
 }
 
@@ -417,7 +417,7 @@ func (d *UDPCustomDialer) DialUDP(network string, remoteAddr *net.UDPAddr) (net.
 
 	select {
 	case <-d.closed:
-		d.logger.Debug("Dialer closed, cannot dial.")
+		d.logger.Printf("Dialer closed, cannot dial.")
 		return nil, net.ErrClosed
 	default:
 	}
@@ -426,12 +426,12 @@ func (d *UDPCustomDialer) DialUDP(network string, remoteAddr *net.UDPAddr) (net.
 
 	tmpConn, err := net.Dial(network, remoteAddr.String())
 	if err != nil {
-		d.logger.Warn("Failed to establish dummy connection to %s to determine local IP: %v", remoteAddr, err)
+		d.logger.Printf("Failed to establish dummy connection to %s to determine local IP: %v", remoteAddr, err)
 		// Fallback: If we can't determine the specific local IP, use the listener's IP
 		// This might still be [::] or 0.0.0.0 if the listener is wildcard.
 		// Or, you could return an error here if precise local IP is critical.
 		listenerAddr := d.conn.LocalAddr().(*net.UDPAddr)
-		d.logger.Warn("Falling back to listener's IP (%s) for custom connection local address.", listenerAddr.IP)
+		d.logger.Printf("Falling back to listener's IP (%s) for custom connection local address.", listenerAddr.IP)
 		return nil, fmt.Errorf("failed to determine local IP for outgoing connection: %w", err)
 	}
 	defer tmpConn.Close() // Close the temporary connection immediately
@@ -455,7 +455,7 @@ func (d *UDPCustomDialer) DialUDP(network string, remoteAddr *net.UDPAddr) (net.
 	}
 
 	d.conns[remoteAddrStr] = append(d.conns[remoteAddrStr], newConn)
-	d.logger.Info("New Custom UDP Conn created for %s. LocalAddr will be %s:%d. Total conns for %s: %d",
+	d.logger.Printf("New Custom UDP Conn created for %s. LocalAddr will be %s:%d. Total conns for %s: %d",
 		remoteAddrStr, localIP, d.conn.LocalAddr().(*net.UDPAddr).Port, remoteAddrStr, len(d.conns[remoteAddrStr]))
 
 	d.wg.Add(1)
@@ -471,10 +471,10 @@ func (d *UDPCustomDialer) DialContext(ctx context.Context, network string, addre
 
 	select {
 	case <-ctx.Done():
-		d.logger.Debug("DialContext cancelled or timed out before address resolution: %v", ctx.Err())
+		d.logger.Printf("DialContext cancelled or timed out before address resolution: %v", ctx.Err())
 		return nil, ctx.Err()
 	case <-d.closed:
-		d.logger.Debug("Dialer closed, cannot DialContext.")
+		d.logger.Printf("Dialer closed, cannot DialContext.")
 		return nil, net.ErrClosed
 	default:
 	}
@@ -494,7 +494,7 @@ func (d *UDPCustomDialer) DialContext(ctx context.Context, network string, addre
 	var remoteAddr *net.UDPAddr
 	select {
 	case <-ctx.Done():
-		d.logger.Debug("DialContext cancelled or timed out during address resolution: %v", ctx.Err())
+		d.logger.Printf("DialContext cancelled or timed out during address resolution: %v", ctx.Err())
 		return nil, ctx.Err()
 	case addr := <-addrCh:
 		remoteAddr = addr
@@ -511,7 +511,7 @@ func (d *UDPCustomDialer) readLoop() {
 	for {
 		select {
 		case <-d.closed:
-			d.logger.Info("UDPCustomDialer readLoop stopping due to dialer closed.")
+			d.logger.Printf("UDPCustomDialer readLoop stopping due to dialer closed.")
 			return
 		default:
 		}
@@ -520,20 +520,20 @@ func (d *UDPCustomDialer) readLoop() {
 		n, remoteAddr, err := d.conn.ReadFromUDP(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				d.logger.Debug("Read from UDP timeout, continuing.")
+				//d.logger.Printf("Read from UDP timeout, continuing.")
 				continue
 			}
 			if err.Error() == "use of closed network connection" {
-				d.logger.Info("Underlying UDP connection closed, stopping readLoop.")
+				d.logger.Printf("Underlying UDP connection closed, stopping readLoop.")
 				return
 			}
-			d.logger.Error("Error reading from UDP: %v", err)
+			//d.logger.Printf("Error reading from UDP: %v", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
 		remoteAddrStr := remoteAddr.String()
-		d.logger.Debug("Received %d bytes from %s on shared UDPConn.", n, remoteAddrStr)
+		//d.logger.Printf("Received %d bytes from %s on shared UDPConn.", n, remoteAddrStr)
 
 		d.mu.RLock()
 		connsToNotify := d.conns[remoteAddrStr]
@@ -545,14 +545,14 @@ func (d *UDPCustomDialer) readLoop() {
 				select {
 				case conn.readCh <- dataCopy:
 				case <-conn.closed:
-					d.logger.Debug("Skipping closed conn %s for %s", conn.RemoteAddr().String(), remoteAddrStr)
+					d.logger.Printf("Skipping closed conn %s for %s", conn.RemoteAddr().String(), remoteAddrStr)
 				default:
-					d.logger.Warn("Read channel for conn %s to %s is full, dropping packet.",
+					d.logger.Printf("Read channel for conn %s to %s is full, dropping packet.",
 						conn.RemoteAddr().String(), remoteAddrStr)
 				}
 			}
 		} else {
-			d.logger.Debug("No custom connections found for received data from %s. Data dropped.", remoteAddrStr)
+			d.logger.Printf("No custom connections found for received data from %s. Data dropped.", remoteAddrStr)
 		}
 	}
 }
@@ -564,16 +564,16 @@ func (d *UDPCustomDialer) writeLoop(c *UDPCustomConn) {
 		case data := <-c.writeCh:
 			_, err := d.conn.WriteToUDP(data, c.remoteAddr.(*net.UDPAddr))
 			if err != nil {
-				d.logger.Error("Error writing to UDP for %s: %v", c.remoteAddr.String(), err)
+				d.logger.Printf("Error writing to UDP for %s: %v", c.remoteAddr.String(), err)
 			} else {
-				d.logger.Debug("Sent %d bytes to %s from %s on shared UDPConn.",
-					len(data), c.remoteAddr.String(), c.LocalAddr().String())
+				//d.logger.Printf("Sent %d bytes to %s from %s on shared UDPConn.",
+				//	len(data), c.remoteAddr.String(), c.LocalAddr().String())
 			}
 		case <-c.closed:
-			d.logger.Info("UDPCustomConn writeLoop for %s stopping due to conn closed.", c.remoteAddr.String())
+			d.logger.Printf("UDPCustomConn writeLoop for %s stopping due to conn closed.", c.remoteAddr.String())
 			return
 		case <-d.closed:
-			d.logger.Info("UDPCustomConn writeLoop for %s stopping due to dialer closed.", c.remoteAddr.String())
+			d.logger.Printf("UDPCustomConn writeLoop for %s stopping due to dialer closed.", c.remoteAddr.String())
 			return
 		}
 	}
@@ -595,13 +595,13 @@ func (d *UDPCustomDialer) removeConn(remoteAddrStr string, connToRemove *UDPCust
 		} else {
 			delete(d.conns, remoteAddrStr)
 		}
-		d.logger.Info("Removed custom conn for %s. Remaining conns for %s: %d",
+		d.logger.Printf("Removed custom conn for %s. Remaining conns for %s: %d",
 			remoteAddrStr, remoteAddrStr, len(d.conns[remoteAddrStr]))
 	}
 }
 
 func (d *UDPCustomDialer) Close() error {
-	d.logger.Info("Closing UDPCustomDialer...")
+	d.logger.Printf("Closing UDPCustomDialer...")
 	select {
 	case <-d.closed:
 		return net.ErrClosed
@@ -621,11 +621,11 @@ func (d *UDPCustomDialer) Close() error {
 
 	err := d.conn.Close()
 	if err != nil {
-		d.logger.Error("Error closing underlying UDPConn: %v", err)
+		d.logger.Printf("Error closing underlying UDPConn: %v", err)
 	}
 
 	d.wg.Wait()
-	d.logger.Info("UDPCustomDialer closed successfully.")
+	d.logger.Printf("UDPCustomDialer closed successfully.")
 	return err
 }
 

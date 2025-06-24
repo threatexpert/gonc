@@ -1,4 +1,4 @@
-package misc
+package easyp2p
 
 import (
 	"encoding/json"
@@ -9,21 +9,9 @@ import (
 	"time"
 )
 
-var (
-	stunServers = []string{
-		"tcp://turn.cloudflare.com:80",
-		"udp://turn.cloudflare.com:53",
-		"udp://stun.miwifi.com:3478",
-		"udp://stun.l.google.com:19302",
-		"global.turn.twilio.com:3478",
-		"stun.nextcloud.com:443",
-		//"freestun.net:3478",
-	}
-)
-
 func TestStunOne(t *testing.T) {
 	timeout := 3 * time.Second
-	results, err := GetPublicIPs("udp4", ":20000", stunServers, timeout, false)
+	results, err := GetPublicIPs("udp4", ":20000", timeout, false)
 	if err != nil {
 		return
 	}
@@ -32,7 +20,7 @@ func TestStunOne(t *testing.T) {
 	} else {
 		fmt.Println("\n--- Public IP Results ---")
 		for _, r := range results {
-			fmt.Printf("StunServer: %s\n", stunServers[r.Index])
+			fmt.Printf("StunServer: %s\n", STUNServers[r.Index])
 			if r.Err != nil {
 				fmt.Printf("    Error: %v\n", r.Err)
 			} else {
@@ -45,7 +33,7 @@ func TestStunOne(t *testing.T) {
 func TestStunN(t *testing.T) {
 	timeout := 30 * time.Second
 	networkList := strings.Split("tcp6,tcp4,udp4", ",")
-	allResults, err := GetNetworksPublicIPs(networkList, "", stunServers, timeout)
+	allResults, err := GetNetworksPublicIPs(networkList, "", timeout)
 	if err != nil {
 		fmt.Println("failed: ", err)
 		return
@@ -53,7 +41,7 @@ func TestStunN(t *testing.T) {
 
 	fmt.Println("\n--- Public IP Results ---")
 	for _, r := range allResults {
-		srv := strings.TrimPrefix(stunServers[r.Index], "udp://")
+		srv := strings.TrimPrefix(STUNServers[r.Index], "udp://")
 		srv = strings.TrimPrefix(srv, "tcp://")
 		fmt.Printf("StunServer: %s://%s\n", r.Network, srv)
 		if r.Err == nil {
@@ -167,7 +155,7 @@ func TestAnalyzeSTUNResults(t *testing.T) {
 func TestAnalyzeRealSTUNResults(t *testing.T) {
 	timeout := 3 * time.Second
 	networkList := strings.Split("tcp6,tcp4,udp4", ",")
-	allResults, err := GetNetworksPublicIPs(networkList, "", stunServers, timeout)
+	allResults, err := GetNetworksPublicIPs(networkList, "", timeout)
 	if err != nil {
 		fmt.Println("failed: ", err)
 		return
