@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand"
@@ -57,6 +58,30 @@ type P2PAddressInfo struct {
 type securePayload struct {
 	Nonce string `json:"nonce"`
 	Data  string `json:"data"`
+}
+
+type UnRetryableError struct {
+	Err error
+}
+
+func (e UnRetryableError) Error() string {
+	return e.Err.Error()
+}
+
+func (e UnRetryableError) Unwrap() error {
+	return e.Err
+}
+
+func WrapUnRetryable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return UnRetryableError{Err: err}
+}
+
+func IsUnRetryable(err error) bool {
+	var target UnRetryableError
+	return err != nil && errors.As(err, &target)
 }
 
 func encryptAES(key, plaintext []byte) (*securePayload, error) {
@@ -656,19 +681,22 @@ func Easy_P2P(network, sessionUid string, logWriter io.Writer) (net.Conn, bool, 
 	var round int
 	for round, p2pInfo = range p2pInfos {
 		if strings.HasPrefix(p2pInfo.Network, "tcp") {
-			conn, isRoleClient, _, err2 := Auto_P2P_TCP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round, logWriter)
+			conn, isRoleClient, _, err2 := Auto_P2P_TCP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
 			if err2 == nil {
 				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round, logWriter)
+			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
 			if err2 == nil {
 				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
 			}
 			err = err2
 		}
 		fmt.Fprintf(logWriter, "ERROR: %v\n", err)
+		if IsUnRetryable(err) {
+			break
+		}
 		time.Sleep(1 * time.Second)
 	}
 
@@ -715,13 +743,6 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	fmt.Fprintf(logWriter, "=== Trying P2P Connection ===\n")
 
 	isClient = SelectRole(p2pInfo)
-
-	if round > 0 {
-		err = Mqtt_P2P_Round_Sync(sessionUid, isClient, round, 25*time.Second, logWriter)
-		if err != nil {
-			return nil, false, nil, fmt.Errorf("failed to sync P2P round: %w", err)
-		}
-	}
 
 	if needSharedKey {
 		sharedKey = p2pInfo.SharedKey[:]
@@ -773,21 +794,6 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	if err != nil {
 		return nil, false, nil, fmt.Errorf("failed to resolve remote address: %v", err)
 	}
-	// 打印详细连接信息
-	p2pInfoPrint(logWriter, p2pInfo)
-	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
-	if isClient {
-		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start immediately)\n", "Client Mode")
-	} else {
-		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
-	}
-	fmt.Fprintf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
-
-	// 启动读写协程
-	ctxStopPunching, stopPunching := context.WithCancel(context.Background())
-	ctxRound, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
-	defer cancel()
-	defer stopPunching()
 
 	type AddrPair struct {
 		Local  *net.UDPAddr
@@ -804,6 +810,30 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	buconn := NewBoundUDPConn(uconn, "", false)
 
 	SetUDPTTL(uconn, ttl)
+
+	//端口监听准备好了，开始P2P
+
+	if round > 0 {
+		err = Mqtt_P2P_Round_Sync(sessionUid, isClient, round, 25*time.Second, logWriter)
+		if err != nil {
+			return nil, false, nil, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
+		}
+	}
+
+	// 打印详细连接信息
+	p2pInfoPrint(logWriter, p2pInfo)
+	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
+	if isClient {
+		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start immediately)\n", "Client Mode")
+	} else {
+		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
+	}
+	fmt.Fprintf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
+
+	ctxStopPunching, stopPunching := context.WithCancel(context.Background())
+	ctxRound, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
+	defer cancel()
+	defer stopPunching()
 
 	// 读协程：收包，类似TCP三次握手等待TCP SYN+ACK
 	go func() {
@@ -1004,43 +1034,46 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	}()
 
 	// 等待结果
+	var errFin error
 	select {
 	case addrPair := <-gotHoleCh:
 		buconn.Close()
 		uconn, err = net.ListenUDP(network, addrPair.Local)
 		if err != nil {
-			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+			errFin = fmt.Errorf("error binding UDP address: %v", err)
+		} else {
+			buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
+			buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
+			fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
+			SetUDPTTL(uconn, 64)
 		}
-		buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
-		buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
-		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
-		SetUDPTTL(uconn, 64)
-		return buconn, isClient, sharedKey, nil
 	case <-recvChan:
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
 		buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
 		SetUDPTTL(uconn, 64)
-		return buconn, isClient, sharedKey, nil
-	case <-errChan:
+	case errFin = <-errChan:
 		buconn.Close()
 	case <-ctxRound.Done():
-		fmt.Fprintf(logWriter, "Timeout (%ds)\n", count)
+		errFin = fmt.Errorf("timeout (%ds)", count)
 		buconn.Close()
 	}
 	cancel()
 	stopPunching()
-	return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed")
+	if errFin != nil {
+		return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
+	}
+	return buconn, isClient, sharedKey, nil
 }
 
 func Mqtt_P2P_Round_Sync(sessionUid string, isClient bool, round int, timeout time.Duration, logWriter io.Writer) error {
 	var msgSend string
 	var msgNeed string
 	if isClient {
-		msgSend = fmt.Sprintf("C%d", round+1)
-		msgNeed = fmt.Sprintf("S%d", round+1)
+		msgSend = fmt.Sprintf("C%d", round)
+		msgNeed = fmt.Sprintf("S%d", round)
 	} else {
-		msgSend = fmt.Sprintf("S%d", round+1)
-		msgNeed = fmt.Sprintf("C%d", round+1)
+		msgSend = fmt.Sprintf("S%d", round)
+		msgNeed = fmt.Sprintf("C%d", round)
 	}
 
 	myKey := deriveKey("gonc-round-sync", sessionUid)
@@ -1048,7 +1081,7 @@ func Mqtt_P2P_Round_Sync(sessionUid string, isClient bool, round int, timeout ti
 	encPayloadBytes, _ := json.Marshal(encPayload)
 	payloadSend := string(encPayloadBytes)
 
-	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ... ", round+1)
+	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ... ", round)
 	payloadRecv, _, err := MQTT_Exchange_Symmetric(payloadSend, sessionUid, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
@@ -1083,14 +1116,6 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	fmt.Fprintf(logWriter, "=== Trying P2P Connection ===\n")
 
 	isClient = SelectRole(p2pInfo)
-
-	if round > 0 {
-		err = Mqtt_P2P_Round_Sync(sessionUid, isClient, round, 25*time.Second, logWriter)
-		if err != nil {
-			return nil, false, nil, fmt.Errorf("failed to sync P2P round: %w", err)
-		}
-	}
-
 	if needSharedKey {
 		sharedKey = p2pInfo.SharedKey[:]
 	}
@@ -1169,14 +1194,6 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		remoteAddr = net.JoinHostPort(remoteIP, strconv.Itoa(remotePortInt))
 		p2pInfo.RemoteNAT = remoteAddr
 	}
-	// Print connection info
-	p2pInfoPrint(logWriter, p2pInfo)
-	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
-	if isClient {
-		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
-	} else {
-		fmt.Fprintf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
-	}
 
 	timeoutMax := 25
 	timeoutPerconn := 6
@@ -1190,6 +1207,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	connChan := make(chan ConnWithTag, 1)
 	errChan := make(chan error, 1)
 	punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
+	var punchAckOnce sync.Once
 
 	// Start listener
 	lc := net.ListenConfig{Control: ControlTCP}
@@ -1198,6 +1216,84 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		return nil, false, nil, fmt.Errorf("failed to listen: %v", err)
 	}
 	defer listener.Close()
+	//端口监听准备好了，开始P2P
+
+	if round > 0 {
+		err = Mqtt_P2P_Round_Sync(sessionUid, isClient, round, 25*time.Second, logWriter)
+		if err != nil {
+			return nil, false, nil, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
+		}
+	}
+
+	// Print connection info
+	p2pInfoPrint(logWriter, p2pInfo)
+	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
+	if isClient {
+		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
+	} else {
+		fmt.Fprintf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
+	}
+
+	//打洞有时候有多个连接都打洞成功了，通过doHandshake实现双向确认，共同选择同一条连接，其他关闭
+	doHandshake := func(conn net.Conn, isClient bool, tag string) error {
+		var success bool
+		if isClient {
+			//所有C主动发送Ack
+			_, writeErr := conn.Write(punchAckPayload)
+			if writeErr != nil {
+				return fmt.Errorf("connection(%s) failed to write: %v", tag, writeErr)
+			}
+
+			//然后进入等待S回复ACK。
+			buf := make([]byte, len(punchAckPayload))
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, readErr := conn.Read(buf)
+			if readErr != nil {
+				return fmt.Errorf("connection(%s) failed to read: %v", tag, readErr)
+			}
+			if !bytes.Equal(buf[:n], punchAckPayload) {
+				return fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
+			}
+			conn.SetReadDeadline(time.Time{})
+
+			//正常来说，只有一个S会回复，这里用punchAckOnce只允许一个C成功。
+			punchAckOnce.Do(func() {
+				success = true
+			})
+			if !success {
+				return fmt.Errorf("connection(%s) not selected", tag)
+			}
+		} else {
+			// S端只挑选一个C尝试接收ACK并回复ACK。确保只有一个C收到ACK，其他C都会关闭连接。
+			errS := fmt.Errorf("connection(%s) not selected", tag)
+			punchAckOnce.Do(func() {
+				buf := make([]byte, len(punchAckPayload))
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				n, readErr := conn.Read(buf)
+				if readErr != nil {
+					errS = fmt.Errorf("connection(%s) failed to read: %v", tag, readErr)
+					return
+				}
+				if !bytes.Equal(buf[:n], punchAckPayload) {
+					errS = fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
+					return
+				}
+				conn.SetReadDeadline(time.Time{})
+
+				_, writeErr := conn.Write(punchAckPayload)
+				if writeErr != nil {
+					errS = fmt.Errorf("connection(%s) failed to write: %v", tag, writeErr)
+					return
+				}
+				success = true
+			})
+			if !success {
+				return errS
+			}
+		}
+
+		return nil
+	}
 
 	// Start accepting connections in goroutine
 	go func() {
@@ -1208,21 +1304,12 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			errChan <- err
 			return
 		}
-		if !isClient {
-			buf := make([]byte, len(punchAckPayload))
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, readErr := conn.Read(buf)
-			if readErr != nil {
-				conn.Close()
-				errChan <- fmt.Errorf("failed to read punchAckPayload: %v", readErr)
-				return
-			}
-			if !bytes.Equal(buf[:n], punchAckPayload) {
-				conn.Close()
-				errChan <- fmt.Errorf("invalid punchAckPayload")
-				return
-			}
-			conn.SetReadDeadline(time.Time{})
+
+		err = doHandshake(conn, isClient, "accept")
+		if err != nil {
+			conn.Close()
+			errChan <- err
+			return
 		}
 
 		// Verify the connection is from expected peer
@@ -1253,7 +1340,6 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		// Setup worker pool for concurrent dialing
 		var wg sync.WaitGroup
 		workerChan := make(chan struct{}, MaxWorkers) // Semaphore for limiting concurrency
-		var once sync.Once
 
 		// Function to try a single connection
 		tryConnect := func(targetAddr string, localAddr *net.TCPAddr, reuseaddr bool, timeout_sec int, isClient bool, tag string) bool {
@@ -1275,39 +1361,21 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				}
 
 				conn, err := dialer.DialContext(ctx, network, targetAddr)
-				if err == nil {
-					if isClient {
-						var success bool
-						// 使用 sync.Once 确保只有一个连接可以发送 punchAckPayload
-						once.Do(func() {
-							_, writeErr := conn.Write(punchAckPayload)
-							if writeErr == nil {
-								success = true
-							}
-						})
-						if !success {
-							conn.Close()
-							return false
-						}
-					} else {
-						// 非 client 的连接需要等待一个 punchAckPayload 的回复，并确认使用这个 conn，其他的关闭
-						buf := make([]byte, len(punchAckPayload))
-						conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-						n, readErr := conn.Read(buf)
-						if readErr != nil || !bytes.Equal(buf[:n], punchAckPayload) {
-							conn.Close()
-							return false
-						}
-						conn.SetReadDeadline(time.Time{})
-					}
+				if err != nil {
+					return false
+				}
+				err = doHandshake(conn, isClient, tag)
+				if err != nil {
+					conn.Close()
+					return false
+				}
 
-					select {
-					case connChan <- ConnWithTag{Conn: conn, Tag: tag}:
-						cancel() // Cancel other attempts
-						return true
-					default:
-						conn.Close()
-					}
+				select {
+				case connChan <- ConnWithTag{Conn: conn, Tag: tag}:
+					cancel() // Cancel other attempts
+					return true
+				default:
+					conn.Close()
 				}
 			}
 			return false
@@ -1391,12 +1459,11 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		connType := connInfo.Tag // 获取连接类型描述
 		fmt.Fprintf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
 		return conn, isClient, sharedKey, nil
-	case <-errChan:
+	case errCh := <-errChan:
+		return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed: %s", errCh.Error())
 	case <-time.After(time.Duration(timeoutMax) * time.Second):
-		fmt.Fprintf(logWriter, "Timeout\n")
+		return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed: Timeout")
 	}
-
-	return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed")
 }
 
 func logwts(logWriter io.Writer, msg string, args ...interface{}) {
