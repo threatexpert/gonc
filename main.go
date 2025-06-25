@@ -432,7 +432,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9.1")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.2")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -986,13 +986,14 @@ func main() {
 	}
 }
 
-// 新增的copyWithProgress函数用于在数据传输时显示进度
-func copyWithProgress(dst io.Writer, src io.Reader, bufsize int, stats *misc.ProgressStats) {
+// 用于在数据传输时显示进度
+func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, stats *misc.ProgressStats) {
+	bufsize := blocksize
 	if bufsize < 32*1024 {
-		bufsize = 32 * 1024
+		bufsize = 32 * 1024 //reader的缓存可以大一些，提高性能
 	}
 	reader := bufio.NewReaderSize(src, bufsize)
-	buf := make([]byte, bufsize)
+	buf := make([]byte, blocksize) //buf的大小按用户指定的bufsize来，如果dst是UDP可以限制每个写入发出去的UDP的大小
 	var n int
 	var err, err1 error
 	for {

@@ -191,10 +191,10 @@ func publishAtLeastN(clients []mqtt.Client, topic string, qos byte, payload stri
 	}
 }
 
-func MQTT_Exchange_Symmetric(sendData, sessionUid string, timeout time.Duration) (recvData string, recvIndex int, err error) {
+func MQTT_Exchange_Symmetric(sendData, topicSalt, sessionUid string, timeout time.Duration) (recvData string, recvIndex int, err error) {
 	brokerServers := MQTTBrokerServers
 	var qos byte = 1
-	topic := TopicExchange + deriveKeyForTopic("mqtt-topic-gonc-ex", sessionUid)
+	topic := TopicExchange + deriveKeyForTopic(topicSalt, sessionUid)
 
 	myClientIDPrefix := deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid)
 	uidNano := fmt.Sprint(time.Now().UnixNano())
@@ -382,14 +382,14 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 		myInfoForExchange.PubKey = base64.StdEncoding.EncodeToString(pubBytes)
 	}
 
-	myKey := deriveKey("p2p-exchange-v1.9", sessionUid)
+	myKey := deriveKey("p2p-exchange-v1.9.2", sessionUid)
 	infoBytes, _ := json.Marshal(myInfoForExchange)
 	encPayload, _ := encryptAES(myKey[:], infoBytes)
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
 	fmt.Fprintf(logWriter, "    Exchanging address info with peer ...")
 
-	remoteInfoRaw, srvIndex, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), sessionUid, timeout)
+	remoteInfoRaw, srvIndex, err := MQTT_Exchange_Symmetric(string(encPayloadBytes), "gonc-exchange-address", sessionUid, timeout)
 	if err != nil {
 		fmt.Fprintf(logWriter, "Failed: %v\n", err)
 		return nil, err
@@ -1082,7 +1082,7 @@ func Mqtt_P2P_Round_Sync(sessionUid string, isClient bool, round int, timeout ti
 	payloadSend := string(encPayloadBytes)
 
 	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ... ", round)
-	payloadRecv, _, err := MQTT_Exchange_Symmetric(payloadSend, sessionUid, timeout)
+	payloadRecv, _, err := MQTT_Exchange_Symmetric(payloadSend, "gonc-exchange-sync", sessionUid, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
 	}
