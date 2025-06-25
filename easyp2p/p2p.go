@@ -40,6 +40,7 @@ var (
 	DebugServerRole         string
 	PunchingShortTTL        int = 5
 	PunchingRandomPortCount int = 600
+	UDPIdleTimeoutSecond    int = 41
 )
 
 type P2PAddressInfo struct {
@@ -1011,11 +1012,13 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
 		}
 		buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
+		buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
 		SetUDPTTL(uconn, 64)
 		return buconn, isClient, sharedKey, nil
 	case <-recvChan:
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
+		buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
 		SetUDPTTL(uconn, 64)
 		return buconn, isClient, sharedKey, nil
 	case <-errChan:
@@ -1040,12 +1043,29 @@ func Mqtt_P2P_Round_Sync(sessionUid string, isClient bool, round int, timeout ti
 		msgNeed = fmt.Sprintf("C%d", round+1)
 	}
 
+	myKey := deriveKey("gonc-round-sync", sessionUid)
+	encPayload, _ := encryptAES(myKey[:], []byte(msgSend))
+	encPayloadBytes, _ := json.Marshal(encPayload)
+	payloadSend := string(encPayloadBytes)
+
 	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ... ", round+1)
-	msgRecv, _, err := MQTT_Exchange_Symmetric(msgSend, sessionUid, timeout)
+	payloadRecv, _, err := MQTT_Exchange_Symmetric(payloadSend, sessionUid, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
 	}
-	if msgRecv != msgNeed {
+
+	var remotePayload securePayload
+	err = json.Unmarshal([]byte(payloadRecv), &remotePayload)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal sync message: %v", err)
+	}
+
+	msgRecv, err := decryptAES(myKey[:], &remotePayload)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt sync message: %v", err)
+	}
+
+	if string(msgRecv) != msgNeed {
 		return fmt.Errorf("expected message '%s', but got '%s'", msgNeed, msgRecv)
 	}
 	fmt.Fprintf(logWriter, "OK\n")

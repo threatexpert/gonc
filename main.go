@@ -751,12 +751,15 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Waiting for initial UDP packet to establish session...\n")
 					uconn.SetReadDeadline(time.Time{})
 					buconn := easyp2p.NewBoundUDPConn(uconn, "", true)
+					buconn.SetIdleTimeout(0)
 					if err = buconn.WaitAndLockRemote(); err != nil {
 						fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 						os.Exit(1)
 					}
 					fmt.Fprintf(os.Stderr, "Received a UDP packet from %s\n", buconn.RemoteAddr().String())
-
+					if isKCPEnabled() {
+						buconn.SetIdleTimeout(time.Duration(easyp2p.UDPIdleTimeoutSecond) * time.Second)
+					}
 					handleConnection(buconn, stats_in, stats_out)
 					time.Sleep(1 * time.Second)
 				}
@@ -785,6 +788,9 @@ func main() {
 				if err = buconn.WaitAndLockRemote(); err != nil {
 					fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
 					os.Exit(1)
+				}
+				if isKCPEnabled() {
+					buconn.SetIdleTimeout(time.Duration(easyp2p.UDPIdleTimeoutSecond) * time.Second)
 				}
 				easyp2p.SetUDPTTL(uconn, 64)
 				fmt.Fprintf(os.Stderr, "Received first UDP packet from %s\n", buconn.RemoteAddr().String())
@@ -1503,7 +1509,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 
 	// 告诉keep alive协程，把间隔调成15秒
 	select {
-	case intervalChange <- 15 * time.Second:
+	case intervalChange <- 13 * time.Second:
 	default:
 	}
 

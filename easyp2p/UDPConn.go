@@ -22,6 +22,9 @@ type BoundUDPConn struct {
 	connCloseOnce  sync.Once // 保护底层连接
 	firstPacket    []byte    // 缓存的首包
 	lastPacketAddr string
+
+	lastActiveTime time.Time     // 最后一次收到合法数据的时间
+	idleTimeout    time.Duration // 超时时间，0表示不启用
 }
 
 // NewBoundUDPConn 创建连接，remoteAddr为nil时允许任意源地址
@@ -40,6 +43,11 @@ func NewBoundUDPConn(conn *net.UDPConn, raddr string, keepOpen bool) *BoundUDPCo
 		keepOpen:   keepOpen,
 		closeChan:  make(chan struct{}),
 	}
+}
+
+// SetIdleTimeout 设置最大空闲时间，如果超过这个时间没收到数据，则Read返回错误
+func (b *BoundUDPConn) SetIdleTimeout(timeout time.Duration) {
+	b.idleTimeout = timeout
 }
 
 // WaitAndLockRemote 阻塞接收首个包并锁定源地址
@@ -71,37 +79,40 @@ func (b *BoundUDPConn) GetLastPacketRemoteAddr() string {
 }
 
 func (b *BoundUDPConn) Read(p []byte) (int, error) {
-	// 1. 检查关闭状态
 	select {
 	case <-b.closeChan:
 		return 0, io.EOF
 	default:
 	}
 
-	// 2. 返回缓存的第一个包
+	// 处理首包
 	if b.firstPacket != nil {
 		n := copy(p, b.firstPacket)
 		b.firstPacket = nil
+		b.lastActiveTime = time.Now()
 		return n, nil
 	}
 
-	// 3. 正常读取流程
 	for {
 		b.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		n, addr, err := b.conn.ReadFromUDP(p)
 
 		switch {
 		case err == nil:
-			addrValid := b.remoteAddr == nil ||
-				(addr.IP.Equal(b.remoteAddr.IP) && addr.Port == b.remoteAddr.Port)
-
+			addrValid := b.remoteAddr == nil || (addr.IP.Equal(b.remoteAddr.IP) && addr.Port == b.remoteAddr.Port)
 			if addrValid {
 				b.lastPacketAddr = addr.String()
+				b.lastActiveTime = time.Now() // 更新最后活动时间
 				return n, nil
 			}
 			continue
 
 		case isTimeout(err):
+			if b.idleTimeout > 0 && !b.lastActiveTime.IsZero() {
+				if time.Since(b.lastActiveTime) > b.idleTimeout {
+					return 0, fmt.Errorf("idle timeout: no data received for %s", b.idleTimeout)
+				}
+			}
 			select {
 			case <-b.closeChan:
 				return 0, io.EOF
