@@ -1507,7 +1507,7 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 	// 取消超时（恢复成无超时）
 	sess.SetReadDeadline(time.Time{})
 
-	// 告诉keep alive协程，把间隔调成15秒
+	// 告诉keep alive协程，把间隔调成13秒
 	select {
 	case intervalChange <- 13 * time.Second:
 	default:
