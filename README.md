@@ -53,11 +53,11 @@ golang版 netcat, 更方便的建立点对点通信。
 
     还可以P2P的方式反弹shell：
 
-    `gonc -tls -pty -exec /bin/bash -p2p-tcp randomString`
+    `gonc -pty -exec /bin/bash -p2p randomString`
 
     另一端这样可以得到shell
 
-    `gonc -tls -pty -p2p-tcp randomString`
+    `gonc -pty -p2p randomString`
 
 
 - 还可以像socat那样建立左右两个通道转发数据(-exec参数值中的第一个.代表gonc自身路径)
@@ -86,7 +86,7 @@ golang版 netcat, 更方便的建立点对点通信。
 
     另一端(本机监听端口)
 
-    `gonc.exe -p2p randomString -socks5local-port 3888"`
+    `gonc.exe -p2p randomString -socks5local-port 3888`
 
     http文件服务器
 
@@ -94,4 +94,4 @@ golang版 netcat, 更方便的建立点对点通信。
 
     另一端(本机监听端口)，那么浏览器访问本机9999端口可实现浏览对端的文件列表和下载文件
 
-    `gonc.exe -p2p randomString -httplocal-port 9999"`
+    `gonc.exe -p2p randomString -httplocal-port 9999`

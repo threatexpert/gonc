@@ -73,7 +73,6 @@ var (
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
 	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
-	peer              = flag.String("peer", "", "peer address to connect, will send a ping/SYN for NAT punching")
 	appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
 	keepAlive         = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
 	punchData         = flag.String("punchdata", "ping\n", "UDP punch payload")
@@ -432,25 +431,14 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9.2")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.3")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
 
-func main() {
-	var err error
-	flag.Parse()
-
-	if *appMux {
-		mux_main()
-		return
-	}
-
-	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
-	easyp2p.STUNServers = parseMultiItems(*stunSrv, true)
-
+func conflictCheck() {
 	if *sendfile != "" && *runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-send and -exec cannot be used together\n")
 		os.Exit(1)
@@ -464,7 +452,7 @@ func main() {
 		os.Exit(1)
 	}
 	if *proxyAddr != "" && *useSTUN {
-		fmt.Fprintf(os.Stderr, "-turn and -x cannot be used together\n")
+		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
 		os.Exit(1)
 	}
 	if *localbind != "" && *listenMode {
@@ -483,14 +471,30 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
 		os.Exit(1)
 	}
-	if *useUNIXdomain && (*useIPv6 || *useIPv4 || *useSTUN || *udpProtocol || *kcpEnabled || *kcpSEnabled || *peer != "" || *localbind != "" || *proxyAddr != "") {
-		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -peer -bind -x) cannot be used together\n")
+	if *useUNIXdomain && (*useIPv6 || *useIPv4 || *useSTUN || *udpProtocol || *kcpEnabled || *kcpSEnabled || *localbind != "" || *proxyAddr != "") {
+		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -bind -x) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *runAppFileServ != "" && (*appMuxListenMode || *appMuxListenOn != "") {
 		fmt.Fprintf(os.Stderr, "-httpserver and (-httplocal -download) cannot be used together\n")
 		os.Exit(1)
 	}
+}
+
+func main() {
+	var err error
+	flag.Parse()
+
+	if *appMux {
+		mux_main()
+		return
+	}
+
+	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
+	easyp2p.STUNServers = parseMultiItems(*stunSrv, true)
+
+	conflictCheck()
+
 	if *runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
 		*runCmd = fmt.Sprintf("-app-mux httpserver \"%s\"", escapedPath)
@@ -700,9 +704,10 @@ func main() {
 		// 监听模式
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
-			if err == nil {
-				port = strconv.Itoa(portInt)
+			if err != nil {
+				panic(err)
 			}
+			port = strconv.Itoa(portInt)
 		}
 		listenAddr := net.JoinHostPort(host, port)
 		if *useUNIXdomain {
@@ -764,26 +769,6 @@ func main() {
 					time.Sleep(1 * time.Second)
 				}
 			} else {
-				if *peer != "" {
-					err = easyp2p.SetUDPTTL(uconn, easyp2p.PunchingShortTTL)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Failed to set udp TTL: %v\n", err)
-					}
-					peerIP, startPort, endPort := parsePeerAddressRange(*peer)
-					data := []byte(*punchData)
-					for port := startPort; port <= endPort; port++ {
-						addrStr := net.JoinHostPort(peerIP, strconv.Itoa(port))
-						peerAddr, err := net.ResolveUDPAddr(network, addrStr)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "Invalid peer address %s: %v\n", addrStr, err)
-							continue
-						}
-						_, err = uconn.WriteToUDP(data, peerAddr)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "Failed to send punch packet to %s: %v\n", addrStr, err)
-						}
-					}
-				}
 				buconn := easyp2p.NewBoundUDPConn(uconn, "", false)
 				if err = buconn.WaitAndLockRemote(); err != nil {
 					fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
@@ -799,7 +784,6 @@ func main() {
 		} else {
 			//TCP/unix listen
 			var listener net.Listener
-			var stopSynTrigger bool = false
 			lc := net.ListenConfig{}
 			if *useSTUN {
 				err = ShowPublicIP(network, listenAddr)
@@ -807,7 +791,7 @@ func main() {
 					panic(err)
 				}
 			}
-			if *peer != "" || *useSTUN {
+			if *useSTUN {
 				lc.Control = easyp2p.ControlTCP
 			}
 			listener, err = lc.Listen(context.Background(), network, listenAddr)
@@ -816,43 +800,6 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
-
-			if *peer != "" {
-				// 发起 outbound TCP SYN，触发 NAT 映射
-				laddr, _ := net.ResolveTCPAddr(network, listener.Addr().String())
-
-				go func() {
-					for !stopSynTrigger {
-						d := net.Dialer{
-							LocalAddr: laddr,
-							Timeout:   20 * time.Millisecond,
-							Control:   easyp2p.ControlTCPTTL, //小ttl，通常到不了对端
-						}
-
-						peerIP, startPort, endPort := parsePeerAddressRange(*peer)
-						for port := startPort; port <= endPort; port++ {
-							addrStr := net.JoinHostPort(peerIP, strconv.Itoa(port))
-							peerAddr, err := net.ResolveTCPAddr(network, addrStr)
-							if err != nil {
-								fmt.Fprintf(os.Stderr, "Invalid peer address %s: %v\n", addrStr, err)
-								continue
-							}
-							pc, err := d.Dial(network, peerAddr.String())
-							if err == nil {
-								if tcpCon, ok := conn.(*net.TCPConn); ok {
-									tcpCon.SetLinger(0)
-								}
-								pc.Close()
-							}
-							fmt.Fprintf(os.Stderr, "Sent a TCP SYN(%s->%s) to trigger NAT mapping\n", laddr.String(), peerAddr.String())
-							if !stopSynTrigger {
-								time.Sleep(2 * time.Second)
-							}
-						}
-					}
-				}()
-
-			}
 
 			if *keepOpen {
 				// 创建进度统计
@@ -869,9 +816,9 @@ func main() {
 					conn, err = listener.Accept()
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
+						time.Sleep(1 * time.Second)
 						continue
 					}
-					stopSynTrigger = true
 					if conn.LocalAddr().Network() == "unix" {
 						fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
 					} else {
@@ -886,7 +833,6 @@ func main() {
 					os.Exit((1))
 				}
 				listener.Close()
-				stopSynTrigger = true
 				if conn.LocalAddr().Network() == "unix" {
 					fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
 				} else {
@@ -922,7 +868,7 @@ func main() {
 
 		if *useSTUN {
 			if *localbind == "" {
-				panic("-turn need be with -bind while connecting")
+				panic("-stun need be with -bind while connecting")
 			}
 			err = ShowPublicIP(network, localAddr.String())
 			if err != nil {

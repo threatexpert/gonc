@@ -3,6 +3,7 @@ package easyp2p
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -48,6 +49,28 @@ func TestStunN(t *testing.T) {
 			fmt.Printf("    Local IP: %s, NAT IP: %s\n", r.Local, r.Nat)
 		}
 	}
+}
+
+func TestGetFreePort(t *testing.T) {
+	port, err := GetFreePort()
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	tcpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("failed to Listen port: %v", err)
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	tcpListener.Close()
+	udpConn.Close()
+	fmt.Printf("done: port: %d\n", port)
 }
 
 // ======= 以下是测试数据生成 =======

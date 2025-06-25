@@ -525,8 +525,9 @@ func GetFreePort() (int, error) {
 		port := addr.Port
 
 		// 尝试绑定相同端口的 UDP
-		udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+		udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 		if err != nil {
+			tcpListener.Close()
 			return 0, fmt.Errorf("ResolveUDPAddr failed: %v", err)
 		}
 		udpConn, err := net.ListenUDP("udp", udpAddr)
