@@ -22,8 +22,8 @@ import (
 	"time"
 	"unicode"
 
-	"gonc/easyp2p"
-	"gonc/misc"
+	"github.com/threatexpert/gonc/easyp2p"
+	"github.com/threatexpert/gonc/misc"
 
 	// "net/http"
 	// _ "net/http/pprof"

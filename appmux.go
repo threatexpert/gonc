@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"gonc/easyp2p"
 	"io"
 	"log"
 	"net"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/threatexpert/gonc/easyp2p"
 	"github.com/xtaci/smux"
 )
 
