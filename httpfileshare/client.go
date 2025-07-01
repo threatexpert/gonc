@@ -420,6 +420,21 @@ func (c *Client) worker(ctx context.Context) {
 	}
 }
 
+func encodePathSegmentPreservingSlashes(pathStr string) string {
+	if pathStr == "" {
+		return ""
+	}
+	// Split the path into segments
+	parts := strings.Split(pathStr, "/")
+	var encodedParts []string
+	for _, part := range parts {
+		// Encode each segment. url.PathEscape is safe for individual segments.
+		encodedParts = append(encodedParts, url.PathEscape(part))
+	}
+	// Rejoin with slashes
+	return strings.Join(encodedParts, "/")
+}
+
 // downloadFile downloads a single file, supporting resume with Range header.
 func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, fileInfo FileInfo) error {
 	select {
@@ -433,22 +448,18 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		return err
 	}
 
-	serverBaseURLPath := path.Clean(remoteURL.Path)
-	if serverBaseURLPath == "." {
-		serverBaseURLPath = "/"
-	} else if !strings.HasPrefix(serverBaseURLPath, "/") {
-		serverBaseURLPath = "/" + serverBaseURLPath
+	standardizedPath := filepath.ToSlash(fileInfo.Path)
+
+	// 2. 对路径进行 URL 编码，保留斜杠。
+	//    这将处理路径中包含的 # 等特殊字符，将它们编码为 %23，而不是被 url.Parse 识别为 Fragment。
+	encodedFileInfoURLPath := encodePathSegmentPreservingSlashes(standardizedPath)
+
+	parsedFileInfoURLPath, err := url.Parse(encodedFileInfoURLPath)
+	if err != nil {
+		return fmt.Errorf("error parsing fileInfo.Path '%s' as URL: %w", fileInfo.Path, err)
 	}
 
-	actualDownloadPathOnServer := serverBaseURLPath
-	if fileInfo.Path != "" {
-		if !strings.HasSuffix(serverBaseURLPath, "/") {
-			actualDownloadPathOnServer += "/"
-		}
-		actualDownloadPathOnServer += filepath.ToSlash(fileInfo.Path)
-	}
-
-	downloadURL := remoteURL.Scheme + "://" + remoteURL.Host + actualDownloadPathOnServer
+	downloadURL := remoteURL.ResolveReference(parsedFileInfoURLPath).String()
 
 	proposedLocalPath := filepath.Join(c.config.LocalDir, filepath.FromSlash(fileInfo.Path))
 	cleanedLocalPath := filepath.Clean(proposedLocalPath)
