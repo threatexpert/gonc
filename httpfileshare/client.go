@@ -416,7 +416,7 @@ func (c *Client) worker(ctx context.Context) {
 			continue // Skip to next file in queue
 		}
 		c.progressTracker.FileCompleted()
-		c.progressTracker.PrintProgress(true, false) // Force a final progress update for overall count
+		c.progressTracker.PrintProgress(false, false) // Force a final progress update for overall count
 	}
 }
 
