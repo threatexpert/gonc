@@ -87,6 +87,7 @@ var (
 	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
 	useDNS            = flag.String("dns", "", "set DNS Server")
 	runAppFileServ    = flag.String("httpserver", "", "http server root directory")
+	runAppFileGet     = flag.String("download", "", "http client download directory")
 	appMuxListenMode  = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
 	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for remote httpserver")
 	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
@@ -102,7 +103,7 @@ func init() {
 	flag.IntVar(&easyp2p.PunchingRandomPortCount, "punch-random-count", easyp2p.PunchingRandomPortCount, "")
 	flag.BoolVar(appMuxListenMode, "socks5local", false, "")
 	flag.StringVar(appMuxListenOn, "socks5local-port", "", "")
-	flag.BoolVar(appMuxListenMode, "download", false, "alias for -httplocal")
+	flag.BoolVar(appMuxListenMode, "browser", false, "alias for -httplocal")
 	flag.IntVar(&udpOutputBlockSize, "udp-size", udpOutputBlockSize, "")
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", kcpWindowSize, "")
 }
@@ -431,7 +432,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9.3")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.4")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -502,6 +503,13 @@ func main() {
 			*MQTTWait = "hello"
 		}
 		*progressEnabled = true
+		*keepOpen = true
+	} else if *runAppFileGet != "" {
+		escapedPath := strings.ReplaceAll(*runAppFileGet, "\\", "/")
+		*runCmd = fmt.Sprintf("-app-mux httpclient \"%s\"", escapedPath)
+		if *MQTTPush == "" {
+			*MQTTPush = "hello"
+		}
 		*keepOpen = true
 	} else if *appMuxSocksMode {
 		*runCmd = "-app-mux socks5"

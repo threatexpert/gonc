@@ -2,18 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/threatexpert/gonc/easyp2p"
+	"github.com/threatexpert/gonc/httpfileshare"
 	"github.com/xtaci/smux"
 )
 
@@ -30,7 +31,7 @@ type MuxSessionConfig struct {
 	AppMode     string
 	Host        string // for forward
 	Port        string
-	RootDir     string // for httpserver
+	HttpDir     string // for httpserver/httpclient
 	SessionConn net.Conn
 }
 
@@ -147,6 +148,7 @@ func mux_usage() {
 	fmt.Fprintln(os.Stderr, "   -app-mux target_host target_port")
 	fmt.Fprintln(os.Stderr, "   -app-mux socks5")
 	fmt.Fprintln(os.Stderr, "   -app-mux httpserver <rootDir>")
+	fmt.Fprintln(os.Stderr, "   -app-mux httpclient <saveDir>")
 	fmt.Fprintln(os.Stderr, "   -app-mux -l listen_port")
 }
 
@@ -162,6 +164,11 @@ func mux_main() {
 		appMode = "socks5"
 	} else if len(args) >= 1 && args[0] == "httpserver" {
 		appMode = "httpserver"
+		if len(args) > 1 {
+			httpServeDir = args[1]
+		}
+	} else if len(args) >= 1 && args[0] == "httpclient" {
+		appMode = "httpclient"
 		if len(args) > 1 {
 			httpServeDir = args[1]
 		}
@@ -259,7 +266,7 @@ func mux_main() {
 		AppMode:     appMode,
 		Host:        host,
 		Port:        port,
-		RootDir:     httpServeDir,
+		HttpDir:     httpServeDir,
 		SessionConn: sessionConn,
 	}
 	err = handleMuxSession(cfg)
@@ -283,6 +290,11 @@ func App_mux_main(conn net.Conn, args []string) {
 		if len(args) > 1 {
 			httpServeDir = args[1]
 		}
+	} else if len(args) >= 1 && args[0] == "httpclient" {
+		appMode = "httpclient"
+		if len(args) > 1 {
+			httpServeDir = args[1]
+		}
 	} else if len(args) == 2 {
 		host = args[0]
 		port = args[1]
@@ -297,7 +309,7 @@ func App_mux_main(conn net.Conn, args []string) {
 		AppMode:     appMode,
 		Host:        host,
 		Port:        port,
-		RootDir:     httpServeDir,
+		HttpDir:     httpServeDir,
 		SessionConn: conn,
 	}
 
@@ -310,19 +322,62 @@ func App_mux_main(conn net.Conn, args []string) {
 func handleMuxSession(cfg MuxSessionConfig) error {
 	switch cfg.AppMode {
 	case "listen":
-		return handleListenMode(cfg)
+		return handleListenMode(cfg, nil, nil)
 	case "forward":
 		return handleForwardMode(cfg)
 	case "socks5":
 		return handleSocks5uMode(cfg)
 	case "httpserver":
 		return handleHTTPServerMode(cfg)
+	case "httpclient":
+		return handleHTTPClientMode(cfg)
 	default:
 		return fmt.Errorf("unsupported app mode: %s", cfg.AppMode)
 	}
 }
 
-func handleListenMode(cfg MuxSessionConfig) error {
+func handleHTTPClientMode(cfg MuxSessionConfig) error {
+	cfg.Port = "0"
+	serverURL := ""
+	listenAddrChan := make(chan string, 1)
+	ctx, done := context.WithCancel(context.Background())
+	go handleListenMode(cfg, listenAddrChan, done)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case webHost := <-listenAddrChan:
+		serverURL = fmt.Sprintf("http://%s/", webHost)
+		httpcfg := httpfileshare.ClientConfig{
+			ServerURL:              serverURL,
+			LocalDir:               cfg.HttpDir,
+			Concurrency:            2,
+			Resume:                 true,
+			DryRun:                 false,
+			Verbose:                false,
+			LoggerOutput:           io.Discard,
+			ProgressOutput:         os.Stderr,
+			ProgressUpdateInterval: 1 * time.Second,
+		}
+
+		c, err := httpfileshare.NewClient(httpcfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create HTTP client: %v\n", err)
+			return err
+		}
+		if err := c.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Client operation failed: %v\n", err)
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+}
+
+func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done context.CancelFunc) error {
+	if done != nil {
+		defer done()
+	}
 	fmt.Fprintln(os.Stderr, "Waiting for app-mux handshake...")
 	hello := make([]byte, 16)
 	if _, err := io.ReadFull(cfg.SessionConn, hello); err != nil {
@@ -350,6 +405,8 @@ func handleListenMode(cfg MuxSessionConfig) error {
 		return fmt.Errorf("listen failed: %v", err)
 	}
 
+	actualListenAddr := ln.Addr().String()
+
 	fmt.Fprintf(os.Stderr, "[%s] Listening on %s\n", peerMode, ln.Addr().String())
 	if peerMode == "httpserver" {
 		_, port, _ := net.SplitHostPort(ln.Addr().String())
@@ -357,6 +414,10 @@ func handleListenMode(cfg MuxSessionConfig) error {
 	}
 	if cfg.Port == "0" {
 		muxLastListenAddress = ln.Addr().String()
+	}
+
+	if notifyAddrChan != nil { // 检查 channel 是否为 nil，因为其他模式调用 handleListenMode 时可能不需要通知
+		notifyAddrChan <- actualListenAddr // 将实际地址发送给 channel
 	}
 
 	// session health check
@@ -375,12 +436,8 @@ func handleListenMode(cfg MuxSessionConfig) error {
 	go func() {
 		var stream net.Conn
 		var err error
-		switch s := session.(type) {
-		case *yamux.Session:
-			stream, err = s.Accept()
-		case *smux.Session:
-			stream, err = s.AcceptStream()
-		}
+		ln := muxListener{session}
+		stream, err = ln.Accept()
 		sessErr = fmt.Errorf("mux session unexpected behavior: %v", err)
 		if err == nil {
 			stream.Close()
@@ -434,14 +491,12 @@ func handleForwardMode(cfg MuxSessionConfig) error {
 
 	fmt.Fprintln(os.Stderr, "forward ready on mux")
 
+	ln := &muxListener{session}
+
 	for {
 		var stream net.Conn
-		switch s := session.(type) {
-		case *yamux.Session:
-			stream, err = s.Accept()
-		case *smux.Session:
-			stream, err = s.AcceptStream()
-		}
+		stream, err = ln.Accept()
+
 		if err != nil {
 			return fmt.Errorf("accept mux stream failed: %v", err)
 		}
@@ -477,31 +532,28 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	handler := createHTTPHandler(cfg.RootDir)
+	ln := &muxListener{session}
+	enableGzip := true
+
+	if easyp2p.IsPeerSameLAN(cfg.SessionConn) {
+		enableGzip = false // 如果是同一局域网内的连接，则禁用 Gzip 压缩
+	}
+
+	srvcfg := httpfileshare.ServerConfig{ // Use ServerConfig
+		RootDirectory: cfg.HttpDir,
+		LoggerOutput:  os.Stderr,
+		EnableGzip:    enableGzip,
+		Listener:      ln,
+	}
+
+	server, err := httpfileshare.NewServer(srvcfg)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
 
 	fmt.Fprintln(os.Stderr, "httpserver ready on mux")
 
-	for {
-		var stream net.Conn
-		switch s := session.(type) {
-		case *yamux.Session:
-			stream, err = s.Accept()
-		case *smux.Session:
-			stream, err = s.AcceptStream()
-		}
-		if err != nil {
-			return fmt.Errorf("accept mux stream failed: %v", err)
-		}
-
-		go func(conn net.Conn) {
-			defer conn.Close()
-			listener := &singleConnListener{
-				conn: conn,
-				done: make(chan struct{}),
-			}
-			_ = http.Serve(listener, handler)
-		}(&streamWrapper{Conn: stream})
-	}
+	return server.Start()
 }
 
 func sendHello(conn net.Conn, mode string) error {
@@ -537,41 +589,4 @@ func isSessionClosed(session interface{}) bool {
 	default:
 		return true
 	}
-}
-
-type singleConnListener struct {
-	conn net.Conn
-	done chan struct{}
-}
-
-func (l *singleConnListener) Accept() (net.Conn, error) {
-	if l.conn != nil {
-		c := l.conn
-		l.conn = nil
-		return c, nil
-	}
-	<-l.done
-	return nil, fmt.Errorf("listener closed")
-}
-
-func (l *singleConnListener) Close() error {
-	close(l.done)
-	return nil
-}
-
-func (l *singleConnListener) Addr() net.Addr {
-	return dummyAddr("stream")
-}
-
-// rootDir 是你希望暴露的目录，比如 "./public"
-func createHTTPHandler(rootDir string) http.Handler {
-	fs := http.FileServer(http.Dir(rootDir))
-	return loggingMiddleware(http.StripPrefix("/", fs))
-}
-
-func loggingMiddleware(handler http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.Path)
-		handler.ServeHTTP(w, r)
-	})
 }

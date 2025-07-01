@@ -531,6 +531,18 @@ func extractIP(addr string) string {
 	return host
 }
 
+func IsPeerSameLAN(conn net.Conn) bool {
+	localIP, _, err := net.SplitHostPort(conn.LocalAddr().String())
+	if err != nil {
+		return false
+	}
+	remoteIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return false
+	}
+	return IsSameLAN(localIP, remoteIP)
+}
+
 func IsSameLAN(ip1, ip2 string) bool {
 	parsed1 := net.ParseIP(ip1)
 	parsed2 := net.ParseIP(ip2)
