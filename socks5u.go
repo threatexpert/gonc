@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,16 +46,40 @@ const (
 	AUTH_NO_AUTH               = 0x00
 	AUTH_USERNAME_PASSWORD     = 0x02
 	AUTH_NO_ACCEPTABLE_METHODS = 0xFF
+	// 用户名/密码认证状态
+	AUTH_STATUS_SUCCESS byte = 0x00 // 认证成功
+	AUTH_STATUS_FAILURE byte = 0x01 // 认证失败
 
 	// 隧道请求前缀
 	TUNNEL_REQ_TCP = "tcp://"
 	TUNNEL_REQ_UDP = "udp://"
 )
 
+// Socks5ServerConfig 用于配置 SOCKS5 服务器的行为，包括认证
+type Socks5ServerConfig struct {
+	// AuthenticateUser 是一个函数，用于验证用户名和密码。
+	// 如果配置为 nil，则表示服务器不要求用户密码认证。
+	// 如果非 nil，服务器将要求客户端进行用户密码认证。
+	AuthenticateUser func(username, password string) bool
+}
+
+// sendSocks5AuthResponse 发送 SOCKS5 用户名/密码认证阶段的响应
+func sendSocks5AuthResponse(conn net.Conn, status byte) error {
+	_, err := conn.Write([]byte{0x01, status})
+	return err
+}
+
+type Socks5Request struct {
+	Command string
+	Host    string
+	Port    int
+}
+
 // handleSocks5Handshake 处理 SOCKS5 握手阶段
-func handleSocks5Handshake(conn net.Conn) error {
+func handleSocks5Handshake(conn net.Conn, config Socks5ServerConfig) error {
 	buf := make([]byte, 256)
 
+	// 1. 读取 VER (版本) 和 NMETHODS (方法数量)
 	_, err := io.ReadFull(conn, buf[:2])
 	if err != nil {
 		return fmt.Errorf("read VER and NMETHODS error: %w", err)
@@ -66,27 +91,122 @@ func handleSocks5Handshake(conn net.Conn) error {
 		return fmt.Errorf("unsupported SOCKS version: %d", ver)
 	}
 
-	_, err = io.ReadFull(conn, buf[:nMethods])
+	// 2. 读取客户端支持的 METHODS (认证方法列表)
+	methodsBuf := make([]byte, nMethods)
+	_, err = io.ReadFull(conn, methodsBuf)
 	if err != nil {
 		return fmt.Errorf("read METHODS error: %w", err)
 	}
 
-	_, err = conn.Write([]byte{SOCKS5_VERSION, 0x00}) // No authentication required
-	if err != nil {
-		return fmt.Errorf("write authentication response error: %w", err)
+	// 3. 选择服务器偏好的认证方法
+	var chosenMethod byte = 0xFF // 默认：无可用方法
+
+	// 检查服务器是否要求认证
+	if config.AuthenticateUser != nil {
+		// 服务器要求认证，优先选择 USERNAME/PASSWORD
+		for _, method := range methodsBuf {
+			if method == AUTH_USERNAME_PASSWORD {
+				chosenMethod = AUTH_USERNAME_PASSWORD
+				break
+			}
+		}
+		if chosenMethod == 0xFF {
+			// 客户端没有提供 USERNAME/PASSWORD 方法，但服务器要求认证
+			// 发送 0xFF 回应表示没有可接受的方法
+			_, writeErr := conn.Write([]byte{SOCKS5_VERSION, 0xFF})
+			if writeErr != nil {
+				return fmt.Errorf("failed to send no acceptable methods response: %w", writeErr)
+			}
+			return fmt.Errorf("authentication required by server, but client did not offer USERNAME/PASSWORD method")
+		}
+	} else {
+		// 服务器不要求认证，优先选择 NO AUTHENTICATION REQUIRED
+		for _, method := range methodsBuf {
+			if method == AUTH_NO_AUTH {
+				chosenMethod = AUTH_NO_AUTH
+				break
+			}
+		}
+		if chosenMethod == 0xFF {
+			// 客户端没有提供 NO AUTHENTICATION REQUIRED 方法，但服务器不要求认证
+			// 理论上客户端总会提供 0x00，但为了健壮性，如果没找到也报错
+			_, writeErr := conn.Write([]byte{SOCKS5_VERSION, 0xFF})
+			if writeErr != nil {
+				return fmt.Errorf("failed to send no acceptable methods response: %w", writeErr)
+			}
+			return fmt.Errorf("no acceptable authentication methods offered by client (expected NO AUTHENTICATION REQUIRED)")
+		}
 	}
+
+	// 4. 向客户端发送方法选择响应 (VER, CHOSEN_METHOD)
+	_, err = conn.Write([]byte{SOCKS5_VERSION, chosenMethod})
+	if err != nil {
+		return fmt.Errorf("send method selection response error: %w", err)
+	}
+
+	// 5. 如果选择了 USERNAME/PASSWORD 认证，则进行认证子协商
+	if chosenMethod == AUTH_USERNAME_PASSWORD {
+		// 读取认证子协商的 VER (版本，应为 0x01)
+		_, err := io.ReadFull(conn, buf[:1])
+		if err != nil {
+			return fmt.Errorf("read auth sub-negotiation VER error: %w", err)
+		}
+		authVer := buf[0]
+		if authVer != 0x01 {
+			sendSocks5AuthResponse(conn, AUTH_STATUS_FAILURE)
+			return fmt.Errorf("unsupported authentication sub-negotiation version: %d", authVer)
+		}
+
+		// 读取 ULEN (用户名长度)
+		_, err = io.ReadFull(conn, buf[:1])
+		if err != nil {
+			return fmt.Errorf("read ULEN error: %w", err)
+		}
+		uLen := int(buf[0])
+
+		// 读取 UNAME (用户名)
+		usernameBuf := make([]byte, uLen)
+		_, err = io.ReadFull(conn, usernameBuf)
+		if err != nil {
+			return fmt.Errorf("read UNAME error: %w", err)
+		}
+		username := string(usernameBuf)
+
+		// 读取 PLEN (密码长度)
+		_, err = io.ReadFull(conn, buf[:1])
+		if err != nil {
+			return fmt.Errorf("read PLEN error: %w", err)
+		}
+		pLen := int(buf[0])
+
+		// 读取 PASSWD (密码)
+		passwordBuf := make([]byte, pLen)
+		_, err = io.ReadFull(conn, passwordBuf)
+		if err != nil {
+			return fmt.Errorf("read PASSWD error: %w", err)
+		}
+		password := string(passwordBuf)
+
+		// --- 执行用户认证逻辑 ---
+		if !config.AuthenticateUser(username, password) { // 使用配置中提供的认证函数
+			sendSocks5AuthResponse(conn, AUTH_STATUS_FAILURE)
+			return fmt.Errorf("authentication failed for user: %s", username)
+		}
+
+		// 认证成功，发送认证成功响应
+		sendSocks5AuthResponse(conn, AUTH_STATUS_SUCCESS)
+	}
+
 	return nil
 }
 
 // handleSocks5Request 处理 SOCKS5 请求阶段
-func handleSocks5Request(clientConn net.Conn, tunnelStream net.Conn) (string, error) {
+func handleSocks5Request(clientConn net.Conn) (*Socks5Request, error) {
 	buf := make([]byte, 256)
-
-	clientConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 
 	_, err := io.ReadFull(clientConn, buf[:4])
 	if err != nil {
-		return "", fmt.Errorf("read VER, CMD, RSV, ATYP error: %w", err)
+		return nil, fmt.Errorf("read VER, CMD, RSV, ATYP error: %w", err)
 	}
 	ver := buf[0]
 	cmd := buf[1]
@@ -94,7 +214,7 @@ func handleSocks5Request(clientConn net.Conn, tunnelStream net.Conn) (string, er
 	atyp := buf[3]
 
 	if ver != SOCKS5_VERSION {
-		return "", fmt.Errorf("unsupported SOCKS version in request: %d", ver)
+		return nil, fmt.Errorf("unsupported SOCKS version in request: %d", ver)
 	}
 
 	var host string
@@ -104,60 +224,66 @@ func handleSocks5Request(clientConn net.Conn, tunnelStream net.Conn) (string, er
 	case ATYP_IPV4:
 		_, err := io.ReadFull(clientConn, buf[:4])
 		if err != nil {
-			return "", fmt.Errorf("read IPv4 address error: %w", err)
+			return nil, fmt.Errorf("read IPv4 address error: %w", err)
 		}
 		host = net.IPv4(buf[0], buf[1], buf[2], buf[3]).String()
 
 		_, err = io.ReadFull(clientConn, buf[:2])
 		if err != nil {
-			return "", fmt.Errorf("read port error: %w", err)
+			return nil, fmt.Errorf("read port error: %w", err)
 		}
 		port = int(buf[0])<<8 | int(buf[1])
 	case ATYP_DOMAINNAME:
 		_, err := io.ReadFull(clientConn, buf[:1])
 		if err != nil {
-			return "", fmt.Errorf("read domain length error: %w", err)
+			return nil, fmt.Errorf("read domain length error: %w", err)
 		}
 		domainLen := int(buf[0])
 
 		_, err = io.ReadFull(clientConn, buf[:domainLen])
 		if err != nil {
-			return "", fmt.Errorf("read domain name error: %w", err)
+			return nil, fmt.Errorf("read domain name error: %w", err)
 		}
 		host = string(buf[:domainLen])
 
 		_, err = io.ReadFull(clientConn, buf[:2])
 		if err != nil {
-			return "", fmt.Errorf("read port error: %w", err)
+			return nil, fmt.Errorf("read port error: %w", err)
 		}
 		port = int(buf[0])<<8 | int(buf[1])
 	case ATYP_IPV6:
 		_, err := io.ReadFull(clientConn, buf[:16])
 		if err != nil {
-			return "", fmt.Errorf("read IPv6 address error: %w", err)
+			return nil, fmt.Errorf("read IPv6 address error: %w", err)
 		}
 		host = net.IP(buf[:16]).String()
 
 		_, err = io.ReadFull(clientConn, buf[:2])
 		if err != nil {
-			return "", fmt.Errorf("read port error: %w", err)
+			return nil, fmt.Errorf("read port error: %w", err)
 		}
 		port = int(buf[0])<<8 | int(buf[1])
 	default:
 		sendSocks5Response(clientConn, REP_ADDRESS_TYPE_NOT_SUPPORTED, "0.0.0.0", 0)
-		return "", fmt.Errorf("unsupported address type: %d", atyp)
+		return nil, fmt.Errorf("unsupported address type: %d", atyp)
 	}
-
-	clientConn.SetReadDeadline(time.Time{})
 
 	switch cmd {
 	case CMD_CONNECT:
-		return "CONNECT", handleTCPConnectViaTunnel(clientConn, tunnelStream, host, port)
+		return &Socks5Request{
+			Command: "CONNECT",
+			Host:    host,
+			Port:    port,
+		}, nil
 	case CMD_UDP_ASSOCIATE:
-		return "UDP", handleUDPAssociateViaTunnel(clientConn, tunnelStream, host, port)
+		return &Socks5Request{
+			Command: "UDP",
+			Host:    host,
+			Port:    port,
+		}, nil
 	default:
 		sendSocks5Response(clientConn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
-		return "", fmt.Errorf("unsupported command: %d", cmd)
+		return nil, fmt.Errorf("unsupported command: %d", cmd)
 	}
 }
 
@@ -460,24 +586,60 @@ func handleLocalUDPToTunnel(localUDPConn *net.UDPConn, tunnelStream net.Conn, cl
 	wg.Wait()
 }
 
+func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort int) error {
+
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+	targetConn, err := net.Dial("tcp", targetAddr)
+	log.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+
+	if err != nil {
+		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		return fmt.Errorf("tunnel TCP connect failed: %v", err)
+	}
+	sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
+	handleProxy(clientConn, targetConn)
+	return nil
+}
+
 func handleSocks5uProxy(conn net.Conn, stream net.Conn) {
 	log.Printf("New client connected from %s", conn.RemoteAddr())
 
+	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+
 	// 1. SOCKS5 握手
-	err := handleSocks5Handshake(conn)
+	configNoAuth := Socks5ServerConfig{
+		AuthenticateUser: nil, // 不要求认证
+	}
+	err := handleSocks5Handshake(conn, configNoAuth)
 	if err != nil {
 		log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
 	// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
-	cmd, err := handleSocks5Request(conn, stream)
+	req, err := handleSocks5Request(conn)
 	if err != nil {
 		log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
-	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), cmd)
+	conn.SetReadDeadline(time.Time{})
+
+	if req.Command == "CONNECT" {
+		err = handleTCPConnectViaTunnel(conn, stream, req.Host, req.Port)
+		if err != nil {
+			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
+	} else if req.Command == "UDP" {
+		err = handleUDPAssociateViaTunnel(conn, stream, req.Host, req.Port)
+		if err != nil {
+			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
+	}
+
+	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
 }
 
 func ReadString(conn io.Reader, delim byte) (string, error) {
@@ -1395,4 +1557,81 @@ func socks5ReplyCodeToString(code byte) string {
 	default:
 		return fmt.Sprintf("Unknown error (%d)", code)
 	}
+}
+
+func App_s5s_main(conn net.Conn, args []string) {
+	defer conn.Close()
+
+	user, pass := "", ""
+	authFlag := ""
+	for i, arg := range args {
+		if arg == "-auth" && i+1 < len(args) {
+			authFlag = args[i+1]
+			break
+		}
+	}
+
+	if authFlag != "" {
+		authParts := strings.SplitN(authFlag, ":", 2)
+		if len(authParts) != 2 {
+			fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
+			os.Exit(1)
+		}
+		user, pass = authParts[0], authParts[1]
+	}
+	config := Socks5ServerConfig{
+		AuthenticateUser: nil,
+	}
+	if user != "" || pass != "" {
+		config.AuthenticateUser = func(username, password string) bool {
+			return username == user && password == pass
+		}
+	}
+	log.Printf("New client connected from %s", conn.RemoteAddr())
+
+	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+
+	// 1. SOCKS5 握手
+	err := handleSocks5Handshake(conn, config)
+	if err != nil {
+		log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
+	req, err := handleSocks5Request(conn)
+	if err != nil {
+		log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	conn.SetReadDeadline(time.Time{})
+
+	if req.Command == "CONNECT" {
+		err = handleDirectTCPConnect(conn, req.Host, req.Port)
+		if err != nil {
+			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
+		}
+	} else if req.Command == "UDP" {
+		fakeTunnelC, fakeTunnelS := net.Pipe()
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			defer c.Close()
+			handleMuxStream(c)
+		}(fakeTunnelS)
+
+		err = handleUDPAssociateViaTunnel(conn, fakeTunnelC, req.Host, req.Port)
+		if err != nil {
+			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
+		}
+		fakeTunnelC.Close()
+		fakeTunnelS.Close()
+		wg.Wait()
+	} else {
+		sendSocks5Response(conn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
+	}
+
+	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
 }

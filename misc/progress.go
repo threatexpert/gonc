@@ -125,6 +125,13 @@ func (p *PipeConn) Close() error {
 	return nil
 }
 
+func (p *PipeConn) CloseWrite() error {
+	if c, ok := p.out.(io.Closer); ok {
+		c.Close()
+	}
+	return nil
+}
+
 // 保持其他方法（使用原始连接）
 func (p *PipeConn) LocalAddr() net.Addr {
 	return p.Conn.LocalAddr()

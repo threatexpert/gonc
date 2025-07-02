@@ -1165,7 +1165,8 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			return
 		}
 
-		if strings.TrimLeft(args[0], "-") == "app-mux" {
+		builtinApp := strings.TrimLeft(args[0], "-")
+		if builtinApp == "app-mux" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
@@ -1173,6 +1174,22 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			defer pipeConn.In.Close()
 			defer pipeConn.Out.Close()
 			go App_mux_main(pipeConn, args[1:])
+		} else if builtinApp == "app-s5s" {
+			pipeConn := misc.NewPipeConn(conn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			defer pipeConn.In.Close()
+			defer pipeConn.Out.Close()
+			go App_s5s_main(pipeConn, args[1:])
+		} else if builtinApp == "app-pf" {
+			pipeConn := misc.NewPipeConn(conn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			defer pipeConn.In.Close()
+			defer pipeConn.Out.Close()
+			go App_pf_main(pipeConn, args[1:])
 		} else {
 
 			// 创建命令
@@ -1774,4 +1791,22 @@ func cleanupUnixSocket(path string) error {
 		return fmt.Errorf("path %s exists but is not a Unix socket (mode: %s), refusing to remove it", path, fileInfo.Mode().String())
 	}
 	return nil
+}
+
+// Port Forwarding
+func App_pf_main(conn net.Conn, args []string) {
+	defer conn.Close()
+
+	if len(args) != 2 {
+		fmt.Fprintf(os.Stderr, "[Port Forwarding]: 2 args expected: <host> <port>\n")
+		os.Exit(1)
+	}
+
+	targetAddr := net.JoinHostPort(args[0], args[1])
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		return
+	}
+
+	handleProxy(conn, targetConn)
 }
