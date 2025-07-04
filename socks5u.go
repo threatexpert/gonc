@@ -1559,32 +1559,54 @@ func socks5ReplyCodeToString(code byte) string {
 	}
 }
 
-func App_s5s_main(conn net.Conn, args []string) {
+type AppS5SConfig struct {
+	username string
+	password string
+}
+
+func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
+	config := &AppS5SConfig{}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "-auth":
+			// 检查是否有-auth对应的值
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("missing value for -auth. Expected user:pass")
+			}
+			authFlag := args[i+1]
+
+			// 解析 user:pass
+			authParts := strings.SplitN(authFlag, ":", 2)
+			if len(authParts) != 2 {
+				return nil, fmt.Errorf("invalid auth format for -auth: %s. Expected user:pass", authFlag)
+			}
+			config.username, config.password = authParts[0], authParts[1]
+			i++ // 跳过已经处理过的-auth的值
+		default:
+			return nil, fmt.Errorf("unknown argument: %s", arg)
+		}
+	}
+
+	return config, nil
+}
+
+func App_s5s_usage() {
+	fmt.Fprintln(os.Stderr, "Usage: -app-s5s [options]")
+	fmt.Fprintln(os.Stderr, "Options:")
+	fmt.Fprintln(os.Stderr, "  -auth user:pass   Set username and password for SOCKS5 authentication")
+}
+
+func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 	defer conn.Close()
 
-	user, pass := "", ""
-	authFlag := ""
-	for i, arg := range args {
-		if arg == "-auth" && i+1 < len(args) {
-			authFlag = args[i+1]
-			break
-		}
-	}
-
-	if authFlag != "" {
-		authParts := strings.SplitN(authFlag, ":", 2)
-		if len(authParts) != 2 {
-			fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
-			os.Exit(1)
-		}
-		user, pass = authParts[0], authParts[1]
-	}
-	config := Socks5ServerConfig{
+	s5config := Socks5ServerConfig{
 		AuthenticateUser: nil,
 	}
-	if user != "" || pass != "" {
-		config.AuthenticateUser = func(username, password string) bool {
-			return username == user && password == pass
+	if config.username != "" || config.password != "" {
+		s5config.AuthenticateUser = func(username, password string) bool {
+			return username == config.username && password == config.password
 		}
 	}
 	log.Printf("New client connected from %s", conn.RemoteAddr())
@@ -1592,7 +1614,7 @@ func App_s5s_main(conn net.Conn, args []string) {
 	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 
 	// 1. SOCKS5 握手
-	err := handleSocks5Handshake(conn, config)
+	err := handleSocks5Handshake(conn, s5config)
 	if err != nil {
 		log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
 		return

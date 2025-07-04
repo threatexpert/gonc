@@ -19,32 +19,25 @@ import (
 )
 
 var (
-	muxSessionMode       = flag.String("mux-mode", "stdio", "connect | listen | stdio")
-	muxSessionAddress    = flag.String("mux-address", "", "host:port (for connect or listen mode)")
+	//muxSessionMode       = flag.String("mux-mode", "stdio", "connect | listen | stdio")
+	//muxSessionAddress    = flag.String("mux-address", "", "host:port (for connect or listen mode)")
 	muxEngine            = flag.String("mux-engine", "smux", "yamux | smux")
 	httpServeDir         = "."
 	muxLastListenAddress = ""
 )
 
-type MuxSessionConfig struct {
-	Engine      string
-	AppMode     string
-	Host        string // for forward
-	Port        string
-	HttpDir     string // for httpserver/httpclient
-	SessionConn net.Conn
+type AppMuxConfig struct {
+	Engine  string
+	AppMode string
+	Host    string // for forward
+	Port    string
+	HttpDir string // for httpserver/httpclient
 }
 
-type stdioConn struct{}
-
-func (s *stdioConn) Read(p []byte) (int, error)         { return os.Stdin.Read(p) }
-func (s *stdioConn) Write(p []byte) (int, error)        { return os.Stdout.Write(p) }
-func (s *stdioConn) Close() error                       { return nil }
-func (s *stdioConn) LocalAddr() net.Addr                { return dummyAddr("stdio") }
-func (s *stdioConn) RemoteAddr() net.Addr               { return dummyAddr("stdio") }
-func (s *stdioConn) SetDeadline(t time.Time) error      { return nil }
-func (s *stdioConn) SetReadDeadline(t time.Time) error  { return nil }
-func (s *stdioConn) SetWriteDeadline(t time.Time) error { return nil }
+type MuxSessionConfig struct {
+	AppMuxConfig
+	SessionConn net.Conn
+}
 
 type dummyAddr string
 
@@ -143,7 +136,7 @@ func handleProxy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 	}
 }
 
-func mux_usage() {
+func App_mux_usage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "   -app-mux target_host target_port")
 	fmt.Fprintln(os.Stderr, "   -app-mux socks5")
@@ -152,165 +145,179 @@ func mux_usage() {
 	fmt.Fprintln(os.Stderr, "   -app-mux -l listen_port")
 }
 
-func mux_main() {
-	appMode := ""
-	host := ""
-	port := ""
-	args := flag.Args()
-	if len(args) == 1 && *listenMode {
-		port = args[0]
-		appMode = "listen"
+// type stdioConn struct{}
+
+// func (s *stdioConn) Read(p []byte) (int, error)         { return os.Stdin.Read(p) }
+// func (s *stdioConn) Write(p []byte) (int, error)        { return os.Stdout.Write(p) }
+// func (s *stdioConn) Close() error                       { return nil }
+// func (s *stdioConn) LocalAddr() net.Addr                { return dummyAddr("stdio") }
+// func (s *stdioConn) RemoteAddr() net.Addr               { return dummyAddr("stdio") }
+// func (s *stdioConn) SetDeadline(t time.Time) error      { return nil }
+// func (s *stdioConn) SetReadDeadline(t time.Time) error  { return nil }
+// func (s *stdioConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// func mux_main() {
+// 	appMode := ""
+// 	host := ""
+// 	port := ""
+// 	args := flag.Args()
+// 	if len(args) == 1 && *listenMode {
+// 		port = args[0]
+// 		appMode = "listen"
+// 	} else if len(args) == 1 && args[0] == "socks5" {
+// 		appMode = "socks5"
+// 	} else if len(args) >= 1 && args[0] == "httpserver" {
+// 		appMode = "httpserver"
+// 		if len(args) > 1 {
+// 			httpServeDir = args[1]
+// 		}
+// 	} else if len(args) >= 1 && args[0] == "httpclient" {
+// 		appMode = "httpclient"
+// 		if len(args) > 1 {
+// 			httpServeDir = args[1]
+// 		}
+// 	} else if len(args) == 2 {
+// 		host = args[0]
+// 		port = args[1]
+// 		appMode = "forward"
+// 	} else {
+// 		App_mux_usage()
+// 		os.Exit(1)
+// 	}
+
+// 	if *udpProtocol {
+// 		fmt.Fprintf(os.Stderr, "-app-mux and -u cannot be used together\n")
+// 		os.Exit(1)
+// 	}
+// 	if *runCmd != "" {
+// 		fmt.Fprintf(os.Stderr, "-app-mux and -exec cannot be used together\n")
+// 		os.Exit(1)
+// 	}
+
+// 	var sessionConn net.Conn
+// 	var err error
+// 	var localAddr net.Addr
+
+// 	init_TLS(false)
+
+// 	dialer := createClientDialer()
+
+// 	switch *muxSessionMode {
+// 	case "connect":
+// 		if *muxSessionAddress == "" {
+// 			fmt.Fprintln(os.Stderr, "Error: -mux-address required for connect mode")
+// 			os.Exit(1)
+// 		}
+// 		if *localbind != "" {
+// 			localAddr, err = net.ResolveTCPAddr("tcp", *localbind)
+// 			if err != nil {
+// 				panic(err)
+// 			}
+// 			d := &net.Dialer{
+// 				LocalAddr: localAddr,
+// 				Control:   easyp2p.ControlTCP,
+// 			}
+// 			sessionConn, err = d.Dial("tcp", *muxSessionAddress)
+// 		} else {
+// 			sessionConn, err = dialer.Dial("tcp", *muxSessionAddress)
+// 		}
+// 		if err != nil {
+// 			fmt.Fprintf(os.Stderr, "Connect failed: %v\n", err)
+// 			os.Exit(1)
+// 		}
+// 		fmt.Fprintln(os.Stderr, "MUX Session: connected to", *muxSessionAddress)
+
+// 	case "listen":
+// 		*listenMode = true
+// 		if *muxSessionAddress == "" {
+// 			fmt.Fprintln(os.Stderr, "Error: -mux-address required for listen mode")
+// 			os.Exit(1)
+// 		}
+// 		ln, err := net.Listen("tcp", *muxSessionAddress)
+// 		if err != nil {
+// 			fmt.Fprintf(os.Stderr, "Listen failed: %v\n", err)
+// 			os.Exit(1)
+// 		}
+// 		fmt.Fprintln(os.Stderr, "Session: listening on", *muxSessionAddress)
+// 		sessionConn, err = ln.Accept()
+// 		if err != nil {
+// 			fmt.Fprintf(os.Stderr, "Accept failed: %v\n", err)
+// 			os.Exit(1)
+// 		}
+// 		fmt.Fprintln(os.Stderr, "MUX Session: accepted connection")
+
+// 	case "stdio":
+// 		sessionConn = &stdioConn{}
+// 		fmt.Fprintln(os.Stderr, "MUX Session: using stdio")
+
+// 	default:
+// 		fmt.Fprintf(os.Stderr, "Unknown mux-mode: %s\n", *muxSessionMode)
+// 		os.Exit(1)
+// 	}
+
+// 	configTCPKeepalive(sessionConn)
+// 	if isTLSEnabled() {
+// 		conn_tls := do_TLS(sessionConn)
+// 		if conn_tls == nil {
+// 			return
+// 		}
+// 		defer conn_tls.Close()
+// 		sessionConn = conn_tls
+// 	}
+
+// 	cfg := MuxSessionConfig{
+// 		AppMuxConfig: AppMuxConfig{
+// 			Engine:  *muxEngine,
+// 			AppMode: appMode,
+// 			Host:    host,
+// 			Port:    port,
+// 			HttpDir: httpServeDir,
+// 		},
+// 		SessionConn: sessionConn,
+// 	}
+// 	err = handleMuxSession(cfg)
+// 	if err != nil {
+// 		fmt.Fprintf(os.Stderr, "app-mux: %v\n", err)
+// 	}
+// }
+
+func AppMuxConfigByArgs(args []string) (*AppMuxConfig, error) {
+	config := &AppMuxConfig{
+		Engine:  *muxEngine,
+		HttpDir: httpServeDir,
+	}
+	if len(args) == 2 && args[0] == "-l" {
+		config.Port = args[1]
+		config.AppMode = "listen"
 	} else if len(args) == 1 && args[0] == "socks5" {
-		appMode = "socks5"
+		config.AppMode = "socks5"
 	} else if len(args) >= 1 && args[0] == "httpserver" {
-		appMode = "httpserver"
+		config.AppMode = "httpserver"
 		if len(args) > 1 {
-			httpServeDir = args[1]
+			config.HttpDir = args[1]
 		}
 	} else if len(args) >= 1 && args[0] == "httpclient" {
-		appMode = "httpclient"
+		config.AppMode = "httpclient"
 		if len(args) > 1 {
-			httpServeDir = args[1]
+			config.HttpDir = args[1]
 		}
 	} else if len(args) == 2 {
-		host = args[0]
-		port = args[1]
-		appMode = "forward"
+		config.Host = args[0]
+		config.Port = args[1]
+		config.AppMode = "forward"
 	} else {
-		mux_usage()
-		os.Exit(1)
+		return nil, fmt.Errorf("invalid arguments for app-mux")
 	}
 
-	if *udpProtocol {
-		fmt.Fprintf(os.Stderr, "-app-mux and -u cannot be used together\n")
-		os.Exit(1)
-	}
-	if *runCmd != "" {
-		fmt.Fprintf(os.Stderr, "-app-mux and -exec cannot be used together\n")
-		os.Exit(1)
-	}
-
-	var sessionConn net.Conn
-	var err error
-	var localAddr net.Addr
-
-	init_TLS(false)
-
-	dialer := createClientDialer()
-
-	switch *muxSessionMode {
-	case "connect":
-		if *muxSessionAddress == "" {
-			fmt.Fprintln(os.Stderr, "Error: -mux-address required for connect mode")
-			os.Exit(1)
-		}
-		if *localbind != "" {
-			localAddr, err = net.ResolveTCPAddr("tcp", *localbind)
-			if err != nil {
-				panic(err)
-			}
-			d := &net.Dialer{
-				LocalAddr: localAddr,
-				Control:   easyp2p.ControlTCP,
-			}
-			sessionConn, err = d.Dial("tcp", *muxSessionAddress)
-		} else {
-			sessionConn, err = dialer.Dial("tcp", *muxSessionAddress)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Connect failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stderr, "MUX Session: connected to", *muxSessionAddress)
-
-	case "listen":
-		*listenMode = true
-		if *muxSessionAddress == "" {
-			fmt.Fprintln(os.Stderr, "Error: -mux-address required for listen mode")
-			os.Exit(1)
-		}
-		ln, err := net.Listen("tcp", *muxSessionAddress)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Listen failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stderr, "Session: listening on", *muxSessionAddress)
-		sessionConn, err = ln.Accept()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Accept failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stderr, "MUX Session: accepted connection")
-
-	case "stdio":
-		sessionConn = &stdioConn{}
-		fmt.Fprintln(os.Stderr, "MUX Session: using stdio")
-
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown mux-mode: %s\n", *muxSessionMode)
-		os.Exit(1)
-	}
-
-	configTCPKeepalive(sessionConn)
-	if isTLSEnabled() {
-		conn_tls := do_TLS(sessionConn)
-		if conn_tls == nil {
-			return
-		}
-		defer conn_tls.Close()
-		sessionConn = conn_tls
-	}
-
-	cfg := MuxSessionConfig{
-		Engine:      *muxEngine,
-		AppMode:     appMode,
-		Host:        host,
-		Port:        port,
-		HttpDir:     httpServeDir,
-		SessionConn: sessionConn,
-	}
-	err = handleMuxSession(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "app-mux: %v\n", err)
-	}
+	return config, nil
 }
 
-func App_mux_main(conn net.Conn, args []string) {
+func App_mux_main_withconfig(conn net.Conn, config *AppMuxConfig) {
 	defer conn.Close()
-	appMode := ""
-	host := ""
-	port := ""
-	if len(args) == 2 && args[0] == "-l" {
-		port = args[1]
-		appMode = "listen"
-	} else if len(args) == 1 && args[0] == "socks5" {
-		appMode = "socks5"
-	} else if len(args) >= 1 && args[0] == "httpserver" {
-		appMode = "httpserver"
-		if len(args) > 1 {
-			httpServeDir = args[1]
-		}
-	} else if len(args) >= 1 && args[0] == "httpclient" {
-		appMode = "httpclient"
-		if len(args) > 1 {
-			httpServeDir = args[1]
-		}
-	} else if len(args) == 2 {
-		host = args[0]
-		port = args[1]
-		appMode = "forward"
-	} else {
-		mux_usage()
-		return
-	}
 
 	cfg := MuxSessionConfig{
-		Engine:      *muxEngine,
-		AppMode:     appMode,
-		Host:        host,
-		Port:        port,
-		HttpDir:     httpServeDir,
-		SessionConn: conn,
+		AppMuxConfig: *config,
+		SessionConn:  conn,
 	}
 
 	err := handleMuxSession(cfg)

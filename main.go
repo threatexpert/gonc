@@ -42,6 +42,9 @@ var (
 	goroutineConnectionCounter int32            = 0
 	udpOutputBlockSize         int              = 1320
 	kcpWindowSize              int              = 1500
+	app_mux_Config             *AppMuxConfig
+	app_s5s_Config             *AppS5SConfig
+	app_pf_Config              *AppPFConfig
 	// 定义命令行参数
 	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
 	proxyAddr         = flag.String("x", "", "ip:port for proxy_address")
@@ -73,24 +76,24 @@ var (
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
 	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
-	appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
-	keepAlive         = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
-	punchData         = flag.String("punchdata", "ping\n", "UDP punch payload")
-	MQTTServers       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
-	autoP2P           = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
-	autoP2PKCP        = flag.String("p2p-kcp", "", "P2P session key, kcp over udp, will be retried up to 3 times upon failure.")
-	autoP2PTCP        = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
-	autoP2PTCPSS      = flag.String("p2p-ss", "", "p2p-tcp + AES-CTR")
-	MQTTWait          = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
-	MQTTPush          = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
-	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
-	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
-	useDNS            = flag.String("dns", "", "set DNS Server")
-	runAppFileServ    = flag.String("httpserver", "", "http server root directory")
-	runAppFileGet     = flag.String("download", "", "http client download directory")
-	appMuxListenMode  = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
-	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for remote httpserver")
-	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
+	//appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
+	keepAlive        = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
+	punchData        = flag.String("punchdata", "ping\n", "UDP punch payload")
+	MQTTServers      = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
+	autoP2P          = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
+	autoP2PKCP       = flag.String("p2p-kcp", "", "P2P session key, kcp over udp, will be retried up to 3 times upon failure.")
+	autoP2PTCP       = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
+	autoP2PTCPSS     = flag.String("p2p-ss", "", "p2p-tcp + AES-CTR")
+	MQTTWait         = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
+	MQTTPush         = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
+	useIPv4          = flag.Bool("4", false, "Forces to use IPv4 addresses only")
+	useIPv6          = flag.Bool("6", false, "Forces to use IPv4 addresses only")
+	useDNS           = flag.String("dns", "", "set DNS Server")
+	runAppFileServ   = flag.String("httpserver", "", "http server root directory")
+	runAppFileGet    = flag.String("download", "", "http client download directory")
+	appMuxListenMode = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
+	appMuxListenOn   = flag.String("httplocal-port", "", "local listen port for remote httpserver")
+	appMuxSocksMode  = flag.Bool("socks5server", false, "for socks5 tunnel")
 )
 
 func init() {
@@ -456,8 +459,8 @@ func conflictCheck() {
 		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
 		os.Exit(1)
 	}
-	if *localbind != "" && *listenMode {
-		fmt.Fprintf(os.Stderr, "-bind and -l cannot be used together\n")
+	if *listenMode && (*remoteAddr != "" || *autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+		fmt.Fprintf(os.Stderr, "-l and (-remote -p2p) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
@@ -482,14 +485,46 @@ func conflictCheck() {
 	}
 }
 
+func preinitBuiltinAppConfig() {
+	args, err := parseCommandLine(*runCmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing command: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Empty command\n")
+		os.Exit(1)
+	}
+
+	builtinApp := strings.TrimLeft(args[0], "-")
+	if builtinApp == "app-mux" {
+		app_mux_Config, err = AppMuxConfigByArgs(args[1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
+			App_mux_usage()
+			os.Exit(1)
+		}
+	} else if builtinApp == "app-s5s" {
+		app_s5s_Config, err = AppS5SConfigByArgs(args[1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
+			App_s5s_usage()
+			os.Exit(1)
+		}
+	} else if builtinApp == "app-pf" {
+		app_pf_Config, err = AppPFConfigByArgs(args[1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
+			App_pf_usage()
+			os.Exit(1)
+		}
+	}
+}
+
 func main() {
 	var err error
 	flag.Parse()
-
-	if *appMux {
-		mux_main()
-		return
-	}
 
 	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
 	easyp2p.STUNServers = parseMultiItems(*stunSrv, true)
@@ -549,6 +584,10 @@ func main() {
 		}
 	}
 
+	if *runCmd != "" {
+		preinitBuiltinAppConfig()
+	}
+
 	var wg *sync.WaitGroup
 	var done chan bool
 	var conn net.Conn
@@ -579,6 +618,12 @@ func main() {
 		port = args[0]
 	} else if len(args) == 1 && !*listenMode && *useUNIXdomain {
 		port = args[0]
+	} else if len(args) == 0 && *listenMode && *localbind != "" {
+		host, port, err = net.SplitHostPort(*localbind)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid local address %q: %v\n", *localbind, err)
+			os.Exit(1)
+		}
 	} else if len(args) == 0 && *remoteAddr != "" {
 		host, port, err = net.SplitHostPort(*remoteAddr)
 		if err != nil {
@@ -1173,7 +1218,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			defer pipeConn.Close()
 			defer pipeConn.In.Close()
 			defer pipeConn.Out.Close()
-			go App_mux_main(pipeConn, args[1:])
+			go App_mux_main_withconfig(pipeConn, app_mux_Config)
 		} else if builtinApp == "app-s5s" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
@@ -1181,7 +1226,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			defer pipeConn.Close()
 			defer pipeConn.In.Close()
 			defer pipeConn.Out.Close()
-			go App_s5s_main(pipeConn, args[1:])
+			go App_s5s_main_withconfig(pipeConn, app_s5s_Config)
 		} else if builtinApp == "app-pf" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
@@ -1189,7 +1234,7 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 			defer pipeConn.Close()
 			defer pipeConn.In.Close()
 			defer pipeConn.Out.Close()
-			go App_pf_main(pipeConn, args[1:])
+			go App_pf_main_withconfig(pipeConn, app_pf_Config)
 		} else {
 
 			// 创建命令
@@ -1791,22 +1836,4 @@ func cleanupUnixSocket(path string) error {
 		return fmt.Errorf("path %s exists but is not a Unix socket (mode: %s), refusing to remove it", path, fileInfo.Mode().String())
 	}
 	return nil
-}
-
-// Port Forwarding
-func App_pf_main(conn net.Conn, args []string) {
-	defer conn.Close()
-
-	if len(args) != 2 {
-		fmt.Fprintf(os.Stderr, "[Port Forwarding]: 2 args expected: <host> <port>\n")
-		os.Exit(1)
-	}
-
-	targetAddr := net.JoinHostPort(args[0], args[1])
-	targetConn, err := net.Dial("tcp", targetAddr)
-	if err != nil {
-		return
-	}
-
-	handleProxy(conn, targetConn)
 }
