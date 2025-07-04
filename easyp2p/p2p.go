@@ -19,6 +19,7 @@ import (
 	"io"
 	mathrand "math/rand"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -453,15 +454,6 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 			remoteLAN := remoteNetInfo["lan"]
 			remoteNAT := remoteNetInfo["nat"]
 
-			if myNATType == "symm" && rNATType == "symm" {
-				continue
-			}
-
-			//Priority == 0 means invalid type
-			if getNATTypePriority(myNATType) == 0 || getNATTypePriority(rNATType) == 0 {
-				continue
-			}
-
 			item := &P2PAddressInfo{
 				Network:       net,
 				LocalLAN:      myLAN,
@@ -473,9 +465,23 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 				SharedKey:     sharedKey,
 			}
 
-			if strings.HasPrefix(net, "tcp") {
-				sameNAT, similarLAN := CompareP2PAddresses(item)
+			//Priority == 0 means invalid type
+			if getNATTypePriority(myNATType) == 0 || getNATTypePriority(rNATType) == 0 {
+				continue
+			}
+
+			sameNAT, similarLAN := CompareP2PAddresses(item)
+
+			if myNATType == "symm" && rNATType == "symm" {
 				if !sameNAT || !similarLAN {
+					continue
+				}
+				//对称型，但在相同内网，可以p2p
+			}
+
+			if strings.HasPrefix(net, "tcp") {
+				if !sameNAT || !similarLAN {
+					//TCP，如果不在相同内网，必须至少一端是easy的
 					if myNATType != "easy" && rNATType != "easy" {
 						continue
 					}
@@ -876,9 +882,23 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		// 定义公共的PING发送函数
 		sendPing := func(i int) bool {
 			if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
+				if errors.Is(err, os.ErrPermission) {
+					//ErrPermission可能是对方先发过来包被macos防火墙拦住了，现在这个udp socket已经无法向对端地址发包了。
+					uconn, err = buconn.Rebuild() //关闭socket，重新创建，并立刻主动发包打通防火墙
+					if err != nil {
+						err = os.ErrPermission
+					} else {
+						_, err = uconn.WriteToUDP(punchPayload, remoteUDPAddr)
+						if err == nil {
+							//重建socket且发送成功了
+							goto SentPingOK
+						}
+					}
+				}
 				errChan <- err
 				return false
 			}
+		SentPingOK:
 			fmt.Fprintf(logWriter, "  ↑ Sent PING(TTL=%d) (%d)\n", ttl, i+1)
 			return true
 		}
@@ -1054,6 +1074,8 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
 		} else {
+			//这个新的socket立刻主动发包打通本机防火墙
+			uconn.WriteToUDP(punchPayload, addrPair.Remote)
 			buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
 			buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
 			fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")

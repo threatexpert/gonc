@@ -15,6 +15,7 @@ import (
 
 type BoundUDPConn struct {
 	conn           *net.UDPConn
+	connmu         sync.Mutex
 	remoteAddr     *net.UDPAddr
 	keepOpen       bool
 	closeChan      chan struct{}
@@ -78,6 +79,19 @@ func (b *BoundUDPConn) GetLastPacketRemoteAddr() string {
 	return b.lastPacketAddr
 }
 
+func (b *BoundUDPConn) Rebuild() (*net.UDPConn, error) {
+	localAddr := b.LocalAddr().(*net.UDPAddr)
+	nw := localAddr.Network()
+
+	b.connmu.Lock()
+	defer b.connmu.Unlock()
+
+	b.conn.Close()
+	c, e := net.ListenUDP(nw, localAddr)
+	b.conn = c
+	return c, e
+}
+
 func (b *BoundUDPConn) Read(p []byte) (int, error) {
 	select {
 	case <-b.closeChan:
@@ -94,8 +108,14 @@ func (b *BoundUDPConn) Read(p []byte) (int, error) {
 	}
 
 	for {
-		b.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		b.connmu.Lock()
+		if b.conn == nil {
+			b.connmu.Unlock()
+			return 0, fmt.Errorf("invalid conn object")
+		}
+		b.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 		n, addr, err := b.conn.ReadFromUDP(p)
+		b.connmu.Unlock()
 
 		switch {
 		case err == nil:
