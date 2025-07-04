@@ -1174,6 +1174,183 @@ func (c *Socks5Client) readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
 	return &net.TCPAddr{IP: bndIP, Port: bndPort}, nil
 }
 
+// Dial 方法现在统一处理 TCP 和 UDP
+func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	if c.Socks5Addr == "" {
+		return net.DialTimeout(network, address, timeout)
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address format: %w", err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port: %w", err)
+		}
+
+		socks5Conn, err := net.DialTimeout("tcp", c.Socks5Addr, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", c.Socks5Addr, err)
+		}
+		socks5Conn.SetDeadline(time.Now().Add(timeout))
+		if err := c.socks5Handshake(socks5Conn); err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("SOCKS5 handshake failed: %w", err)
+		}
+		if _, err := c.sendSocks5RequestHeader(socks5Conn, CMD_CONNECT, host, port); err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("send SOCKS5 CONNECT request error: %w", err)
+		}
+		if _, err := c.readSocks5Response(socks5Conn); err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("read SOCKS5 CONNECT response error: %w", err)
+		}
+		socks5Conn.SetDeadline(time.Time{})
+		//log.Printf("Successfully connected to %s via SOCKS5 TCP proxy.", address)
+		return socks5Conn, nil
+
+	case "udp", "udp4", "udp6":
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address format: %w", err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port: %w", err)
+		}
+
+		// 1. TCP 控制连接
+		serverTCPConn, err := net.DialTimeout("tcp", c.Socks5Addr, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("dial SOCKS5 server %s for UDP ASSOCIATE error: %w", c.Socks5Addr, err)
+		}
+		serverTCPConn.SetDeadline(time.Now().Add(timeout))
+		if err := c.socks5Handshake(serverTCPConn); err != nil {
+			serverTCPConn.Close()
+			return nil, fmt.Errorf("SOCKS5 handshake for UDP ASSOCIATE failed: %w", err)
+		}
+
+		// 2. 发送 UDP ASSOCIATE 请求 (DST.ADDR 和 DST.PORT 通常是 0.0.0.0:0, 但也可以指定)
+		// 这里，我们将应用程序指定的 host/port 作为请求参数。
+		_, err = c.sendSocks5RequestHeader(serverTCPConn, CMD_UDP_ASSOCIATE, host, port)
+		if err != nil {
+			serverTCPConn.Close()
+			return nil, fmt.Errorf("send SOCKS5 UDP ASSOCIATE request error: %w", err)
+		}
+
+		// 3. 读取 UDP ASSOCIATE 响应，获取 SOCKS5 服务器返回的 UDP 绑定地址和端口
+		var actualSocks5ServerUDPAddr net.IP // 用于存储实际服务器UDP地址
+		var actualSocks5ServerUDPPort int    // 用于存储实际服务器UDP端口
+
+		bindAddr, err := c.readSocks5Response(serverTCPConn)
+		if err != nil {
+			serverTCPConn.Close()
+			return nil, fmt.Errorf("read SOCKS5 UDP ASSOCIATE response error: %w", err)
+		}
+
+		// 判断如果服务端给的地址是全0, 则用serverTCPConn.RemoteAddr()的地址
+		if bindAddr.IP.IsUnspecified() { // 检查是否是 0.0.0.0 或 ::
+			// 获取 TCP 连接的对端地址，即 SOCKS5 服务器的 IP
+			if tcpRemoteAddr, ok := serverTCPConn.RemoteAddr().(*net.TCPAddr); ok {
+				actualSocks5ServerUDPAddr = tcpRemoteAddr.IP
+				actualSocks5ServerUDPPort = bindAddr.Port // 端口用响应中的端口
+			} else {
+				// 理论上不会发生，但以防万一
+				actualSocks5ServerUDPAddr = bindAddr.IP
+				actualSocks5ServerUDPPort = bindAddr.Port
+			}
+		} else {
+			// 服务器返回了具体的 IP 地址，直接使用
+			actualSocks5ServerUDPAddr = bindAddr.IP
+			actualSocks5ServerUDPPort = bindAddr.Port
+		}
+
+		// 4. 客户端本地 dialUDP 到 SOCKS5 服务器的 UDP 绑定地址
+		localUDPConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort})
+		if err != nil {
+			serverTCPConn.Close()
+			return nil, fmt.Errorf("dial local UDP to SOCKS5 server UDP address error: %w", err)
+		}
+
+		// 初始化 UDPConnWrapper
+		wrapper := &UDPConnWrapper{
+			client:           c,
+			serverTCPConn:    serverTCPConn,
+			localUDPConn:     localUDPConn, // 这里的 localUDPConn 已经 Dial 到 SOCKS5 服务器的 UDP 地址了
+			strTargetUDPAddr: address,      // 保存 Dial 时的最终目标地址
+		}
+
+		serverTCPConn.SetDeadline(time.Time{})
+
+		// 启动 goroutine 监听 TCP 控制连接的关闭，以便关闭 UDP 关联
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+				}
+			}()
+			// io.Copy 阻塞直到 TCP 连接关闭或出错
+			_, err := io.Copy(io.Discard, serverTCPConn)
+			if err != nil && err != io.EOF {
+			}
+			wrapper.Close() // 当 TCP 控制连接关闭时，关闭整个 UDP 客户端关联
+		}()
+
+		//log.Printf("Successfully established SOCKS5 UDP proxy for %s. Using local UDP socket: %s", address, wrapper.LocalAddr())
+		return wrapper, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported network type: %s", network)
+	}
+}
+
+// parseHostPortToSocksAddr 辅助函数，将主机和端口转换为 SOCKS 地址字节和 ATYP
+func parseHostPortToSocksAddr(host string) ([]byte, byte, error) {
+	ip := net.ParseIP(host)
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4, ATYP_IPV4, nil
+	}
+	if ipv6 := ip.To16(); ipv6 != nil {
+		return ipv6, ATYP_IPV6, nil
+	}
+
+	// 域名
+	if len(host) > 255 {
+		return nil, 0, fmt.Errorf("domain name too long: %s", host)
+	}
+	addrBytes := make([]byte, 1+len(host))
+	addrBytes[0] = byte(len(host))
+	copy(addrBytes[1:], host)
+	return addrBytes, ATYP_DOMAINNAME, nil
+}
+
+// socks5ReplyCodeToString 将 SOCKS5 响应码转换为可读字符串
+func socks5ReplyCodeToString(code byte) string {
+	switch code {
+	case REP_SUCCEEDED:
+		return "Succeeded"
+	case REP_GENERAL_SOCKS_SERVER_FAIL:
+		return "General SOCKS server failure"
+	case REP_CONNECTION_NOT_ALLOWED:
+		return "Connection not allowed by ruleset"
+	case REP_NETWORK_UNREACHABLE:
+		return "Network unreachable"
+	case REP_HOST_UNREACHABLE:
+		return "Host unreachable"
+	case REP_CONNECTION_REFUSED:
+		return "Connection refused"
+	case REP_TTL_EXPIRED:
+		return "TTL expired"
+	case REP_COMMAND_NOT_SUPPORTED:
+		return "Command not supported"
+	case REP_ADDRESS_TYPE_NOT_SUPPORTED:
+		return "Address type not supported"
+	default:
+		return fmt.Sprintf("Unknown error (%d)", code)
+	}
+}
+
 // UDPConnWrapper 包装器，实现 net.Conn 接口，用于通过 SOCKS5 UDP 关联转发数据
 type UDPConnWrapper struct {
 	// 客户端底层的 SOCKS5 客户端实例
@@ -1385,178 +1562,6 @@ func (u *UDPConnWrapper) SetWriteDeadline(t time.Time) error {
 		return u.localUDPConn.SetWriteDeadline(t)
 	}
 	return nil
-}
-
-// Dial 方法现在统一处理 TCP 和 UDP
-func (c *Socks5Client) Dial(network, address string) (net.Conn, error) {
-	if c.Socks5Addr == "" {
-		return net.Dial(network, address)
-	}
-	switch network {
-	case "tcp", "tcp4", "tcp6":
-		host, portStr, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("invalid address format: %w", err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port: %w", err)
-		}
-
-		socks5Conn, err := net.Dial("tcp", c.Socks5Addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", c.Socks5Addr, err)
-		}
-		if err := c.socks5Handshake(socks5Conn); err != nil {
-			socks5Conn.Close()
-			return nil, fmt.Errorf("SOCKS5 handshake failed: %w", err)
-		}
-		if _, err := c.sendSocks5RequestHeader(socks5Conn, CMD_CONNECT, host, port); err != nil {
-			socks5Conn.Close()
-			return nil, fmt.Errorf("send SOCKS5 CONNECT request error: %w", err)
-		}
-		if _, err := c.readSocks5Response(socks5Conn); err != nil {
-			socks5Conn.Close()
-			return nil, fmt.Errorf("read SOCKS5 CONNECT response error: %w", err)
-		}
-		//log.Printf("Successfully connected to %s via SOCKS5 TCP proxy.", address)
-		return socks5Conn, nil
-
-	case "udp", "udp4", "udp6":
-		host, portStr, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("invalid address format: %w", err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port: %w", err)
-		}
-
-		// 1. TCP 控制连接
-		serverTCPConn, err := net.Dial("tcp", c.Socks5Addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial SOCKS5 server %s for UDP ASSOCIATE error: %w", c.Socks5Addr, err)
-		}
-		if err := c.socks5Handshake(serverTCPConn); err != nil {
-			serverTCPConn.Close()
-			return nil, fmt.Errorf("SOCKS5 handshake for UDP ASSOCIATE failed: %w", err)
-		}
-
-		// 2. 发送 UDP ASSOCIATE 请求 (DST.ADDR 和 DST.PORT 通常是 0.0.0.0:0, 但也可以指定)
-		// 这里，我们将应用程序指定的 host/port 作为请求参数。
-		_, err = c.sendSocks5RequestHeader(serverTCPConn, CMD_UDP_ASSOCIATE, host, port)
-		if err != nil {
-			serverTCPConn.Close()
-			return nil, fmt.Errorf("send SOCKS5 UDP ASSOCIATE request error: %w", err)
-		}
-
-		// 3. 读取 UDP ASSOCIATE 响应，获取 SOCKS5 服务器返回的 UDP 绑定地址和端口
-		var actualSocks5ServerUDPAddr net.IP // 用于存储实际服务器UDP地址
-		var actualSocks5ServerUDPPort int    // 用于存储实际服务器UDP端口
-
-		bindAddr, err := c.readSocks5Response(serverTCPConn)
-		if err != nil {
-			serverTCPConn.Close()
-			return nil, fmt.Errorf("read SOCKS5 UDP ASSOCIATE response error: %w", err)
-		}
-
-		// 判断如果服务端给的地址是全0, 则用serverTCPConn.RemoteAddr()的地址
-		if bindAddr.IP.IsUnspecified() { // 检查是否是 0.0.0.0 或 ::
-			// 获取 TCP 连接的对端地址，即 SOCKS5 服务器的 IP
-			if tcpRemoteAddr, ok := serverTCPConn.RemoteAddr().(*net.TCPAddr); ok {
-				actualSocks5ServerUDPAddr = tcpRemoteAddr.IP
-				actualSocks5ServerUDPPort = bindAddr.Port // 端口用响应中的端口
-			} else {
-				// 理论上不会发生，但以防万一
-				actualSocks5ServerUDPAddr = bindAddr.IP
-				actualSocks5ServerUDPPort = bindAddr.Port
-			}
-		} else {
-			// 服务器返回了具体的 IP 地址，直接使用
-			actualSocks5ServerUDPAddr = bindAddr.IP
-			actualSocks5ServerUDPPort = bindAddr.Port
-		}
-
-		// 4. 客户端本地 dialUDP 到 SOCKS5 服务器的 UDP 绑定地址
-		localUDPConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort})
-		if err != nil {
-			serverTCPConn.Close()
-			return nil, fmt.Errorf("dial local UDP to SOCKS5 server UDP address error: %w", err)
-		}
-
-		// 初始化 UDPConnWrapper
-		wrapper := &UDPConnWrapper{
-			client:           c,
-			serverTCPConn:    serverTCPConn,
-			localUDPConn:     localUDPConn, // 这里的 localUDPConn 已经 Dial 到 SOCKS5 服务器的 UDP 地址了
-			strTargetUDPAddr: address,      // 保存 Dial 时的最终目标地址
-		}
-
-		// 启动 goroutine 监听 TCP 控制连接的关闭，以便关闭 UDP 关联
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-				}
-			}()
-			// io.Copy 阻塞直到 TCP 连接关闭或出错
-			_, err := io.Copy(io.Discard, serverTCPConn)
-			if err != nil && err != io.EOF {
-			}
-			wrapper.Close() // 当 TCP 控制连接关闭时，关闭整个 UDP 客户端关联
-		}()
-
-		//log.Printf("Successfully established SOCKS5 UDP proxy for %s. Using local UDP socket: %s", address, wrapper.LocalAddr())
-		return wrapper, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported network type: %s", network)
-	}
-}
-
-// parseHostPortToSocksAddr 辅助函数，将主机和端口转换为 SOCKS 地址字节和 ATYP
-func parseHostPortToSocksAddr(host string) ([]byte, byte, error) {
-	ip := net.ParseIP(host)
-	if ipv4 := ip.To4(); ipv4 != nil {
-		return ipv4, ATYP_IPV4, nil
-	}
-	if ipv6 := ip.To16(); ipv6 != nil {
-		return ipv6, ATYP_IPV6, nil
-	}
-
-	// 域名
-	if len(host) > 255 {
-		return nil, 0, fmt.Errorf("domain name too long: %s", host)
-	}
-	addrBytes := make([]byte, 1+len(host))
-	addrBytes[0] = byte(len(host))
-	copy(addrBytes[1:], host)
-	return addrBytes, ATYP_DOMAINNAME, nil
-}
-
-// socks5ReplyCodeToString 将 SOCKS5 响应码转换为可读字符串
-func socks5ReplyCodeToString(code byte) string {
-	switch code {
-	case REP_SUCCEEDED:
-		return "Succeeded"
-	case REP_GENERAL_SOCKS_SERVER_FAIL:
-		return "General SOCKS server failure"
-	case REP_CONNECTION_NOT_ALLOWED:
-		return "Connection not allowed by ruleset"
-	case REP_NETWORK_UNREACHABLE:
-		return "Network unreachable"
-	case REP_HOST_UNREACHABLE:
-		return "Host unreachable"
-	case REP_CONNECTION_REFUSED:
-		return "Connection refused"
-	case REP_TTL_EXPIRED:
-		return "TTL expired"
-	case REP_COMMAND_NOT_SUPPORTED:
-		return "Command not supported"
-	case REP_ADDRESS_TYPE_NOT_SUPPORTED:
-		return "Address type not supported"
-	default:
-		return fmt.Sprintf("Unknown error (%d)", code)
-	}
 }
 
 type AppS5SConfig struct {

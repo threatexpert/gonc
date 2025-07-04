@@ -7,10 +7,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type Dialer interface {
-	Dial(network, address string) (net.Conn, error)
+	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
 }
 
 type HttpConnectClient struct {
@@ -44,10 +45,10 @@ func getFullHttpHeader(conn net.Conn) (string, error) {
 	return result, nil
 }
 
-// Dial 实现 HttpConnectClient 的拨号逻辑
-func (c *HttpConnectClient) Dial(network, address string) (net.Conn, error) {
+// DialTimeout 实现 HttpConnectClient 的拨号逻辑
+func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	// 1. 连接HTTP代理服务器
-	proxyConn, err := net.Dial(network, c.ProxyAddr)
+	proxyConn, err := net.DialTimeout(network, c.ProxyAddr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("connect to HTTP proxy server failed: %w", err)
 	}
@@ -62,6 +63,7 @@ func (c *HttpConnectClient) Dial(network, address string) (net.Conn, error) {
 	if c.Username != "" && c.Password != "" {
 		connectReq.SetBasicAuth(c.Username, c.Password)
 	}
+	proxyConn.SetDeadline(time.Now().Add(timeout))
 
 	err = connectReq.Write(proxyConn)
 	if err != nil {
@@ -89,7 +91,7 @@ func (c *HttpConnectClient) Dial(network, address string) (net.Conn, error) {
 		proxyConn.Close()
 		return nil, fmt.Errorf("HTTP CONNECT failed with status: %s", resp.Status)
 	}
-
+	proxyConn.SetDeadline(time.Time{})
 	return proxyConn, nil
 }
 
@@ -118,17 +120,24 @@ func NewProxyClient(proxyProt, proxyAddr, username, password string) (*ProxyClie
 	case "http":
 		pc.dialer = NewHttpConnectClient(proxyAddr, username, password)
 	case "":
-		pc.dialer = &net.Dialer{}
+		pc.dialer = &DirectDialer{}
 	default:
 		return nil, fmt.Errorf("unsupported proxy protocol: %s", proxyProt)
 	}
 	return pc, nil
 }
 
+type DirectDialer struct{}
+
+// DialTimeout implements the Dialer interface for DirectDialer
+func (d *DirectDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout(network, address, timeout)
+}
+
 // Dial 实现 ProxyClient 的拨号逻辑，委托给内部的 dialer
-func (c *ProxyClient) Dial(network, address string) (net.Conn, error) {
+func (c *ProxyClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	if c.dialer == nil {
 		return nil, fmt.Errorf("proxy client not initialized, call NewProxyClient first")
 	}
-	return c.dialer.Dial(network, address)
+	return c.dialer.DialTimeout(network, address, timeout)
 }

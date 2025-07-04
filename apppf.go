@@ -18,18 +18,18 @@ type AppPFConfig struct {
 	network      string           // 默认是tcp，然而如果有参数-4 -6 -U，则可能是tcp4 tcp6 unix
 	host, port   string           // 是最后 two args
 	presharedKey string           // -psk <psk-string>
+	proxyProt    string           // -X 代理协议，可能是 connect或5，或空
+	proxyAddress string           // -x 代理服务器地址 host:port
+	proxyAuth    string           // -auth 代理认证信息，格式为 username:password
 }
 
 func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
-	// 初始化配置，设置默认值
 	config := &AppPFConfig{
 		network: "tcp",
 	}
 
-	// 临时存储非标志参数，用于解析 host 和 port
 	var positionalArgs []string
 
-	// 遍历参数，解析标志和其对应的值
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
@@ -44,9 +44,36 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		case "-psk":
 			if i+1 < len(args) {
 				config.presharedKey = args[i+1]
-				i++ // 跳过下一个参数，因为它已经被解析为 -psk 的值
+				i++
 			} else {
 				return nil, fmt.Errorf("missing value for -psk")
+			}
+		case "-X":
+			if i+1 < len(args) {
+				config.proxyProt = args[i+1]
+				if config.proxyProt != "5" && config.proxyProt != "connect" && config.proxyProt != "" {
+					return nil, fmt.Errorf("invalid proxy protocol: %s", config.proxyProt)
+				}
+				i++
+			} else {
+				return nil, fmt.Errorf("missing value for -X")
+			}
+		case "-x":
+			if i+1 < len(args) {
+				config.proxyAddress = args[i+1]
+				i++
+			} else {
+				return nil, fmt.Errorf("missing value for -x")
+			}
+		case "-auth":
+			if i+1 < len(args) {
+				config.proxyAuth = args[i+1]
+				if !strings.Contains(config.proxyAuth, ":") {
+					return nil, fmt.Errorf("invalid format for -auth, expected user:pass")
+				}
+				i++
+			} else {
+				return nil, fmt.Errorf("missing value for -auth")
 			}
 		default:
 			if strings.HasPrefix(arg, "-") {
@@ -56,22 +83,21 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		}
 	}
 
-	// 解析 host 和 port (或 unix socket 路径)
+	// 处理 host/port 或 unix 路径
 	if config.network == "unix" {
 		if len(positionalArgs) != 1 {
-			return nil, fmt.Errorf("wrong arguments: expect only one unix socket path for -U mode")
+			return nil, fmt.Errorf("expect one unix socket path for -U mode")
 		}
-		config.port = positionalArgs[len(positionalArgs)-1]
+		config.port = positionalArgs[0]
 	} else {
-		// 对于 TCP/TCP4/TCP6，需要 host 和 port
 		if len(positionalArgs) != 2 {
-			return nil, fmt.Errorf("wrong arguments: host and port are required for network type %s", config.network)
+			return nil, fmt.Errorf("expect host and port for network type %s", config.network)
 		}
-		// host 是倒数第二个参数，port 是最后一个参数
-		config.host = positionalArgs[len(positionalArgs)-2]
-		config.port = positionalArgs[len(positionalArgs)-1]
+		config.host = positionalArgs[0]
+		config.port = positionalArgs[1]
 	}
 
+	// 若启用 TLS 或 PSK，加载证书
 	if config.tlsEnabled || config.presharedKey != "" {
 		var err error
 		config.cert, err = misc.GenerateECDSACertificate(config.host, config.presharedKey)
@@ -80,11 +106,15 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		}
 		config.tlsEnabled = true
 	}
+
 	return config, nil
 }
 
 func App_pf_usage() {
-	fmt.Fprintln(os.Stderr, "Usage: -app-pf [-tls] [-4|-6|-U] [-psk <psk-string>] <host> <port>")
+	fmt.Fprintln(os.Stderr, "Usage: -app-pf [-tls] [-4|-6|-U] [-x <proxy>] [-psk <psk-string>] <host> <port>")
+	fmt.Fprintln(os.Stderr, "  -X            proxy protocol. Supported protocols are “5” (SOCKS v.5) and “connect”")
+	fmt.Fprintln(os.Stderr, "  -x            ip:port for proxy address")
+	fmt.Fprintln(os.Stderr, "  -auth         user:password for proxy")
 	fmt.Fprintln(os.Stderr, "  -tls          Enable TLS encryption")
 	fmt.Fprintln(os.Stderr, "  -4            Use IPv4 (default is tcp)")
 	fmt.Fprintln(os.Stderr, "  -6            Use IPv6")
@@ -110,7 +140,6 @@ func App_pf_main(conn net.Conn, args []string) {
 
 func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	defer conn.Close()
-	var d net.Dialer
 	timeout_sec := 20
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
 	defer cancel()
@@ -119,7 +148,12 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	if config.network == "unix" {
 		address = config.port
 	}
-	targetConn, err := d.DialContext(ctx, config.network, address)
+	dialer, err := createClientDialer(config.proxyProt, config.proxyAddress, config.proxyAuth)
+	if err != nil {
+		return
+	}
+
+	targetConn, err := dialer.DialTimeout(config.network, address, 20*time.Second)
 	if err != nil {
 		return
 	}

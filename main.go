@@ -336,42 +336,41 @@ func do_DTLS(conn net.Conn) net.Conn {
 	return dtlsConn
 }
 
-func createClientDialer() *ProxyClient {
-	if *proxyAddr != "" {
+func createClientDialer(proxyProt, proxyAddr, proxyAuth string) (*ProxyClient, error) {
+	if proxyAddr != "" {
 		user, pass := "", ""
-		if *auth != "" {
-			authParts := strings.SplitN(*auth, ":", 2)
+		if proxyAuth != "" {
+			authParts := strings.SplitN(proxyAuth, ":", 2)
 			if len(authParts) != 2 {
-				fmt.Fprintf(os.Stderr, "Invalid auth format. Expected user:pass\n")
-				os.Exit(1)
+				return nil, fmt.Errorf("invalid auth format: expected user:pass")
 			}
 			user, pass = authParts[0], authParts[1]
 		}
-		if *proxyProt == "" || *proxyProt == "5" {
-			client, err := NewProxyClient("socks5", *proxyAddr, user, pass)
+
+		switch proxyProt {
+		case "", "5":
+			client, err := NewProxyClient("socks5", proxyAddr, user, pass)
 			if err != nil {
-				panic(err)
+				return nil, fmt.Errorf("failed to create socks5 client: %w", err)
 			}
-			return client
-		} else if *proxyProt == "connect" {
-			client, err := NewProxyClient("http", *proxyAddr, user, pass)
+			return client, nil
+		case "connect":
+			client, err := NewProxyClient("http", proxyAddr, user, pass)
 			if err != nil {
-				panic(err)
+				return nil, fmt.Errorf("failed to create http client: %w", err)
 			}
-			return client
-		} else {
-			fmt.Fprintf(os.Stderr, "Invalid proxy_protocol\n")
-			os.Exit(1)
-			return nil
+			return client, nil
+		default:
+			return nil, fmt.Errorf("invalid proxy protocol: %s", proxyProt)
 		}
-	} else {
-		// 如果没有指定代理，则返回一个模拟的直接连接客户端
-		client, err := NewProxyClient("", "", "", "")
-		if err != nil {
-			panic(err)
-		}
-		return client
 	}
+
+	// 没有代理时，返回默认的直连客户端
+	client, err := NewProxyClient("", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create direct client: %w", err)
+	}
+	return client, nil
 }
 
 func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *sync.WaitGroup) {
@@ -435,7 +434,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9.4")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.5")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -751,8 +750,11 @@ func main() {
 		}
 	}
 
-	dialer := createClientDialer()
-
+	dialer, err := createClientDialer(*proxyProt, *proxyAddr, *auth)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error create client dialer: %v\n", err)
+		os.Exit(1)
+	}
 	if *listenMode {
 		// 监听模式
 		if port == "0" {
@@ -935,7 +937,7 @@ func main() {
 		} else {
 			// TCP/UDP 连接
 			if localAddr == nil {
-				conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
+				conn, err = dialer.DialTimeout(network, net.JoinHostPort(host, port), 20*time.Second)
 			} else {
 				dialer := &net.Dialer{
 					LocalAddr: localAddr,
