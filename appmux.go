@@ -20,9 +20,10 @@ import (
 var (
 	//muxSessionMode       = flag.String("mux-mode", "stdio", "connect | listen | stdio")
 	//muxSessionAddress    = flag.String("mux-address", "", "host:port (for connect or listen mode)")
-	muxEngine            = flag.String("mux-engine", "smux", "yamux | smux")
-	httpServeDir         = "."
-	muxLastListenAddress = ""
+	muxEngine                    = flag.String("mux-engine", "smux", "yamux | smux")
+	httpServeDir                 = "."
+	muxLastListenAddress         = ""
+	httpDownloadNoCompress *bool = new(bool)
 )
 
 type AppMuxConfig struct {
@@ -365,6 +366,7 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 			LoggerOutput:           os.Stderr,
 			ProgressOutput:         os.Stderr,
 			ProgressUpdateInterval: 1 * time.Second,
+			NoCompress:             *httpDownloadNoCompress,
 		}
 
 		c, err := httpfileshare.NewClient(httpcfg)
@@ -541,10 +543,6 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 
 	ln := &muxListener{session}
 	enableZstd := true
-
-	// if easyp2p.IsPeerSameLAN(cfg.SessionConn) {
-	// 	enableZstd = false // 如果是同一局域网内的连接，可能禁用压缩效率更快
-	// }
 
 	srvcfg := httpfileshare.ServerConfig{ // Use ServerConfig
 		RootDirectory: cfg.HttpDir,

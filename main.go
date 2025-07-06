@@ -90,6 +90,7 @@ var (
 	appMuxListenMode = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
 	appMuxListenOn   = flag.String("httplocal-port", "", "local listen port for remote httpserver")
 	appMuxSocksMode  = flag.Bool("socks5server", false, "for socks5 tunnel")
+	disableCompress  = flag.Bool("no-compress", false, "disable compression for http download")
 )
 
 func init() {
@@ -105,6 +106,7 @@ func init() {
 	flag.BoolVar(appMuxListenMode, "browser", false, "alias for -httplocal")
 	flag.IntVar(&udpOutputBlockSize, "udp-size", udpOutputBlockSize, "")
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", kcpWindowSize, "")
+	httpDownloadNoCompress = disableCompress
 }
 
 func init_TLS(genCertForced bool) []tls.Certificate {

@@ -51,6 +51,7 @@ type ClientConfig struct {
 	LoggerOutput           io.Writer
 	ProgressOutput         io.Writer
 	ProgressUpdateInterval time.Duration
+	NoCompress             bool
 }
 
 // Client represents our download client.
@@ -334,6 +335,15 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) setAcceptEncodingForCompress(req *http.Request) {
+	// Set Accept-Encoding to declare support for zstd, gzip
+	if c.config.NoCompress {
+		req.Header.Set("Accept-Encoding", "identity") // No compression
+	} else {
+		req.Header.Set("Accept-Encoding", "zstd, gzip") // Support zstd and gzip
+	}
+}
+
 // fetchFileList connects to the server and streams recursive file info,
 // collecting all FileInfo objects before returning them.
 func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
@@ -358,8 +368,7 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	// Set Accept-Encoding to declare support for zstd, gzip
-	req.Header.Set("Accept-Encoding", "zstd, gzip") //
+	c.setAcceptEncodingForCompress(req)
 
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
@@ -608,8 +617,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		c.logVerbose("Requesting bytes %d- for %s", localFileSize, downloadURL)
 	}
 
-	// Set Accept-Encoding for download requests as well
-	req.Header.Set("Accept-Encoding", "zstd, gzip")
+	c.setAcceptEncodingForCompress(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
