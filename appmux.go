@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
-	"github.com/threatexpert/gonc/easyp2p"
 	"github.com/threatexpert/gonc/httpfileshare"
 	"github.com/xtaci/smux"
 )
@@ -362,7 +361,8 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 			Resume:                 true,
 			DryRun:                 false,
 			Verbose:                false,
-			LoggerOutput:           io.Discard,
+			LogLevel:               httpfileshare.LogLevelError,
+			LoggerOutput:           os.Stderr,
 			ProgressOutput:         os.Stderr,
 			ProgressUpdateInterval: 1 * time.Second,
 		}
@@ -540,16 +540,16 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 	}
 
 	ln := &muxListener{session}
-	enableGzip := true
+	enableZstd := true
 
-	if easyp2p.IsPeerSameLAN(cfg.SessionConn) {
-		enableGzip = false // 如果是同一局域网内的连接，则禁用 Gzip 压缩
-	}
+	// if easyp2p.IsPeerSameLAN(cfg.SessionConn) {
+	// 	enableZstd = false // 如果是同一局域网内的连接，可能禁用压缩效率更快
+	// }
 
 	srvcfg := httpfileshare.ServerConfig{ // Use ServerConfig
 		RootDirectory: cfg.HttpDir,
 		LoggerOutput:  os.Stderr,
-		EnableGzip:    enableGzip,
+		EnableZstd:    enableZstd,
 		Listener:      ln,
 	}
 

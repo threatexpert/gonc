@@ -526,6 +526,9 @@ func main() {
 	} else if *runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileGet, "\\", "/")
 		*runCmd = fmt.Sprintf("-app-mux httpclient \"%s\"", escapedPath)
+		if *appMuxListenOn != "" {
+			muxLastListenAddress = *appMuxListenOn
+		}
 		if *MQTTPush == "" {
 			*MQTTPush = "hello"
 		}

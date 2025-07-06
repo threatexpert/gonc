@@ -6,6 +6,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/eclipse/paho.mqtt.golang v1.5.0
 	github.com/hashicorp/yamux v0.1.2
+	github.com/klauspost/compress v1.18.0
 	github.com/pion/dtls/v3 v3.0.6
 	github.com/pion/stun v0.6.1
 	github.com/xtaci/kcp-go/v5 v5.6.22

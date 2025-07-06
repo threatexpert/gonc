@@ -1,7 +1,6 @@
 package httpfileshare
 
 import (
-	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // FileInfo represents a file or directory for JSON listing.
@@ -31,7 +32,7 @@ type ServerConfig struct {
 	ListenAddr    string
 	RootDirectory string
 	LoggerOutput  io.Writer
-	EnableGzip    bool
+	EnableZstd    bool
 	Listener      net.Listener
 }
 
@@ -66,15 +67,69 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return s, nil
 }
 
+// zstdWriter wraps http.ResponseWriter to provide Zstandard compression.
+type zstdWriter struct {
+	http.ResponseWriter
+	Writer *zstd.Encoder
+}
+
+func (z *zstdWriter) Write(data []byte) (int, error) {
+	return z.Writer.Write(data)
+}
+
+func (z *zstdWriter) WriteHeader(status int) {
+	z.Header().Del("Content-Length")
+	z.ResponseWriter.WriteHeader(status)
+}
+
+// zstdMiddleware applies Zstandard compression if the client accepts it.
+func (s *Server) zstdMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Do not compress if the client doesn't accept zstd
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "zstd") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Clean the path to get the actual file name/extension
+		requestedFilePath := path.Clean(r.URL.Path)
+
+		// If it's a directory, or the root path (which leads to listing), compress the listing.
+		// If it's a specific file, check its extension.
+		if strings.HasSuffix(requestedFilePath, "/") || requestedFilePath == "." || requestedFilePath == "/" {
+			// It's a directory or the root, so compress the HTML/JSON listing
+		} else if isAlreadyCompressed(requestedFilePath) {
+			s.logger.Printf("Skipping Zstd for %s (known compressed type)", requestedFilePath)
+			next.ServeHTTP(w, r) // Serve uncompressed
+			return
+		}
+
+		// If it reaches here, we should attempt compression
+		w.Header().Set("Content-Encoding", "zstd")
+		w.Header().Set("Vary", "Accept-Encoding")
+
+		encoder, err := zstd.NewWriter(w)
+		if err != nil {
+			s.logger.Printf("Error creating Zstd encoder: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		defer encoder.Close()
+
+		zwr := &zstdWriter{ResponseWriter: w, Writer: encoder}
+		next.ServeHTTP(zwr, r)
+	})
+}
+
 // Start runs the HTTP server.
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	var handler http.Handler = http.HandlerFunc(s.serveFiles)
-	if s.config.EnableGzip {
-		s.logger.Println("Gzip compression enabled. Will skip already-compressed file types.")
-		handler = s.gzipMiddleware(handler)
+	if s.config.EnableZstd {
+		s.logger.Println("Zstd compression enabled. Will skip already-compressed file types.")
+		handler = s.zstdMiddleware(handler)
 	} else {
-		s.logger.Println("Gzip compression disabled.")
+		s.logger.Println("Zstd compression disabled.")
 	}
 	mux.Handle("/", handler)
 	mux.HandleFunc("/favicon.ico", serveFavicon)
@@ -114,21 +169,6 @@ func (s *Server) Start() error {
 	return server.Serve(ln) // Use server.Serve with the determined listener
 }
 
-// gzipWriter wraps http.ResponseWriter to provide Gzip compression.
-type gzipWriter struct {
-	http.ResponseWriter
-	Writer *gzip.Writer
-}
-
-func (g *gzipWriter) Write(data []byte) (int, error) {
-	return g.Writer.Write(data)
-}
-
-func (g *gzipWriter) WriteHeader(status int) {
-	g.Header().Del("Content-Length")
-	g.ResponseWriter.WriteHeader(status)
-}
-
 var faviconData = []byte{
 	0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10, 0x10, 0x00, 0x01, 0x00,
 	0x04, 0x00, 0x28, 0x01, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x28, 0x00,
@@ -160,7 +200,7 @@ var faviconData = []byte{
 }
 
 // knownCompressedExtensions is a list of file extensions that typically indicate
-// that the file is already compressed or doesn't benefit from Gzip.
+// that the file is already compressed.
 var knownCompressedExtensions = map[string]struct{}{
 	".zip": {}, ".rar": {}, ".7z": {},
 	".gz": {}, ".tgz": {}, ".bz2": {}, ".tbz2": {}, ".xz": {}, ".txz": {},
@@ -175,40 +215,6 @@ func isAlreadyCompressed(filePath string) bool {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	_, ok := knownCompressedExtensions[ext]
 	return ok
-}
-
-// gzipMiddleware applies Gzip compression if the client accepts it and the file type is not already compressed.
-func (s *Server) gzipMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Do not compress if the client doesn't accept gzip
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Clean the path to get the actual file name/extension
-		requestedFilePath := path.Clean(r.URL.Path)
-
-		// If it's a directory, or the root path (which leads to listing), compress the listing.
-		// If it's a specific file, check its extension.
-		if strings.HasSuffix(requestedFilePath, "/") || requestedFilePath == "." || requestedFilePath == "/" {
-			// It's a directory or the root, so compress the HTML/JSON listing
-		} else if isAlreadyCompressed(requestedFilePath) {
-			s.logger.Printf("Skipping Gzip for %s (known compressed type)", requestedFilePath)
-			next.ServeHTTP(w, r) // Serve uncompressed
-			return
-		}
-
-		// If it reaches here, we should attempt compression
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Set("Vary", "Accept-Encoding")
-
-		gz := gzip.NewWriter(w)
-		defer gz.Close()
-
-		gzr := &gzipWriter{ResponseWriter: w, Writer: gz}
-		next.ServeHTTP(gzr, r)
-	})
 }
 
 // serveFavicon handles requests for /favicon.ico

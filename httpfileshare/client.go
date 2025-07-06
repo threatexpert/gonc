@@ -2,6 +2,7 @@ package httpfileshare
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,22 @@ import (
 	"sync"
 	"sync/atomic" // For atomic operations on progress counters
 	"time"
+
+	"github.com/klauspost/compress/zstd" // For Zstd decompression
+)
+
+// LogLevel defines the verbosity of logging.
+type LogLevel int
+
+const (
+	// LogLevelSilent suppresses all logging.
+	LogLevelSilent LogLevel = iota
+	// LogLevelError logs only errors.
+	LogLevelError
+	// LogLevelInfo logs informational messages and errors.
+	LogLevelInfo
+	// LogLevelVerbose logs all messages including verbose debug info.
+	LogLevelVerbose
 )
 
 // ClientConfig holds the client configuration for downloads.
@@ -29,7 +46,8 @@ type ClientConfig struct {
 	Include                []string
 	Resume                 bool
 	DryRun                 bool
-	Verbose                bool
+	Verbose                bool     // This will now control LogLevelVerbose if true
+	LogLevel               LogLevel // New field for controlling log verbosity
 	LoggerOutput           io.Writer
 	ProgressOutput         io.Writer
 	ProgressUpdateInterval time.Duration
@@ -38,9 +56,12 @@ type ClientConfig struct {
 // Client represents our download client.
 type Client struct {
 	config ClientConfig
-	logger *log.Logger
-	queue  chan FileInfo // Channel for files to download
-	wg     sync.WaitGroup
+	// infoLogger logs general information, controlled by LogLevel
+	infoLogger *log.Logger
+	// errorLogger logs critical errors, usually always enabled
+	errorLogger *log.Logger
+	queue       chan FileInfo // Channel for files to download
+	wg          sync.WaitGroup
 
 	absLocalDownloadRoot string
 
@@ -196,10 +217,33 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg.Concurrency = 4
 	}
 
-	if cfg.LoggerOutput == nil {
-		cfg.LoggerOutput = io.Discard
+	// Determine effective log level
+	if cfg.Verbose { // If Verbose is true, force LogLevelVerbose
+		cfg.LogLevel = LogLevelVerbose
 	}
-	clientLogger := log.New(cfg.LoggerOutput, "[CLIENT] ", log.Ldate|log.Ltime)
+
+	var infoWriter io.Writer = io.Discard
+	var errorWriter io.Writer = io.Discard
+
+	if cfg.LoggerOutput == nil {
+		cfg.LoggerOutput = io.Discard // Default to discard if not set
+	}
+
+	switch cfg.LogLevel {
+	case LogLevelSilent:
+		// Both remain Discard
+	case LogLevelError:
+		errorWriter = cfg.LoggerOutput
+	case LogLevelInfo:
+		infoWriter = cfg.LoggerOutput
+		errorWriter = cfg.LoggerOutput
+	case LogLevelVerbose:
+		infoWriter = cfg.LoggerOutput
+		errorWriter = cfg.LoggerOutput
+	}
+
+	infoLogger := log.New(infoWriter, "[INFO] ", log.Ldate|log.Ltime)
+	errorLogger := log.New(errorWriter, "[ERROR] ", log.Ldate|log.Ltime|log.Lshortfile) // Add Lshortfile for error origin
 
 	if cfg.ProgressOutput == nil {
 		cfg.ProgressOutput = io.Discard
@@ -211,28 +255,52 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	return &Client{
 		config:               cfg,
-		logger:               clientLogger,
+		infoLogger:           infoLogger,
+		errorLogger:          errorLogger,
 		queue:                make(chan FileInfo, cfg.Concurrency*2),
 		absLocalDownloadRoot: absLocalDir,
 		progressTracker:      progressTracker,
 	}, nil
 }
 
+// logInfo logs informational messages if the log level permits.
+func (c *Client) logInfo(format string, v ...interface{}) {
+	if c.config.LogLevel >= LogLevelInfo {
+		c.infoLogger.Printf(format, v...)
+	}
+}
+
+// logError logs error messages if the log level permits.
+func (c *Client) logError(format string, v ...interface{}) {
+	if c.config.LogLevel >= LogLevelError {
+		c.errorLogger.Printf(format, v...)
+	}
+}
+
+// logVerbose logs verbose messages if the log level permits.
+func (c *Client) logVerbose(format string, v ...interface{}) {
+	if c.config.LogLevel >= LogLevelVerbose {
+		c.infoLogger.Printf(format, v...)
+	}
+}
+
 // Start initiates the download process.
 func (c *Client) Start(ctx context.Context) error {
-	c.logger.Printf("Starting client download from %s to %s", c.config.ServerURL, c.config.LocalDir)
+	c.logInfo("Starting client download from %s to %s", c.config.ServerURL, c.config.LocalDir)
 
 	if !c.config.DryRun {
 		if err := os.MkdirAll(c.config.LocalDir, 0755); err != nil {
+			c.logError("Failed to create local directory %s: %v", c.config.LocalDir, err)
 			return fmt.Errorf("failed to create local directory %s: %w", c.config.LocalDir, err)
 		}
 	} else {
-		c.logger.Printf("Dry run enabled: no files will be downloaded or created.")
+		c.logInfo("Dry run enabled: no files will be downloaded or created.")
 	}
 
 	// Fetch all file information first
 	filesToDownload, err := c.fetchFileList(ctx)
 	if err != nil {
+		c.logError("Failed to fetch file list: %v", err)
 		return fmt.Errorf("failed to fetch file list: %w", err)
 	}
 
@@ -250,7 +318,7 @@ func (c *Client) Start(ctx context.Context) error {
 		case c.queue <- fileInfo: // Try to send fileInfo
 			// Successfully sent
 		case <-ctx.Done(): // Context cancelled
-			c.logger.Printf("Client stopped populating queue due to context cancellation: %v", ctx.Err())
+			c.logInfo("Client stopped populating queue due to context cancellation: %v", ctx.Err())
 			close(c.queue)   // Close queue to unblock workers
 			c.wg.Wait()      // Wait for workers to finish current tasks
 			return ctx.Err() // Return context cancellation error
@@ -262,7 +330,7 @@ func (c *Client) Start(ctx context.Context) error {
 
 	c.progressTracker.PrintProgress(true, true)
 	//c.progressTracker.ClearProgressLine() // Clear final progress line
-	c.logger.Println("Download process completed.")
+	c.logInfo("Download process completed.")
 	return nil
 }
 
@@ -271,6 +339,7 @@ func (c *Client) Start(ctx context.Context) error {
 func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 	serverURL, err := url.Parse(c.config.ServerURL)
 	if err != nil {
+		c.logError("Invalid server URL: %v", err)
 		return nil, fmt.Errorf("invalid server URL: %w", err)
 	}
 
@@ -285,34 +354,66 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 
 	req, err := http.NewRequestWithContext(ctx, "GET", fullRequestURL, nil)
 	if err != nil {
+		c.logError("Error creating request: %v", err)
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	// Set Accept-Encoding to declare support for zstd, gzip
+	req.Header.Set("Accept-Encoding", "zstd, gzip") //
 
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		c.logError("Error making request to server: %v", err)
 		return nil, fmt.Errorf("error making request to server: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		c.logError("Server returned non-OK status for file list (%s): %s", fullRequestURL, resp.Status)
 		return nil, fmt.Errorf("server returned non-OK status for file list (%s): %s", fullRequestURL, resp.Status)
 	}
 
+	var reader io.Reader = resp.Body
+	contentEncoding := resp.Header.Get("Content-Encoding")
+
+	switch contentEncoding {
+	case "zstd":
+		c.logVerbose("Decompressing file list with Zstandard (zstd)")
+		zstdReader, zstdErr := zstd.NewReader(resp.Body)
+		if zstdErr != nil {
+			return nil, fmt.Errorf("error creating zstd reader for file list: %w", zstdErr)
+		}
+		defer zstdReader.Close()
+		reader = zstdReader
+	case "gzip":
+		c.logVerbose("File list is Gzip encoded")
+		gzipReader, gzipErr := gzip.NewReader(resp.Body)
+		if gzipErr != nil {
+			return nil, fmt.Errorf("error creating gzip reader for file list: %w", gzipErr)
+		}
+		defer gzipReader.Close() // 确保解压器关闭
+		reader = gzipReader
+	case "":
+		c.logVerbose("No content encoding for file list")
+	default:
+		c.logInfo("Warning: Unknown Content-Encoding '%s' for file list. Attempting direct read.", contentEncoding)
+	}
+
 	var collectedFiles []FileInfo // Collect files here
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(reader)
+
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			c.logger.Printf("Aborting file list fetch due to context cancellation: %v", ctx.Err())
+			c.logInfo("Aborting file list fetch due to context cancellation: %v", ctx.Err())
 			return nil, ctx.Err()
 		default:
 		}
 		line := scanner.Bytes()
 		var fileInfo FileInfo
 		if err := json.Unmarshal(line, &fileInfo); err != nil {
-			c.logger.Printf("Error unmarshaling JSON line: %v, line: %s", err, string(line))
+			c.logError("Error unmarshaling JSON line: %v, line: %s", err, string(line))
 			continue
 		}
 
@@ -336,16 +437,12 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 
 				if adjustedRelativePath != "" {
 					dirPath := filepath.Join(c.config.LocalDir, filepath.FromSlash(adjustedRelativePath))
-					if c.config.Verbose {
-						c.logger.Printf("Creating directory: %s", dirPath)
-					}
+					c.logVerbose("Creating directory: %s", dirPath)
 					if err := os.MkdirAll(dirPath, 0755); err != nil {
-						c.logger.Printf("Warning: Failed to create directory %s: %v", dirPath, err)
+						c.logError("Warning: Failed to create directory %s: %v", dirPath, err)
 					}
 				} else {
-					if c.config.Verbose {
-						c.logger.Printf("Skipping creating base directory, as it is the target local directory: %s", c.config.LocalDir)
-					}
+					c.logVerbose("Skipping creating base directory, as it is the target local directory: %s", c.config.LocalDir)
 				}
 			} else if c.config.Verbose && fileInfo.Path != requestPath {
 				urlPathRelativeToRoot := path.Clean(serverURL.Path)
@@ -364,16 +461,14 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 					}
 				}
 				if adjustedRelativePath != "" {
-					c.logger.Printf("Dry run: Would create directory: %s", filepath.Join(c.config.LocalDir, filepath.FromSlash(adjustedRelativePath)))
+					c.logVerbose("Dry run: Would create directory: %s", filepath.Join(c.config.LocalDir, filepath.FromSlash(adjustedRelativePath)))
 				}
 			}
 			continue
 		}
 
 		if !c.shouldInclude(fileInfo.Path) || c.shouldExclude(fileInfo.Path) {
-			if c.config.Verbose {
-				c.logger.Printf("Skipping %s due to include/exclude filters", fileInfo.Path)
-			}
+			c.logVerbose("Skipping %s due to include/exclude filters", fileInfo.Path)
 			continue
 		}
 
@@ -381,6 +476,7 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
+		c.logError("Error reading server response: %v", err)
 		return nil, fmt.Errorf("error reading server response: %w", err)
 	}
 
@@ -390,7 +486,7 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 		c.progressTracker.AddTotalBytes(fileInfo.Size)
 	}
 
-	c.logger.Printf("Finished fetching file list. Total files to process: %d, total bytes: %s",
+	c.logInfo("Finished fetching file list. Total files to process: %d, total bytes: %s",
 		c.progressTracker.totalFiles.Load(), formatBytes(c.progressTracker.totalBytes.Load()))
 
 	// Return the list of files to the Start method
@@ -405,15 +501,16 @@ func (c *Client) worker(ctx context.Context) {
 	for fileInfo := range c.queue {
 		select {
 		case <-ctx.Done(): // Context cancelled, exit worker
-			c.logger.Printf("worker exiting due to context cancellation: %v", ctx.Err())
+			c.logInfo("worker exiting due to context cancellation: %v", ctx.Err())
 			return // Exit the worker goroutine
 		default:
 			// Continue with download
 		}
 		err := c.downloadFile(ctx, httpClient, fileInfo)
 		if err != nil {
-			time.Sleep(1 * time.Second)
-			continue // Skip to next file in queue
+			c.logError("Failed to download file %s: %v", fileInfo.Path, err)
+			time.Sleep(250 * time.Millisecond) // Small delay before trying next file
+			continue                           // Skip to next file in queue
 		}
 		c.progressTracker.FileCompleted()
 		c.progressTracker.PrintProgress(false, false) // Force a final progress update for overall count
@@ -435,7 +532,7 @@ func encodePathSegmentPreservingSlashes(pathStr string) string {
 	return strings.Join(encodedParts, "/")
 }
 
-// downloadFile downloads a single file, supporting resume with Range header.
+// downloadFile downloads a single file, supporting resume with Range header and decompression.
 func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, fileInfo FileInfo) error {
 	select {
 	case <-ctx.Done():
@@ -444,7 +541,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	}
 	remoteURL, err := url.Parse(c.config.ServerURL)
 	if err != nil {
-		c.logger.Printf("Error parsing server URL for %s: %v", fileInfo.Path, err)
+		c.logError("Error parsing server URL for %s: %v", fileInfo.Path, err)
 		return err
 	}
 
@@ -477,35 +574,27 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	if stat, err := os.Stat(localFilePath); err == nil {
 		localFileExists = true
 		localFileSize = stat.Size()
-		if c.config.Verbose {
-			c.logger.Printf("Local file exists: %s, size: %d bytes", localFilePath, localFileSize)
-		}
+		c.logVerbose("Local file exists: %s, size: %d bytes", localFilePath, localFileSize)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("error checking local file %s: %w", localFilePath, err)
 	}
 
 	if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
-		if c.config.Verbose {
-			c.logger.Printf("Resuming download for %s. Local size: %d, Server size: %d", localFilePath, localFileSize, fileInfo.Size)
-		}
+		c.logVerbose("Resuming download for %s. Local size: %d, Server size: %d", localFilePath, localFileSize, fileInfo.Size)
 		fileMode |= os.O_APPEND
 		c.progressTracker.AddBytesDownloaded(localFileSize)
 	} else if c.config.Resume && localFileExists && localFileSize >= fileInfo.Size {
-		if c.config.Verbose {
-			c.logger.Printf("File %s already appears complete (local size %d >= server size %d). Skipping download.", localFilePath, localFileSize, fileInfo.Size)
-		}
+		c.logVerbose("File %s already appears complete (local size %d >= server size %d). Skipping download.", localFilePath, localFileSize, fileInfo.Size)
 		c.progressTracker.AddBytesDownloaded(localFileSize)
 		return nil
 	} else if localFileExists && !c.config.Overwrite {
-		if c.config.Verbose {
-			c.logger.Printf("Skipping existing file (use -o to overwrite): %s", localFilePath)
-		}
+		c.logInfo("Skipping existing file (use -o to overwrite): %s", localFilePath)
 		c.progressTracker.AddBytesDownloaded(localFileSize)
 		return nil
 	} else if localFileExists && c.config.Overwrite {
-		c.logger.Printf("Overwriting existing file: %s", localFilePath)
+		c.logInfo("Overwriting existing file: %s", localFilePath)
 	} else if c.config.DryRun {
-		c.logger.Printf("Dry run: Would download %s to %s", downloadURL, localFilePath)
+		c.logInfo("Dry run: Would download %s to %s", downloadURL, localFilePath)
 		return nil
 	}
 	// Attach context to the request for HTTP client operation
@@ -516,10 +605,11 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 
 	if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", localFileSize))
-		if c.config.Verbose {
-			c.logger.Printf("Requesting bytes %d- for %s", localFileSize, downloadURL)
-		}
+		c.logVerbose("Requesting bytes %d- for %s", localFileSize, downloadURL)
 	}
+
+	// Set Accept-Encoding for download requests as well
+	req.Header.Set("Accept-Encoding", "zstd, gzip")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -527,6 +617,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err // Propagate context cancellation error
 		}
+		c.logError("Error downloading %s: %v", downloadURL, err)
 		return fmt.Errorf("error downloading %s: %w", downloadURL, err)
 	}
 	defer resp.Body.Close()
@@ -534,13 +625,13 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	responseBytesOffset := int64(0)
 	if resp.StatusCode == http.StatusPartialContent {
 		if !c.config.Resume || !localFileExists || localFileSize >= fileInfo.Size {
-			c.logger.Printf("Warning: Received 206 Partial Content for %s but not in resume mode or file already complete. Proceeding as full download.", downloadURL)
+			c.logInfo("Warning: Received 206 Partial Content for %s but not in resume mode or file already complete. Proceeding as full download.", downloadURL)
 		}
 		responseBytesOffset = localFileSize
 	} else if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned unexpected status %s for %s", resp.Status, downloadURL)
 	} else if resp.StatusCode == http.StatusOK && c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
-		c.logger.Printf("Server does not support Range requests for %s (received 200 OK instead of 206). Restarting download.", downloadURL)
+		c.logInfo("Server does not support Range requests for %s (received 200 OK instead of 206). Restarting download.", downloadURL)
 		fileMode = os.O_CREATE | os.O_WRONLY
 	}
 
@@ -560,15 +651,44 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		}
 	}
 
+	var bodyReader io.Reader = resp.Body
+	contentEncoding := resp.Header.Get("Content-Encoding")
+
+	switch contentEncoding {
+	case "zstd":
+		c.logVerbose("Decompressing %s with Zstandard (zstd)", fileInfo.Path)
+		zstdReader, zstdErr := zstd.NewReader(resp.Body)
+		if zstdErr != nil {
+			return fmt.Errorf("error creating zstd reader for %s: %w", fileInfo.Path, zstdErr)
+		}
+		defer zstdReader.Close()
+		bodyReader = zstdReader
+	case "gzip":
+		c.logVerbose("Decompressing %s with Gzip", fileInfo.Path)
+		gzipReader, gzipErr := gzip.NewReader(resp.Body)
+		if gzipErr != nil {
+			return fmt.Errorf("error creating gzip reader for file list: %w", gzipErr)
+		}
+		defer gzipReader.Close() // 确保解压器关闭
+		bodyReader = gzipReader
+	case "":
+		c.logVerbose("No content encoding for %s", fileInfo.Path)
+	default:
+		c.logInfo("Warning: Unknown Content-Encoding '%s' for %s. Attempting direct copy.", contentEncoding, fileInfo.Path)
+	}
+
 	writerForCopy := io.Writer(outFile)
-	if !c.config.Verbose {
+	// ProgressWriter should wrap the actual file writer, not the decompression reader.
+	// The bytes will be counted *after* decompression.
+	if !c.config.Verbose { // ProgressWriter is only active if Verbose is false
 		writerForCopy = &ProgressWriter{
 			Writer:   outFile,
 			Progress: c.progressTracker,
 		}
 	}
 
-	bytesCopiedSuccessfully, err := io.Copy(writerForCopy, resp.Body) // Use the wrapped bodyReader
+	// Use the potentially decompressed bodyReader
+	bytesCopiedSuccessfully, err := io.Copy(writerForCopy, bodyReader)
 
 	if err != nil && err != io.EOF {
 		// If the error is due to context cancellation, just return it.
@@ -576,26 +696,29 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
+		c.logError("Error during file copy for %s: %v", localFilePath, err)
 		return fmt.Errorf("error during file copy for %s: %w", localFilePath, err)
 	}
 
-	if expectedBytesToRead := resp.ContentLength; expectedBytesToRead != -1 && bytesCopiedSuccessfully != expectedBytesToRead {
-		return fmt.Errorf("integrity warning: downloaded %d bytes for %s, but expected %d from response. File segment might be incomplete",
-			bytesCopiedSuccessfully, filepath.Base(localFilePath), expectedBytesToRead)
-	}
+	// Note: resp.ContentLength will be the compressed size if compression was applied by server
+	// For zstd, resp.ContentLength will be the compressed size, but bytesCopiedSuccessfully will be decompressed.
+	// We should compare finalTotalBytesOnDisk with fileInfo.Size (original size).
 
 	finalTotalBytesOnDisk := bytesCopiedSuccessfully + responseBytesOffset
 
 	if finalTotalBytesOnDisk != fileInfo.Size {
+		// This check is crucial for integrity, comparing decompressed size with expected original size
+		c.logError("CRITICAL WARNING: Final size of %s (%d bytes) does not match expected server size (%d bytes)! File is incomplete or corrupted",
+			localFilePath, finalTotalBytesOnDisk, fileInfo.Size)
 		return fmt.Errorf("CRITICAL WARNING: Final size of %s (%d bytes) does not match expected server size (%d bytes)! File is incomplete or corrupted",
 			localFilePath, finalTotalBytesOnDisk, fileInfo.Size)
 	} else {
-		c.logger.Printf("Downloaded %s (%d bytes) to %s. Total size on disk: %d bytes (expected full: %d)",
+		c.logInfo("Downloaded %s (%d bytes) to %s. Total size on disk: %d bytes (expected full: %d)",
 			filepath.Base(localFilePath), bytesCopiedSuccessfully, localFilePath, finalTotalBytesOnDisk, fileInfo.Size)
 	}
 
 	if err := os.Chtimes(localFilePath, time.Now(), fileInfo.ModTime); err != nil {
-		c.logger.Printf("Warning: Could not set modification time for %s: %v", localFilePath, err)
+		c.logInfo("Warning: Could not set modification time for %s: %v", localFilePath, err)
 	}
 
 	return nil
@@ -638,7 +761,7 @@ func (c *Client) shouldExclude(filePath string) bool {
 
 		matched, err := filepath.Match(pattern, filepath.Base(cleanFilePath))
 		if err != nil {
-			c.logger.Printf("Error with exclude pattern %s (base name): %v", pattern, err)
+			c.logError("Error with exclude pattern %s (base name): %v", pattern, err)
 			continue
 		}
 		if matched {
@@ -646,7 +769,7 @@ func (c *Client) shouldExclude(filePath string) bool {
 		}
 		matched, err = filepath.Match(pattern, cleanFilePath)
 		if err != nil {
-			c.logger.Printf("Error with exclude pattern %s (full path): %v", pattern, err)
+			c.logError("Error with exclude pattern %s (full path): %v", pattern, err)
 			continue
 		}
 		if matched {
@@ -666,7 +789,7 @@ func (c *Client) shouldInclude(filePath string) bool {
 
 		matched, err := filepath.Match(pattern, filepath.Base(cleanFilePath))
 		if err != nil {
-			c.logger.Printf("Error with include pattern %s (base name): %v", pattern, err)
+			c.logError("Error with include pattern %s (base name): %v", pattern, err)
 			continue
 		}
 		if matched {
@@ -674,7 +797,7 @@ func (c *Client) shouldInclude(filePath string) bool {
 		}
 		matched, err = filepath.Match(pattern, cleanFilePath)
 		if err != nil {
-			c.logger.Printf("Error with include pattern %s (full path): %v", pattern, err)
+			c.logError("Error with include pattern %s (full path): %v", pattern, err)
 			continue
 		}
 		if matched {
