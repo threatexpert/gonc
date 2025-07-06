@@ -34,14 +34,11 @@ import (
 )
 
 var (
-	tls_cert_EC                *tls.Certificate = nil
-	tls_cert_RSA               *tls.Certificate = nil
-	sessionReady                                = false
-	sessionSharedKey           []byte           = nil
-	secureStreamEnabled                         = false
-	goroutineConnectionCounter int32            = 0
-	udpOutputBlockSize         int              = 1320
-	kcpWindowSize              int              = 1500
+	connConfig                 *connectionConfig = nil
+	sessionReady                                 = false
+	goroutineConnectionCounter int32             = 0
+	udpOutputBlockSize         int               = 1320
+	kcpWindowSize              int               = 1500
 	app_mux_Config             *AppMuxConfig
 	app_s5s_Config             *AppS5SConfig
 	app_pf_Config              *AppPFConfig
@@ -81,9 +78,8 @@ var (
 	punchData        = flag.String("punchdata", "ping\n", "UDP punch payload")
 	MQTTServers      = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
 	autoP2P          = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
-	autoP2PKCP       = flag.String("p2p-kcp", "", "P2P session key, kcp over udp, will be retried up to 3 times upon failure.")
 	autoP2PTCP       = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
-	autoP2PTCPSS     = flag.String("p2p-ss", "", "p2p-tcp + AES-CTR")
+	useMutilPath     = flag.Bool("mp", false, "enable multipath(NOT IMPL)")
 	MQTTWait         = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
 	MQTTPush         = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
 	useIPv4          = flag.Bool("4", false, "Forces to use IPv4 addresses only")
@@ -111,8 +107,8 @@ func init() {
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", kcpWindowSize, "")
 }
 
-func init_TLS(genCertForced bool) {
-	var err error
+func init_TLS(genCertForced bool) []tls.Certificate {
+	var certs []tls.Certificate
 	if isTLSEnabled() {
 		if *listenMode || *kcpSEnabled {
 			*tlsServerMode = true
@@ -128,31 +124,34 @@ func init_TLS(genCertForced bool) {
 				} else {
 					fmt.Fprintf(os.Stderr, "Generating ECDSA(randomly) cert for secure communication...")
 				}
-				tls_cert_EC, err = misc.GenerateECDSACertificate(*tlsSNI, *presharedKey)
+				cert, err := misc.GenerateECDSACertificate(*tlsSNI, *presharedKey)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error generating EC certificate: %v\n", err)
 					os.Exit(1)
 				}
+				certs = append(certs, *cert)
 			}
 			if *tlsRSACertEnabled {
 				fmt.Fprintf(os.Stderr, "Generating RSA cert...")
-				tls_cert_RSA, err = misc.GenerateRSACertificate(*tlsSNI)
+				cert, err := misc.GenerateRSACertificate(*tlsSNI)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error generating RSA certificate: %v\n", err)
 					os.Exit(1)
 				}
+				certs = append(certs, *cert)
 			}
 			fmt.Fprintf(os.Stderr, "completed.\n")
 
 		}
 	}
+	return certs
 }
 
 func isTLSEnabled() bool {
 	return *tlsServerMode || *tlsEnabled || *tls10_forced || *tls11_forced || *tls12_forced || *tls13_forced
 }
 
-func do_TLS(conn net.Conn) net.Conn {
+func do_TLS(config *connectionConfig, conn net.Conn) net.Conn {
 	// 获取所有安全加密套件
 	safeCiphers := tls.CipherSuites()
 	// 获取所有不安全加密套件
@@ -174,19 +173,19 @@ func do_TLS(conn net.Conn) net.Conn {
 		MaxVersion:               tls.VersionTLS13, // 最大支持 TLSv1.3
 		PreferServerCipherSuites: true,             // 优先使用服务器的密码套件
 	}
-	if *tls10_forced {
+	if config.secureLayer == "tls10" {
 		tlsConfig.MinVersion = tls.VersionTLS10
 		tlsConfig.MaxVersion = tls.VersionTLS10
 	}
-	if *tls11_forced {
+	if config.secureLayer == "tls11" {
 		tlsConfig.MinVersion = tls.VersionTLS11
 		tlsConfig.MaxVersion = tls.VersionTLS11
 	}
-	if *tls12_forced {
+	if config.secureLayer == "tls12" {
 		tlsConfig.MinVersion = tls.VersionTLS12
 		tlsConfig.MaxVersion = tls.VersionTLS12
 	}
-	if *tls13_forced {
+	if config.secureLayer == "tls13" {
 		tlsConfig.MinVersion = tls.VersionTLS13
 		tlsConfig.MaxVersion = tls.VersionTLS13
 	}
@@ -195,32 +194,26 @@ func do_TLS(conn net.Conn) net.Conn {
 	defer cancel()
 	// 使用 TLS 握手
 	var conn_tls *tls.Conn
-	var certs []tls.Certificate
+	var certs []tls.Certificate = config.certs
 
-	if tls_cert_RSA != nil {
-		certs = append(certs, *tls_cert_RSA)
-	}
-	if tls_cert_EC != nil {
-		certs = append(certs, *tls_cert_EC)
-	}
-	if *tlsServerMode {
-		tlsConfig.Certificates = certs
-		if *presharedKey != "" {
+	if !config.isClient {
+		tlsConfig.Certificates = config.certs
+		if config.key != "" && config.keyType == "PSK" {
 			tlsConfig.ClientAuth = tls.RequireAnyClientCert
-			tlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(*presharedKey)
-			fmt.Fprintf(os.Stderr, "Performing TLS-S handshake (PSK-based mutual authentication)...")
+			tlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
+			fmt.Fprintf(os.Stderr, "%sPerforming TLS-S handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing TLS-S handshake...")
+			fmt.Fprintf(os.Stderr, "%sPerforming TLS-S handshake...", config.label)
 		}
 		conn_tls = tls.Server(conn, tlsConfig)
 	} else {
 		tlsConfig.ServerName = *tlsSNI
-		if *presharedKey != "" {
+		if config.key != "" && config.keyType == "PSK" {
 			tlsConfig.Certificates = certs
-			tlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(*presharedKey)
-			fmt.Fprintf(os.Stderr, "Performing TLS-C handshake (PSK-based mutual authentication)...")
+			tlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
+			fmt.Fprintf(os.Stderr, "%sPerforming TLS-C handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing TLS-C handshake...")
+			fmt.Fprintf(os.Stderr, "%sPerforming TLS-C handshake...", config.label)
 		}
 		conn_tls = tls.Client(conn, tlsConfig)
 	}
@@ -232,7 +225,7 @@ func do_TLS(conn net.Conn) net.Conn {
 	return conn_tls
 }
 
-func do_DTLS(conn net.Conn) net.Conn {
+func do_DTLS(config *connectionConfig, conn net.Conn) net.Conn {
 	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
 	allCiphers := []dtls.CipherSuiteID{
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -260,33 +253,25 @@ func do_DTLS(conn net.Conn) net.Conn {
 	// 开启NAT打洞， 首包是4秒后发出punch包
 	startUDPKeepAlive(ctx, conn, []byte(*punchData), 4*time.Second, intervalChange)
 
-	var certs []tls.Certificate
-	if tls_cert_RSA != nil {
-		certs = append(certs, *tls_cert_RSA)
-	}
-	if tls_cert_EC != nil {
-		certs = append(certs, *tls_cert_EC)
-	}
-
-	if *tlsServerMode {
-		dtlsConfig.Certificates = certs
-		if *presharedKey != "" {
+	if !config.isClient {
+		dtlsConfig.Certificates = config.certs
+		if config.key != "" && config.keyType == "PSK" {
 			dtlsConfig.ClientAuth = dtls.RequireAnyClientCert
-			dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(*presharedKey)
-			fmt.Fprintf(os.Stderr, "Performing DTLS-S handshake (PSK-based mutual authentication)...")
+			dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
+			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-S handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing DTLS-S handshake...")
+			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-S handshake...", config.label)
 		}
 		//dtls.Server 不会主动发包，startUDPKeepAlive4秒后发出punch包有助于P2P建立通信
 		dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
 	} else {
 		dtlsConfig.ServerName = *tlsSNI
-		if *presharedKey != "" {
-			dtlsConfig.Certificates = certs
-			dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(*presharedKey)
-			fmt.Fprintf(os.Stderr, "Performing DTLS-C handshake (PSK-based mutual authentication)...")
+		if config.key != "" && config.keyType == "PSK" {
+			dtlsConfig.Certificates = config.certs
+			dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
+			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-C handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing DTLS-C handshake...")
+			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-C handshake...", config.label)
 		}
 		//dtls.Client 会立刻发出hello包，dtls.Server
 		dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
@@ -398,7 +383,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 							connCount,
 							h, m, s,
 						)
-					} else {
+					} else if connCount == 1 {
 						fmt.Fprintf(os.Stderr,
 							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \r",
 							misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
@@ -458,12 +443,12 @@ func conflictCheck() {
 		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
 		os.Exit(1)
 	}
-	if *listenMode && (*remoteAddr != "" || *autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+	if *listenMode && (*remoteAddr != "" || *autoP2P != "" || *autoP2PTCP != "") {
 		fmt.Fprintf(os.Stderr, "-l and (-remote -p2p) cannot be used together\n")
 		os.Exit(1)
 	}
-	if *autoP2P != "" && (*autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
-		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-kcp, -p2p-tcp, -p2p-ss) cannot be used together\n")
+	if *autoP2P != "" && (*autoP2PTCP != "") {
+		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-tcp) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *presharedKey != "" && *tlsRSACertEnabled {
@@ -574,7 +559,6 @@ func main() {
 		os.Exit(1)
 	}
 	if *presharedKey != "" {
-		secureStreamEnabled = true
 		if strings.HasPrefix(*presharedKey, "@") {
 			*presharedKey, err = ReadPSKFile(*presharedKey)
 			if err != nil {
@@ -629,7 +613,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", *remoteAddr, err)
 			os.Exit(1)
 		}
-	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PKCP != "" || *autoP2PTCP != "" || *autoP2PTCPSS != "") {
+	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PTCP != "") {
 		if *proxyAddr != "" {
 			fmt.Fprintf(os.Stderr, "INFO: proxy is ignored with p2p\n")
 			*proxyAddr = ""
@@ -645,24 +629,9 @@ func main() {
 			*kcpEnabled = true //需要kcp实现稳定传输
 			*udpProtocol = true
 			network = "udp"
-		} else if *autoP2PKCP != "" {
-			P2PSessionKey = *autoP2PKCP
-			*kcpEnabled = true
-			*udpProtocol = true
-			network = "udp"
-			// if *tlsServerMode || *kcpSEnabled {
-			// 	misc.DebugServerRole = "S"
-			// } else {
-			// 	misc.DebugServerRole = "C"
-			// }
 		} else if *autoP2PTCP != "" {
 			P2PSessionKey = *autoP2PTCP
 			*udpProtocol = false
-			network = "tcp"
-		} else if *autoP2PTCPSS != "" {
-			P2PSessionKey = *autoP2PTCPSS
-			*udpProtocol = false
-			secureStreamEnabled = true
 			network = "tcp"
 		} else {
 			os.Exit(1)
@@ -702,8 +671,10 @@ func main() {
 		}
 	}
 
-	genCertForced := *presharedKey != ""
-	init_TLS(genCertForced)
+	connConfig, err = preinitConnectionConfig()
+	if err != nil {
+		panic(err)
+	}
 
 	if *useDNS != "" {
 		setDns(*useDNS)
@@ -714,49 +685,50 @@ func main() {
 		}
 	}
 
+	//p2p模式
 	if P2PSessionKey != "" {
-		if *keepOpen {
-			// 创建进度统计
-			stats_in := misc.NewProgressStats()
-			stats_out := misc.NewProgressStats()
-			if *progressEnabled {
-				// 启动进度显示
-				wg = &sync.WaitGroup{}
-				done = make(chan bool)
-				showProgress(stats_in, stats_out, done, wg)
-			}
+		// 创建进度统计
+		stats_in := misc.NewProgressStats()
+		stats_out := misc.NewProgressStats()
+		if *progressEnabled {
+			// 启动进度显示
+			wg = &sync.WaitGroup{}
+			done = make(chan bool)
+			showProgress(stats_in, stats_out, done, wg)
+		}
 
+		if *keepOpen {
 			for {
-				conn, err = do_P2P(network, P2PSessionKey)
+				nconn, err := do_P2P_multipath(network, P2PSessionKey, *useMutilPath)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 					time.Sleep(10 * time.Second)
 					continue
 				}
 				if *MQTTWait != "" {
-					go handleConnection(conn, stats_in, stats_out)
+					go handleNegotiatedConnection(nconn, stats_in, stats_out)
 				} else {
-					handleConnection(conn, stats_in, stats_out)
+					handleNegotiatedConnection(nconn, stats_in, stats_out)
 				}
 				time.Sleep(2 * time.Second)
 			}
 		} else {
-			conn, err = do_P2P(network, P2PSessionKey)
+			nconn, err := do_P2P_multipath(network, P2PSessionKey, *useMutilPath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 				os.Exit(1)
 			}
-			network = conn.LocalAddr().Network()
+			handleNegotiatedConnection(nconn, stats_in, stats_out)
 		}
+		if *progressEnabled {
+			done <- true
+			wg.Wait()
+		}
+		return
 	}
 
-	dialer, err := createClientDialer(*proxyProt, *proxyAddr, *auth)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error create client dialer: %v\n", err)
-		os.Exit(1)
-	}
+	// 监听模式
 	if *listenMode {
-		// 监听模式
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
 			if err != nil {
@@ -820,7 +792,7 @@ func main() {
 					if isKCPEnabled() {
 						buconn.SetIdleTimeout(time.Duration(easyp2p.UDPIdleTimeoutSecond) * time.Second)
 					}
-					handleConnection(buconn, stats_in, stats_out)
+					handleConnection(connConfig, buconn, stats_in, stats_out)
 					time.Sleep(1 * time.Second)
 				}
 			} else {
@@ -879,7 +851,7 @@ func main() {
 					} else {
 						fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
 					}
-					go handleConnection(conn, stats_in, stats_out)
+					go handleConnection(connConfig, conn, stats_in, stats_out)
 				}
 			} else {
 				conn, err = listener.Accept()
@@ -895,13 +867,13 @@ func main() {
 				}
 			}
 		}
-	} else if conn == nil {
+	} else {
+		//主动连接模式
 
 		// go func() {
 		// 	log.Println(http.ListenAndServe("localhost:6060", nil))
 		// }()
 
-		//主动连接模式
 		var localAddr net.Addr
 		var localTcpAddr *net.TCPAddr
 
@@ -929,6 +901,12 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+		}
+
+		dialer, err := createClientDialer(*proxyProt, *proxyAddr, *auth)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error create client dialer: %v\n", err)
+			os.Exit(1)
 		}
 
 		if *useUNIXdomain {
@@ -980,7 +958,7 @@ func main() {
 		showProgress(stats_in, stats_out, done, wg)
 	}
 
-	handleConnection(conn, stats_in, stats_out)
+	handleConnection(connConfig, conn, stats_in, stats_out)
 	if *progressEnabled {
 		done <- true
 		wg.Wait()
@@ -1107,68 +1085,200 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
-func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
-	defer conn.Close()
+type connectionConfig struct {
+	label         string
+	isClient      bool
+	secureLayer   string //tls tls13 dtls ss
+	certs         []tls.Certificate
+	kcpWithUDP    bool
+	kcpEncryption bool //是否开启kcp加密
+	key           string
+	keyType       string // ECDHE or PSK
+}
+
+func preinitConnectionConfig() (*connectionConfig, error) {
+	config := &connectionConfig{}
+
+	genCertForced := *presharedKey != ""
+	config.certs = init_TLS(genCertForced)
+
+	if *listenMode || *kcpSEnabled || *tlsServerMode {
+		config.isClient = false
+	} else {
+		config.isClient = true
+	}
+
+	if *presharedKey != "" {
+		config.keyType = "PSK"
+		config.key = *presharedKey
+	}
+
+	if *udpProtocol {
+		config.kcpWithUDP = isKCPEnabled()
+		if isTLSEnabled() {
+			config.secureLayer = "dtls"
+		} else if config.kcpWithUDP && config.key != "" {
+			config.kcpEncryption = true
+		}
+	} else {
+		if isTLSEnabled() {
+			if *tls10_forced {
+				config.secureLayer = "tls10"
+			} else if *tls11_forced {
+				config.secureLayer = "tls11"
+			} else if *tls12_forced {
+				config.secureLayer = "tls12"
+			} else if *tls13_forced {
+				config.secureLayer = "tls13"
+			} else {
+				config.secureLayer = "tls"
+			}
+		} else if config.key != "" {
+			config.secureLayer = "ss"
+		}
+	}
+
+	return config, nil
+}
+
+type negotiatedConn struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	connLayers []net.Conn
+	isUDP      bool
+}
+
+func (nconn *negotiatedConn) Close() error {
+	if nconn.cancel != nil {
+		nconn.cancel()
+	}
+	for _, c := range nconn.connLayers {
+		c.Close()
+	}
+	nconn.connLayers = []net.Conn{}
+	nconn.ctx = nil
+	nconn.cancel = nil
+	return nil
+}
+
+func (nconn *negotiatedConn) Read(b []byte) (int, error) {
+	return nconn.connLayers[0].Read(b)
+}
+
+func (nconn *negotiatedConn) Write(b []byte) (int, error) {
+	return nconn.connLayers[0].Write(b)
+}
+
+func (nconn *negotiatedConn) CloseWrite() error {
+	if cw, ok := nconn.connLayers[0].(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nconn.connLayers[0].Close()
+}
+
+func (nconn *negotiatedConn) LocalAddr() net.Addr {
+	return nconn.connLayers[0].LocalAddr()
+}
+
+func (nconn *negotiatedConn) RemoteAddr() net.Addr {
+	return nconn.connLayers[0].RemoteAddr()
+}
+
+func (nconn *negotiatedConn) SetDeadline(t time.Time) error {
+	return nconn.connLayers[0].SetDeadline(t)
+}
+
+func (nconn *negotiatedConn) SetReadDeadline(t time.Time) error {
+	return nconn.connLayers[0].SetReadDeadline(t)
+}
+
+func (nconn *negotiatedConn) SetWriteDeadline(t time.Time) error {
+	return nconn.connLayers[0].SetWriteDeadline(t)
+}
+
+func do_Negotiation(cfg *connectionConfig, rawconn net.Conn) (*negotiatedConn, error) {
+	nconn := &negotiatedConn{
+		connLayers: []net.Conn{rawconn},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() {
+		if nconn.cancel == nil {
+			cancel()
+			for i, c := range nconn.connLayers {
+				if i != len(nconn.connLayers)-1 { // 最后一个连接是原始连接，发送错误时不关闭，还给调用者处置
+					c.Close()
+				}
+			}
+		}
+	}()
+
+	if strings.HasPrefix(rawconn.LocalAddr().Network(), "udp") {
+		nconn.isUDP = true
+		configUDPConn(rawconn)
+	} else {
+		configTCPKeepalive(rawconn)
+	}
+
+	switch {
+	case strings.HasPrefix(cfg.secureLayer, "tls"):
+		conn_tls := do_TLS(cfg, nconn.connLayers[0])
+		if conn_tls == nil {
+			return nil, fmt.Errorf("failed to establish TLS connection")
+		}
+		nconn.connLayers = append([]net.Conn{conn_tls}, nconn.connLayers...)
+	case cfg.secureLayer == "dtls":
+		conn_dtls := do_DTLS(cfg, nconn.connLayers[0])
+		if conn_dtls == nil {
+			return nil, fmt.Errorf("failed to establish DTLS connection")
+		}
+		nconn.connLayers = append([]net.Conn{conn_dtls}, nconn.connLayers...)
+	case cfg.secureLayer == "ss":
+		var key32 [32]byte
+		if cfg.keyType == "ECDHE" {
+			copy(key32[:], []byte(cfg.key))
+			fmt.Fprintf(os.Stderr, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.label)
+		} else if cfg.keyType == "PSK" {
+			k, err := misc.DerivePSK(cfg.key)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%sFailed to derive key for secure stream: %v\n", cfg.label, err)
+				return nil, err
+			}
+			copy(key32[:], k)
+			fmt.Fprintf(os.Stderr, "%sCommunication is encrypted(PSK) with AES.\n", cfg.label)
+		} else {
+			fmt.Fprintf(os.Stderr, "%sMissing key type for secure stream\n", cfg.label)
+			return nil, fmt.Errorf("missing key type for secure stream")
+		}
+		connss := misc.NewSecureStreamConn(nconn.connLayers[0], key32)
+		nconn.connLayers = append([]net.Conn{connss}, nconn.connLayers...)
+	default:
+	}
+
+	if cfg.kcpWithUDP && nconn.isUDP {
+		sess_kcp := do_KCP(ctx, cfg, nconn.connLayers[0], rawconn, 30*time.Second)
+		if sess_kcp == nil {
+			return nil, fmt.Errorf("failed to establish KCP session")
+		}
+		nconn.connLayers = append([]net.Conn{sess_kcp}, nconn.connLayers...)
+	}
+
+	nconn.ctx = ctx
+	nconn.cancel = cancel
+	return nconn, nil
+}
+
+func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc.ProgressStats) {
 	defer atomic.AddInt32(&goroutineConnectionCounter, -1)
 	atomic.AddInt32(&goroutineConnectionCounter, 1)
 
-	configTCPKeepalive(conn)
+	defer nconn.Close()
+
+	conn := nconn.connLayers[0]
 
 	var bufsize int = 32 * 1024
 	blocksize := bufsize
-	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+	if nconn.isUDP {
 		blocksize = udpOutputBlockSize
-	}
-
-	// 如果启用 TLS，优先使用TLS作为安全加密层
-	if isTLSEnabled() {
-		if *udpProtocol {
-			conn_dtls := do_DTLS(conn)
-			if conn_dtls == nil {
-				return
-			}
-			defer conn_dtls.Close()
-			conn = conn_dtls
-		} else {
-			conn_tls := do_TLS(conn)
-			if conn_tls == nil {
-				return
-			}
-			defer conn_tls.Close()
-			conn = conn_tls
-		}
-	}
-
-	if isKCPEnabled() {
-		sess_kcp := do_KCP(ctx, conn, 30*time.Second)
-		if sess_kcp == nil {
-			return
-		}
-		defer sess_kcp.Close()
-		conn = sess_kcp
-	}
-
-	//如果没有TLS和KCP协议，-psk的密钥将直接对会话流进行加密，UDP由于非稳定传输NewSecureStreamConn不支持
-	if secureStreamEnabled && !isTLSEnabled() && !*udpProtocol {
-		var key32 [32]byte
-		if sessionSharedKey != nil {
-			copy(key32[:], sessionSharedKey)
-			fmt.Fprintf(os.Stderr, "Communication is encrypted(ECDHE) with AES.\n")
-		} else if *presharedKey != "" {
-			k, err := misc.DerivePSK(*presharedKey)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to derive key for secure stream\n")
-				return
-			}
-			copy(key32[:], k)
-			fmt.Fprintf(os.Stderr, "Communication is encrypted(PSK) with AES.\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "Missing key for secure stream\n")
-			return
-		}
-		conn = misc.NewSecureStreamConn(conn, key32)
 	}
 
 	if !sessionReady {
@@ -1368,6 +1478,15 @@ func handleConnection(conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
 	}
 }
 
+func handleConnection(cfg *connectionConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
+	nconn, err := do_Negotiation(cfg, conn)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	handleNegotiatedConnection(nconn, stats_in, stats_out)
+}
+
 func configTCPKeepalive(conn net.Conn) {
 	if *keepAlive > 0 {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -1421,40 +1540,38 @@ func isKCPEnabled() bool {
 	return *udpProtocol && (*kcpEnabled || *kcpSEnabled)
 }
 
-func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn {
+func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Conn, timeout time.Duration) net.Conn {
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
-	var keyType = ""
-	//如果已经有TLS加密了，则不再给KCP配置加密
-	if sessionSharedKey != nil && !isTLSEnabled() {
-		blockCrypt, err = createKCPBlockCryptFromKey(sessionSharedKey)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "createKCPBlockCryptFromKey failed: %v\n", err)
-			return nil
+	if config.kcpEncryption {
+		if config.keyType == "ECDHE" {
+			blockCrypt, err = createKCPBlockCryptFromKey([]byte(config.key))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%screateKCPBlockCryptFromKey failed: %v\n", config.label, err)
+				return nil
+			}
+		} else if config.keyType == "PSK" {
+			blockCrypt, err = createKCPBlockCrypt(config.key, []byte("1234567890abcdef"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%screateKCPBlockCrypt failed: %v\n", config.label, err)
+				return nil
+			}
 		}
-		keyType = "ECDHE"
-	} else if *presharedKey != "" && !isTLSEnabled() {
-		blockCrypt, err = createKCPBlockCrypt(*presharedKey, []byte("1234567890abcdef"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "createKCPBlockCrypt failed: %v\n", err)
-			return nil
-		}
-		keyType = "PSK"
 	}
 
 	// 通知keepalive调整间隔
 	intervalChange := make(chan time.Duration, 1)
 
 	// 启动 keepalive
-	startUDPKeepAlive(ctx, conn, []byte(*punchData), 2*time.Second, intervalChange)
+	startUDPKeepAlive(ctx, rawconn, []byte(*punchData), 2*time.Second, intervalChange)
 
 	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
-	if *listenMode || *kcpSEnabled {
+	if !config.isClient {
 		if blockCrypt == nil {
-			fmt.Fprintf(os.Stderr, "Performing KCP-S handshake...")
+			fmt.Fprintf(os.Stderr, "%sPerforming KCP-S handshake...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing encrypted(%s) KCP-S handshake...", keyType)
+			fmt.Fprintf(os.Stderr, "%sPerforming encrypted(%s) KCP-S handshake...", config.label, config.keyType)
 		}
 		listener, err := kcp.ServeConn(blockCrypt, 10, 3, pktconn)
 		if err != nil {
@@ -1493,9 +1610,9 @@ func do_KCP(ctx context.Context, conn net.Conn, timeout time.Duration) net.Conn 
 		}
 	} else {
 		if blockCrypt == nil {
-			fmt.Fprintf(os.Stderr, "Performing KCP-C handshake...")
+			fmt.Fprintf(os.Stderr, "%sPerforming KCP-C handshake...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "Performing encrypted(%s) KCP-C handshake using...", keyType)
+			fmt.Fprintf(os.Stderr, "%sPerforming encrypted(%s) KCP-C handshake using...", config.label, config.keyType)
 		}
 		sess, err = kcp.NewConn(conn.RemoteAddr().String(), blockCrypt, 10, 3, pktconn)
 		if err != nil {
@@ -1635,116 +1752,50 @@ func Mqtt_stop_pushing() {
 	}
 }
 
-func do_P2P(network, sessionKey string) (net.Conn, error) {
-	var err error
-	var conn net.Conn
-	var isRoleClient bool
+func do_P2P(network, sessionKey string) (*negotiatedConn, error) {
 	defer Mqtt_stop_pushing()
 
-	err = Mqtt_ensure_ready(sessionKey)
+	err := Mqtt_ensure_ready(sessionKey)
 	if err != nil {
 		return nil, err
 	}
-	conn, isRoleClient, sessionSharedKey, err = easyp2p.Easy_P2P(network, sessionKey, os.Stderr)
+	connInfo, err := easyp2p.Easy_P2P(network, sessionKey, os.Stderr)
 	if err != nil {
 		return nil, err
 	}
-
-	if strings.HasPrefix(network, "any") {
-		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-			*udpProtocol = true
-			if isRoleClient {
-				*kcpSEnabled = false
-				*kcpEnabled = true
-			} else {
-				*kcpSEnabled = true
-				*kcpEnabled = false
-			}
-		} else {
-			*udpProtocol = false
-			*kcpSEnabled = false
-			*kcpEnabled = false
-		}
-		*tlsEnabled = true
-		*tls13_forced = true
-		*tlsServerMode = !isRoleClient
-	} else if strings.HasPrefix(network, "udp") {
-		*udpProtocol = true
-		if isRoleClient {
-			//client mode
-			*kcpSEnabled = false
-			*kcpEnabled = true
-		} else {
-			*kcpSEnabled = true
-			*kcpEnabled = false
-		}
-		if isTLSEnabled() {
-			*tlsServerMode = !isRoleClient
-		}
-	} else if strings.HasPrefix(network, "tcp") {
-		if secureStreamEnabled {
-			zeroBytes := make([]byte, 32)
-			if sessionSharedKey == nil || len(sessionSharedKey) != 32 || bytes.Equal(sessionSharedKey, zeroBytes) {
-				conn.Close()
-				return nil, fmt.Errorf("expect a 32 bytes session key")
-			}
-		}
-		*udpProtocol = false
-		*kcpSEnabled = false
-		*kcpEnabled = false
-		if isTLSEnabled() {
-			*tlsServerMode = !isRoleClient
-			*tls13_forced = true
-		}
+	conn := connInfo.Conns[0]
+	config := connectionConfig{
+		key:      sessionKey,
+		keyType:  "PSK",
+		certs:    connConfig.certs,
+		isClient: connInfo.IsClient,
+	}
+	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+		config.kcpWithUDP = true
+		config.secureLayer = "dtls"
 	} else {
-		return nil, fmt.Errorf("unexpected p2p mode")
+		config.kcpWithUDP = false
+		config.secureLayer = "tls13"
 	}
 
-	if conn != nil {
-		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-			configUDPConn(conn)
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
-		} else {
-			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
-		}
+	nconn, err := do_Negotiation(&config, conn)
+	if err != nil {
+		return nil, err
 	}
-
-	return conn, nil
+	if nconn.isUDP {
+		fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
+	} else {
+		fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+	}
+	return nconn, nil
 }
 
-func parsePeerAddressRange(peer string) (host string, startPort, endPort int) {
-	host, portPart, err := net.SplitHostPort(peer)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid peer address: %v\n", err)
-		os.Exit(1)
+func do_P2P_multipath(network, sessionKey string, enableMP bool) (*negotiatedConn, error) {
+	if !enableMP {
+		return do_P2P(network, sessionKey)
 	}
-
-	if strings.Contains(portPart, "-") {
-		ports := strings.SplitN(portPart, "-", 2)
-		startPort, err = strconv.Atoi(ports[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid start port: %v\n", err)
-			os.Exit(1)
-		}
-		endPort, err = strconv.Atoi(ports[1])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid end port: %v\n", err)
-			os.Exit(1)
-		}
-		if startPort > endPort {
-			fmt.Fprintf(os.Stderr, "Start port greater than end port\n")
-			os.Exit(1)
-		}
-	} else {
-		startPort, err = strconv.Atoi(portPart)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid port: %v\n", err)
-			os.Exit(1)
-		}
-		endPort = startPort
-	}
-
-	return host, startPort, endPort
+	//建立多个连接，例如包含UDP TCP TCP6几个会话，然后封装为哪个协议快用哪个，规避Qos
+	return nil, fmt.Errorf("multipath not implemented yet")
 }
 
 func ReadPSKFile(filepath string) (string, error) {

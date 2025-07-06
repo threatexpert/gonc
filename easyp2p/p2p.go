@@ -666,7 +666,21 @@ func p2pInfoPrint(logWriter io.Writer, p2pInfo *P2PAddressInfo) {
 	}
 }
 
-func Easy_P2P(network, sessionUid string, logWriter io.Writer) (net.Conn, bool, []byte, error) {
+type P2PConnInfo struct {
+	Conns     []net.Conn
+	SharedKey [32]byte
+	IsClient  bool
+}
+
+func Easy_P2P(network, sessionUid string, logWriter io.Writer) (*P2PConnInfo, error) {
+	connInfo, err := Easy_P2P_MP(network, sessionUid, false, logWriter)
+	if err != nil {
+		return nil, err
+	}
+	return connInfo, nil
+}
+
+func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, logWriter io.Writer) (*P2PConnInfo, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	var networksToTryStun []string
 	switch network {
@@ -683,7 +697,7 @@ func Easy_P2P(network, sessionUid string, logWriter io.Writer) (net.Conn, bool, 
 	case "tcp6", "tcp4", "udp6", "udp4":
 		networksToTryStun = []string{network}
 	default:
-		return nil, false, nil, fmt.Errorf("unsupported network type: '%s'", network)
+		return nil, fmt.Errorf("unsupported network type: '%s'", network)
 	}
 
 	fmt.Fprintf(logWriter, "=== Checking NAT reachability ===\n")
@@ -692,22 +706,51 @@ func Easy_P2P(network, sessionUid string, logWriter io.Writer) (net.Conn, bool, 
 	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, 25*time.Second, true, logWriter)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
-		return nil, false, nil, fmt.Errorf("failed to exchange address info: %w", err)
+		return nil, fmt.Errorf("failed to exchange address info: %w", err)
 	}
 	// Do_autoP2PEx返回的p2pInfos是优先考虑建立TCP来排序的。
 	var p2pInfo *P2PAddressInfo
 	var round int
+	var CorS []bool = []bool{false, true, false}
+	var role int = 0 // 0: unknown, 1: client, 2: server
+	var mconn []net.Conn
+	var sharedKey [32]byte
+
 	for round, p2pInfo = range p2pInfos {
 		if strings.HasPrefix(p2pInfo.Network, "tcp") {
 			conn, isRoleClient, _, err2 := Auto_P2P_TCP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
 			if err2 == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
+				mconn = append(mconn, conn)
+				if role == 0 {
+					if isRoleClient {
+						role = 1
+					} else {
+						role = 2
+					}
+					sharedKey = p2pInfo.SharedKey
+				}
+				if !multipathEnabled {
+					break
+				}
+				continue
 			}
 			err = err2
 		} else {
 			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
 			if err2 == nil {
-				return conn, isRoleClient, p2pInfo.SharedKey[:], nil
+				mconn = append(mconn, conn)
+				if role == 0 {
+					if isRoleClient {
+						role = 1
+					} else {
+						role = 2
+					}
+					sharedKey = p2pInfo.SharedKey
+				}
+				if !multipathEnabled {
+					break
+				}
+				continue
 			}
 			err = err2
 		}
@@ -718,7 +761,16 @@ func Easy_P2P(network, sessionUid string, logWriter io.Writer) (net.Conn, bool, 
 		time.Sleep(1 * time.Second)
 	}
 
-	return nil, false, nil, fmt.Errorf("direct P2P connection failed")
+	if len(mconn) > 0 {
+		connInfo := &P2PConnInfo{
+			Conns:     mconn,
+			SharedKey: sharedKey,
+			IsClient:  CorS[role],
+		}
+		return connInfo, nil
+	}
+
+	return nil, fmt.Errorf("direct P2P connection failed")
 }
 
 func generateRandomPorts(count int) []int {
