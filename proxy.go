@@ -12,6 +12,7 @@ import (
 
 type Dialer interface {
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
+	Listen(network, address string) (net.Listener, error)
 }
 
 type HttpConnectClient struct {
@@ -95,6 +96,10 @@ func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Du
 	return proxyConn, nil
 }
 
+func (c *HttpConnectClient) Listen(network, address string) (net.Listener, error) {
+	return nil, fmt.Errorf("N/A")
+}
+
 // ProxyClient 通用代理客户端
 type ProxyClient struct {
 	ProxyProt string // 代理协议类型："socks5" 或 "http"
@@ -134,10 +139,19 @@ func (d *DirectDialer) DialTimeout(network, address string, timeout time.Duratio
 	return net.DialTimeout(network, address, timeout)
 }
 
+func (c *DirectDialer) Listen(network, address string) (net.Listener, error) {
+	return nil, fmt.Errorf("N/A")
+}
+
 // Dial 实现 ProxyClient 的拨号逻辑，委托给内部的 dialer
 func (c *ProxyClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	if c.dialer == nil {
 		return nil, fmt.Errorf("proxy client not initialized, call NewProxyClient first")
 	}
 	return c.dialer.DialTimeout(network, address, timeout)
+}
+
+func (c *ProxyClient) SupportBIND() bool {
+	// 目前仅 SOCKS5 支持 BIND
+	return c.ProxyProt == "socks5"
 }

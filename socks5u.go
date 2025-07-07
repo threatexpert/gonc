@@ -20,6 +20,7 @@ const (
 	SOCKS5_VERSION = 0x05
 	// 命令码
 	CMD_CONNECT       = 0x01 // TCP CONNECT
+	CMD_BIND          = 0x02 // TCP BIND
 	CMD_UDP_ASSOCIATE = 0x03 // UDP ASSOCIATE
 
 	// UDP 代理相关常量
@@ -272,6 +273,12 @@ func handleSocks5Request(clientConn net.Conn) (*Socks5Request, error) {
 	case CMD_CONNECT:
 		return &Socks5Request{
 			Command: "CONNECT",
+			Host:    host,
+			Port:    port,
+		}, nil
+	case CMD_BIND:
+		return &Socks5Request{
+			Command: "BIND",
 			Host:    host,
 			Port:    port,
 		}, nil
@@ -601,6 +608,97 @@ func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort i
 	return nil
 }
 
+func handleTCPListen(clientConn net.Conn, targetHost string, targetPort int) error {
+	lc := net.ListenConfig{}
+	if targetHost == "" {
+		local, ok := clientConn.LocalAddr().(*net.TCPAddr)
+		if ok {
+			targetHost = local.IP.String()
+		}
+	}
+	bindAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+	listener, err := lc.Listen(context.Background(), "tcp", bindAddr)
+	if err != nil {
+		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		return fmt.Errorf("bind to %v failed: %w", bindAddr, err)
+	}
+
+	localAddr := listener.Addr()
+	local, ok := localAddr.(*net.TCPAddr)
+	if !ok {
+		listener.Close()
+		return fmt.Errorf("bind to %v failed: local address is %s://%s", bindAddr, localAddr.Network(), localAddr.String())
+	}
+
+	err = sendSocks5Response(clientConn, REP_SUCCEEDED, local.IP.String(), local.Port)
+	if err != nil {
+		return fmt.Errorf("send response error: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background()) // 控制 goroutine 正常退出
+	wg.Add(1)
+
+	// 监控 clientConn 是否异常
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1)
+		for {
+			// 设置1秒超时
+			_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_, err := clientConn.Read(buf)
+
+			if err != nil {
+				// 检查是否是超时（非致命）
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					select {
+					case <-ctx.Done():
+						// 收到主线程通知，正常退出
+						return
+					default:
+						// 超时但还要继续循环
+						continue
+					}
+				}
+
+				// 其他错误，说明连接断了或异常
+				listener.Close() // 主动关闭 Accept
+				return
+			}
+
+			// 如果读到数据（buf 非空），也认为异常
+			listener.Close()
+			return
+		}
+	}()
+
+	// 阻塞等待连接
+	conn, err := listener.Accept()
+	cancel() // 通知 goroutine 正常退出
+	if err != nil {
+		listener.Close()
+		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		wg.Wait()
+		return fmt.Errorf("accept failed: %w", err)
+	}
+
+	listener.Close()
+	wg.Wait() // 等 goroutine 退出后继续
+	_ = clientConn.SetReadDeadline(time.Time{})
+
+	remoteAddr := conn.RemoteAddr()
+	remote, ok := remoteAddr.(*net.TCPAddr)
+	if !ok {
+		return fmt.Errorf("failed: cast remote address to TCPAddr: %s://%s", remoteAddr.Network(), remoteAddr.String())
+	}
+	err = sendSocks5Response(clientConn, REP_SUCCEEDED, remote.IP.String(), remote.Port)
+	if err != nil {
+		return fmt.Errorf("send response error: %w", err)
+	}
+	handleProxy(clientConn, conn)
+	return nil
+}
+
 func handleSocks5uProxy(conn net.Conn, stream net.Conn) {
 	log.Printf("New client connected from %s", conn.RemoteAddr())
 
@@ -691,12 +789,12 @@ func handleSocks5uModeForRemote(cfg MuxSessionConfig) error {
 			log.Printf("Failed to accept mux stream: %v", err)
 			return err
 		}
-		go handleMuxStream(stream) // 为每个新流启动一个 goroutine 处理
+		go handleSocks5ClientOnStream(stream) // 为每个新流启动一个 goroutine 处理
 	}
 }
 
-// handleMuxStream 处理每个通过 MuxSession 传入的 Stream
-func handleMuxStream(tunnelStream net.Conn) {
+// handleSocks5ClientOnMuxStream 处理每个通过 MuxSession 传入的 Stream
+func handleSocks5ClientOnStream(tunnelStream net.Conn) {
 	defer tunnelStream.Close()
 
 	// 读取流的第一个请求行
@@ -1088,7 +1186,7 @@ func (c *Socks5Client) socks5Handshake(conn net.Conn) error {
 }
 
 // sendSocks5RequestHeader 构建并发送 SOCKS5 请求头
-func (c *Socks5Client) sendSocks5RequestHeader(conn net.Conn, cmd byte, host string, port int) ([]byte, error) {
+func sendSocks5RequestHeader(conn net.Conn, cmd byte, host string, port int) ([]byte, error) {
 	addrBytes, atyp, err := parseHostPortToSocksAddr(host)
 	if err != nil {
 		return nil, fmt.Errorf("parse host/port error: %w", err)
@@ -1113,7 +1211,7 @@ func (c *Socks5Client) sendSocks5RequestHeader(conn net.Conn, cmd byte, host str
 }
 
 // readSocks5Response 读取并解析 SOCKS5 响应
-func (c *Socks5Client) readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
+func readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
 	resp := make([]byte, 256)             // Sufficient for standard response
 	_, err := io.ReadFull(conn, resp[:4]) // Read VER, REP, RSV, ATYP
 	if err != nil {
@@ -1199,11 +1297,11 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			socks5Conn.Close()
 			return nil, fmt.Errorf("SOCKS5 handshake failed: %w", err)
 		}
-		if _, err := c.sendSocks5RequestHeader(socks5Conn, CMD_CONNECT, host, port); err != nil {
+		if _, err := sendSocks5RequestHeader(socks5Conn, CMD_CONNECT, host, port); err != nil {
 			socks5Conn.Close()
 			return nil, fmt.Errorf("send SOCKS5 CONNECT request error: %w", err)
 		}
-		if _, err := c.readSocks5Response(socks5Conn); err != nil {
+		if _, err := readSocks5Response(socks5Conn); err != nil {
 			socks5Conn.Close()
 			return nil, fmt.Errorf("read SOCKS5 CONNECT response error: %w", err)
 		}
@@ -1234,7 +1332,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 
 		// 2. 发送 UDP ASSOCIATE 请求 (DST.ADDR 和 DST.PORT 通常是 0.0.0.0:0, 但也可以指定)
 		// 这里，我们将应用程序指定的 host/port 作为请求参数。
-		_, err = c.sendSocks5RequestHeader(serverTCPConn, CMD_UDP_ASSOCIATE, host, port)
+		_, err = sendSocks5RequestHeader(serverTCPConn, CMD_UDP_ASSOCIATE, host, port)
 		if err != nil {
 			serverTCPConn.Close()
 			return nil, fmt.Errorf("send SOCKS5 UDP ASSOCIATE request error: %w", err)
@@ -1244,7 +1342,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		var actualSocks5ServerUDPAddr net.IP // 用于存储实际服务器UDP地址
 		var actualSocks5ServerUDPPort int    // 用于存储实际服务器UDP端口
 
-		bindAddr, err := c.readSocks5Response(serverTCPConn)
+		bindAddr, err := readSocks5Response(serverTCPConn)
 		if err != nil {
 			serverTCPConn.Close()
 			return nil, fmt.Errorf("read SOCKS5 UDP ASSOCIATE response error: %w", err)
@@ -1303,6 +1401,106 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 	default:
 		return nil, fmt.Errorf("unsupported network type: %s", network)
 	}
+}
+
+func (c *Socks5Client) Listen(network, address string) (net.Listener, error) {
+	bc, err := c.RemoteListen(network, address, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	return &socks5listener{
+		boundConn:     bc,
+		fakeLocalAddr: bc.LocalAddr().(*net.TCPAddr),
+	}, nil
+}
+
+func (c *Socks5Client) RemoteListen(network, address string, timeout time.Duration) (*Socks5BindConn, error) {
+	if c.Socks5Addr == "" {
+		return nil, fmt.Errorf("empty server address")
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address format: %w", err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port: %w", err)
+		}
+
+		socks5Conn, err := net.DialTimeout("tcp", c.Socks5Addr, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", c.Socks5Addr, err)
+		}
+		socks5Conn.SetDeadline(time.Now().Add(timeout))
+		if err := c.socks5Handshake(socks5Conn); err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("SOCKS5 handshake failed: %w", err)
+		}
+		if _, err := sendSocks5RequestHeader(socks5Conn, CMD_BIND, host, port); err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("send SOCKS5 BIND request error: %w", err)
+		}
+		remoteBindAddr, err := readSocks5Response(socks5Conn)
+		if err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("read SOCKS5 BIND response error: %w", err)
+		}
+		socks5Conn.SetDeadline(time.Time{})
+		return &Socks5BindConn{
+			Conn:          socks5Conn,
+			fakeLocalAddr: remoteBindAddr,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported network type: %s", network)
+	}
+}
+
+type Socks5BindConn struct {
+	net.Conn                    // 原始连接（嵌入）
+	fakeLocalAddr  *net.TCPAddr // BIND 返回的地址
+	fakeRemoteAddr *net.TCPAddr // BIND 返回的地址
+}
+
+func (b *Socks5BindConn) LocalAddr() net.Addr {
+	return b.fakeLocalAddr
+}
+
+func (b *Socks5BindConn) RemoteAddr() net.Addr {
+	return b.fakeRemoteAddr
+}
+
+func (c *Socks5BindConn) Accept() (net.Conn, error) {
+	remoteAcceptAddr, err := readSocks5Response(c)
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("read SOCKS5 Accept response error: %w", err)
+	}
+	c.fakeRemoteAddr = remoteAcceptAddr
+	return c, nil
+}
+
+type socks5listener struct {
+	boundConn     *Socks5BindConn
+	fakeLocalAddr *net.TCPAddr
+}
+
+// Accept waits for and returns the next connection to the listener.
+func (l *socks5listener) Accept() (net.Conn, error) {
+	return l.boundConn.Accept()
+}
+
+// Close closes the listener.
+func (l *socks5listener) Close() error {
+	return nil
+}
+
+// address returns the listener's network address.
+func (l *socks5listener) Addr() net.Addr {
+	return l.fakeLocalAddr
 }
 
 // parseHostPortToSocksAddr 辅助函数，将主机和端口转换为 SOCKS 地址字节和 ATYP
@@ -1639,6 +1837,11 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 		if err != nil {
 			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 		}
+	} else if req.Command == "BIND" {
+		err = handleTCPListen(conn, req.Host, req.Port)
+		if err != nil {
+			log.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
+		}
 	} else if req.Command == "UDP" {
 		fakeTunnelC, fakeTunnelS := net.Pipe()
 		var wg sync.WaitGroup
@@ -1646,7 +1849,7 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
-			handleMuxStream(c)
+			handleSocks5ClientOnStream(c)
 		}(fakeTunnelS)
 
 		err = handleUDPAssociateViaTunnel(conn, fakeTunnelC, req.Host, req.Port)

@@ -323,7 +323,7 @@ func do_DTLS(config *connectionConfig, conn net.Conn) net.Conn {
 	return dtlsConn
 }
 
-func createClientDialer(proxyProt, proxyAddr, proxyAuth string) (*ProxyClient, error) {
+func createProxyClient(proxyProt, proxyAddr, proxyAuth string) (*ProxyClient, error) {
 	if proxyAddr != "" {
 		user, pass := "", ""
 		if proxyAuth != "" {
@@ -443,6 +443,10 @@ func conflictCheck() {
 	}
 	if *proxyAddr != "" && *useSTUN {
 		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
+		os.Exit(1)
+	}
+	if *keepOpen && *proxyAddr != "" {
+		fmt.Fprintf(os.Stderr, "-keep-open and -x cannot be used together\n")
 		os.Exit(1)
 	}
 	if *listenMode && (*remoteAddr != "" || *autoP2P != "" || *autoP2PTCP != "") {
@@ -732,14 +736,22 @@ func main() {
 		return
 	}
 
+	proxyClient, err := createProxyClient(*proxyProt, *proxyAddr, *auth)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error create proxy client: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 监听模式
 	if *listenMode {
-		if port == "0" {
-			portInt, err := easyp2p.GetFreePort()
-			if err != nil {
-				panic(err)
+		if *proxyAddr == "" {
+			if port == "0" {
+				portInt, err := easyp2p.GetFreePort()
+				if err != nil {
+					panic(err)
+				}
+				port = strconv.Itoa(portInt)
 			}
-			port = strconv.Itoa(portInt)
 		}
 		listenAddr := net.JoinHostPort(host, port)
 		if *useUNIXdomain {
@@ -814,22 +826,31 @@ func main() {
 				conn = buconn
 			}
 		} else {
-			//TCP/unix listen
 			var listener net.Listener
-			lc := net.ListenConfig{}
-			if *useSTUN {
-				err = ShowPublicIP(network, listenAddr)
+
+			if proxyClient.SupportBIND() {
+				listener, err = proxyClient.dialer.Listen(network, listenAddr)
 				if err != nil {
-					panic(err)
+					fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
+					os.Exit(1)
 				}
-			}
-			if *useSTUN {
-				lc.Control = easyp2p.ControlTCP
-			}
-			listener, err = lc.Listen(context.Background(), network, listenAddr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
-				os.Exit(1)
+			} else {
+				// TCP/unix listen
+				lc := net.ListenConfig{}
+				if *useSTUN {
+					err = ShowPublicIP(network, listenAddr)
+					if err != nil {
+						panic(err)
+					}
+				}
+				if *useSTUN {
+					lc.Control = easyp2p.ControlTCP
+				}
+				listener, err = lc.Listen(context.Background(), network, listenAddr)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
+					os.Exit(1)
+				}
 			}
 			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
 
@@ -908,19 +929,13 @@ func main() {
 			}
 		}
 
-		dialer, err := createClientDialer(*proxyProt, *proxyAddr, *auth)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error create client dialer: %v\n", err)
-			os.Exit(1)
-		}
-
 		if *useUNIXdomain {
 			// Unix域套接字
 			conn, err = net.Dial("unix", port)
 		} else {
 			// TCP/UDP 连接
 			if localAddr == nil {
-				conn, err = dialer.DialTimeout(network, net.JoinHostPort(host, port), 20*time.Second)
+				conn, err = proxyClient.DialTimeout(network, net.JoinHostPort(host, port), 20*time.Second)
 			} else {
 				dialer := &net.Dialer{
 					LocalAddr: localAddr,
@@ -1333,24 +1348,18 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
-			defer pipeConn.In.Close()
-			defer pipeConn.Out.Close()
 			go App_mux_main_withconfig(pipeConn, app_mux_Config)
 		} else if builtinApp == "app-s5s" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
-			defer pipeConn.In.Close()
-			defer pipeConn.Out.Close()
 			go App_s5s_main_withconfig(pipeConn, app_s5s_Config)
 		} else if builtinApp == "app-pf" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
-			defer pipeConn.In.Close()
-			defer pipeConn.Out.Close()
 			go App_pf_main_withconfig(pipeConn, app_pf_Config)
 		} else {
 

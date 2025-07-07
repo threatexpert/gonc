@@ -148,7 +148,7 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	if config.network == "unix" {
 		address = config.port
 	}
-	dialer, err := createClientDialer(config.proxyProt, config.proxyAddress, config.proxyAuth)
+	dialer, err := createProxyClient(config.proxyProt, config.proxyAddress, config.proxyAuth)
 	if err != nil {
 		return
 	}

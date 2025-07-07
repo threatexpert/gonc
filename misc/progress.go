@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 )
 
@@ -87,23 +86,19 @@ func FormatBytes(bytes int64) string {
 
 type PipeConn struct {
 	net.Conn
-	In, in    io.ReadCloser
-	Out, out  io.WriteCloser
-	closeCh   chan struct{}
-	closeOnce sync.Once
+	In, in   net.Conn
+	Out, out net.Conn
 }
 
 func NewPipeConn(originalConn net.Conn) *PipeConn {
-	inReader, inWriter := io.Pipe()
-	outReader, outWriter := io.Pipe()
+	a, b := net.Pipe()
 
 	return &PipeConn{
-		Conn:    originalConn,
-		in:      inReader,
-		Out:     inWriter,
-		In:      outReader,
-		out:     outWriter,
-		closeCh: make(chan struct{}),
+		Conn: originalConn,
+		in:   a,
+		Out:  b,
+		In:   b,
+		out:  a,
 	}
 }
 
@@ -117,11 +112,8 @@ func (p *PipeConn) Write(b []byte) (n int, err error) {
 }
 
 func (p *PipeConn) Close() error {
-	p.closeOnce.Do(func() { close(p.closeCh) })
-	p.in.Close()
-	if c, ok := p.out.(io.Closer); ok {
-		c.Close()
-	}
+	p.Out.Close()
+	p.out.Close()
 	return nil
 }
 
@@ -140,11 +132,16 @@ func (p *PipeConn) RemoteAddr() net.Addr {
 	return p.Conn.RemoteAddr()
 }
 func (p *PipeConn) SetDeadline(t time.Time) error {
-	return p.Conn.SetDeadline(t)
+	err := p.in.SetDeadline(t)
+	if err != nil {
+		return err
+	}
+	err = p.out.SetDeadline(t)
+	return err
 }
 func (p *PipeConn) SetReadDeadline(t time.Time) error {
-	return p.Conn.SetReadDeadline(t)
+	return p.in.SetReadDeadline(t)
 }
 func (p *PipeConn) SetWriteDeadline(t time.Time) error {
-	return p.Conn.SetWriteDeadline(t)
+	return p.out.SetWriteDeadline(t)
 }

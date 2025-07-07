@@ -200,7 +200,7 @@ func App_mux_usage() {
 
 // 	init_TLS(false)
 
-// 	dialer := createClientDialer()
+// 	dialer := createProxyClient()
 
 // 	switch *muxSessionMode {
 // 	case "connect":
