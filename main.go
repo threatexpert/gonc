@@ -82,7 +82,6 @@ var (
 	punchData        = flag.String("punchdata", "ping\n", "UDP punch payload")
 	MQTTServers      = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
 	autoP2P          = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
-	autoP2PTCP       = flag.String("p2p-tcp", "", "P2P session key, tcp, will be retried up to 3 times upon failure.")
 	useMutilPath     = flag.Bool("mp", false, "enable multipath(NOT IMPL)")
 	MQTTWait         = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
 	MQTTPush         = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
@@ -465,12 +464,8 @@ func conflictCheck() {
 		fmt.Fprintf(os.Stderr, "-keep-open and -x cannot be used together\n")
 		os.Exit(1)
 	}
-	if *listenMode && (*remoteAddr != "" || *autoP2P != "" || *autoP2PTCP != "") {
+	if *listenMode && (*remoteAddr != "" || *autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "-l and (-remote -p2p) cannot be used together\n")
-		os.Exit(1)
-	}
-	if *autoP2P != "" && (*autoP2PTCP != "") {
-		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-tcp) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *presharedKey != "" && (*tlsRSACertEnabled || (*sslCertFile != "" && *sslKeyFile != "")) {
@@ -497,7 +492,7 @@ func conflictCheck() {
 		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key set without -tls ?")
 		os.Exit(1)
 	}
-	if (*sslCertFile != "" && *sslKeyFile != "") && (*autoP2P != "" || *autoP2PTCP != "") {
+	if (*sslCertFile != "" && *sslKeyFile != "") && (*autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
 		os.Exit(1)
 	}
@@ -648,7 +643,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", *remoteAddr, err)
 			os.Exit(1)
 		}
-	} else if len(args) == 0 && (*autoP2P != "" || *autoP2PTCP != "") {
+	} else if len(args) == 0 && (*autoP2P != "") {
 		if *proxyAddr != "" {
 			fmt.Fprintf(os.Stderr, "INFO: proxy is ignored with p2p\n")
 			*proxyAddr = ""
@@ -664,10 +659,6 @@ func main() {
 			*kcpEnabled = true //需要kcp实现稳定传输
 			*udpProtocol = true
 			network = "udp"
-		} else if *autoP2PTCP != "" {
-			P2PSessionKey = *autoP2PTCP
-			*udpProtocol = false
-			network = "tcp"
 		} else {
 			os.Exit(1)
 		}

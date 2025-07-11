@@ -1469,15 +1469,35 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 
 		//相同子网的，以及easy对easy的，就尝试一下直接连接
 		if inSameLAN || (p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy") {
-			// First try direct connection
+			select {
+			// 如果有连接接受成功，直接转发回主流程
+			case <-ctx.Done():
+				return
+			case connInfo := <-connChan:
+				connChan <- connInfo
+				return
+			default:
+			}
 			workerChan <- struct{}{}
 			wg.Add(1)
+			fmt.Fprintf(logWriter, "  ↑ Trying direct dial to peer...")
 			if tryConnect(remoteAddr, localAddr, true, timeoutPerconn, isClient, "dial") {
+				fmt.Fprintf(logWriter, "completed.\n")
 				return
+			}
+			fmt.Fprintf(logWriter, "failed.\n")
+			if !inSameLAN {
+				if isClient {
+					//easy - easy 失败，可能对方的洞口没开是不可以先碰的
+					time.Sleep(3 * time.Second)
+					randomDstPort = true
+				} else {
+					randomSrcPort = true
+				}
 			}
 		}
 
-		for i := 0; i < 3 && !(p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy"); i++ {
+		for i := 0; i < 3 && (randomDstPort || randomSrcPort); i++ {
 			select {
 			case <-ctx.Done():
 				return
@@ -1543,6 +1563,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	case connInfo := <-connChan:
 		conn := connInfo.Conn    // 获取实际的连接对象
 		connType := connInfo.Tag // 获取连接类型描述
+		cancel()
 		fmt.Fprintf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
 		return conn, isClient, sharedKey, nil
 	case errCh := <-errChan:
