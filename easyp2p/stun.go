@@ -314,7 +314,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) (
 		defer sharedUDPConn.Close()
 
 		logDiscard := log.New(io.Discard, "", log.LstdFlags|log.Lshortfile)
-		UDPDialer, err = NewUDPCustomDialer(sharedUDPConn, 1500, logDiscard)
+		UDPDialer, err = NewUDPCustomDialer(sharedUDPConn, 4096, logDiscard)
 		if err != nil {
 			return nil, err
 		}

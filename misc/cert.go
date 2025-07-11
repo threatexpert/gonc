@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"os"
 	"reflect"
 	"time"
 )
@@ -288,4 +289,20 @@ func GenerateECDSACertificate(sni, psk string) (*tls.Certificate, error) {
 	}
 
 	return &certificate, nil
+}
+
+func LoadCertificate(certPath, keyPath string) (*tls.Certificate, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	return &cert, nil
 }

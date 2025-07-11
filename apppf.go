@@ -3,95 +3,111 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/pion/dtls/v3"
+	"github.com/threatexpert/gonc/easyp2p"
 	"github.com/threatexpert/gonc/misc"
 )
 
 type AppPFConfig struct {
 	tlsEnabled   bool             // -tls (bool)
 	cert         *tls.Certificate // 如果tlsEnabled是true，这个就需要用到
-	network      string           // 默认是tcp，然而如果有参数-4 -6 -U，则可能是tcp4 tcp6 unix
+	network      string           // 默认是tcp，然而如果有参数-4 -6 -u -U，则可能是tcp4 tcp6 udp4 udp6 unix
 	host, port   string           // 是最后 two args
-	presharedKey string           // -psk <psk-string>
-	proxyProt    string           // -X 代理协议，可能是 connect或5，或空
-	proxyAddress string           // -x 代理服务器地址 host:port
-	proxyAuth    string           // -auth 代理认证信息，格式为 username:password
+	localAddr    string
+	presharedKey string // -psk <psk-string>
+	proxyProt    string // -X 代理协议，可能是 connect或5，或空
+	proxyAddress string // -x 代理服务器地址 host:port
+	proxyAuth    string // -auth 代理认证信息，格式为 username:password
 }
 
+// AppPFConfigByArgs 解析给定的 []string 参数，生成 AppPFConfig
 func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	config := &AppPFConfig{
-		network: "tcp",
+		network: "tcp", // 默认值
 	}
 
-	var positionalArgs []string
+	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
+	// 设置 ContinueOnError 允许我们捕获错误而不是直接退出
+	fs := flag.NewFlagSet("AppPFConfig", flag.ContinueOnError)
 
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "-tls":
-			config.tlsEnabled = true
-		case "-4":
-			config.network = "tcp4"
-		case "-6":
-			config.network = "tcp6"
-		case "-U":
-			config.network = "unix"
-		case "-psk":
-			if i+1 < len(args) {
-				config.presharedKey = args[i+1]
-				i++
-			} else {
-				return nil, fmt.Errorf("missing value for -psk")
-			}
-		case "-X":
-			if i+1 < len(args) {
-				config.proxyProt = args[i+1]
-				if config.proxyProt != "5" && config.proxyProt != "connect" && config.proxyProt != "" {
-					return nil, fmt.Errorf("invalid proxy protocol: %s", config.proxyProt)
-				}
-				i++
-			} else {
-				return nil, fmt.Errorf("missing value for -X")
-			}
-		case "-x":
-			if i+1 < len(args) {
-				config.proxyAddress = args[i+1]
-				i++
-			} else {
-				return nil, fmt.Errorf("missing value for -x")
-			}
-		case "-auth":
-			if i+1 < len(args) {
-				config.proxyAuth = args[i+1]
-				if !strings.Contains(config.proxyAuth, ":") {
-					return nil, fmt.Errorf("invalid format for -auth, expected user:pass")
-				}
-				i++
-			} else {
-				return nil, fmt.Errorf("missing value for -auth")
-			}
-		default:
-			if strings.HasPrefix(arg, "-") {
-				return nil, fmt.Errorf("unknown argument: %s", arg)
-			}
-			positionalArgs = append(positionalArgs, arg)
+	// 定义标志变量，这些变量会绑定到 config 结构体中
+	// 注意：对于布尔标志，我们可以直接使用 BoolVar 绑定到结构体字段
+	// 对于其他类型，我们先定义一个临时变量，解析后再赋值给结构体
+	fs.BoolVar(&config.tlsEnabled, "tls", false, "Enable TLS encryption")
+	var is4, is6 bool
+	fs.BoolVar(&is4, "4", false, "Use IPv4 (default is tcp)")
+	fs.BoolVar(&is6, "6", false, "Use IPv6")
+	var isUdp, isUnix bool // 为了避免与 -U 混淆，使用 isUdp, isUnix
+	fs.BoolVar(&isUdp, "u", false, "UDP socket")
+	fs.BoolVar(&isUnix, "U", false, "Use Unix socket")
+
+	fs.StringVar(&config.presharedKey, "psk", "", "Use pre-shared key for TLS verification")
+	fs.StringVar(&config.localAddr, "local", "", "Bind on address")
+	fs.StringVar(&config.proxyProt, "X", "", `Proxy protocol. Supported protocols are "5" (SOCKS v.5) and "connect"`)
+	fs.StringVar(&config.proxyAddress, "x", "", "ip:port for proxy address")
+	fs.StringVar(&config.proxyAuth, "auth", "", "user:password for proxy")
+
+	// 设置自定义的 Usage 函数，当用户传递无效参数或请求帮助时显示
+	// 这里我们使用 App_pf_usage 函数的内容
+	fs.Usage = func() {
+		App_pf_usage_flagSet(fs) // 传递 fs，以便它能打印出定义好的标志
+	}
+
+	// 解析传入的 args 切片
+	// 注意：我们假设 args 已经不包含程序名 (os.Args[0])，所以直接传入
+	err := fs.Parse(args)
+	if err != nil {
+		return nil, err // 解析错误直接返回
+	}
+
+	// 验证代理协议值
+	if config.proxyProt != "" && config.proxyProt != "5" && config.proxyProt != "connect" {
+		return nil, fmt.Errorf("invalid proxy protocol: %s", config.proxyProt)
+	}
+
+	// 验证代理认证格式
+	if config.proxyAuth != "" && !strings.Contains(config.proxyAuth, ":") {
+		return nil, fmt.Errorf("invalid format for -auth, expected user:pass")
+	}
+
+	// 处理网络类型
+	if isUdp {
+		config.network = "udp"
+	} else if isUnix {
+		config.network = "unix"
+	} // 否则保持默认 "tcp"
+
+	if is4 {
+		if strings.HasSuffix(config.network, "4") || strings.HasSuffix(config.network, "6") {
+			return nil, fmt.Errorf("-4 and -6 cannot be used together or with -u/-U in a conflicting way")
 		}
+		config.network += "4"
+	} else if is6 {
+		if strings.HasSuffix(config.network, "4") || strings.HasSuffix(config.network, "6") {
+			return nil, fmt.Errorf("-4 and -6 cannot be used together or with -u/-U in a conflicting way")
+		}
+		config.network += "6"
 	}
+
+	// 获取所有非标志参数（即位置参数）
+	positionalArgs := fs.Args()
 
 	// 处理 host/port 或 unix 路径
 	if config.network == "unix" {
 		if len(positionalArgs) != 1 {
-			return nil, fmt.Errorf("expect one unix socket path for -U mode")
+			return nil, fmt.Errorf("expect one unix socket path for -U mode, got %d", len(positionalArgs))
 		}
-		config.port = positionalArgs[0]
+		config.port = positionalArgs[0] // 对于Unix，port字段存储路径
 	} else {
 		if len(positionalArgs) != 2 {
-			return nil, fmt.Errorf("expect host and port for network type %s", config.network)
+			return nil, fmt.Errorf("expect host and port for network type %s, got %d", config.network, len(positionalArgs))
 		}
 		config.host = positionalArgs[0]
 		config.port = positionalArgs[1]
@@ -104,25 +120,20 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error generating EC certificate: %v", err)
 		}
+		// 如果PSK存在，即使没有显式-tls，也认为TLS enabled
 		config.tlsEnabled = true
 	}
 
 	return config, nil
 }
 
-func App_pf_usage() {
-	fmt.Fprintln(os.Stderr, "Usage: -app-pf [-tls] [-4|-6|-U] [-x <proxy>] [-psk <psk-string>] <host> <port>")
-	fmt.Fprintln(os.Stderr, "  -X            proxy protocol. Supported protocols are “5” (SOCKS v.5) and “connect”")
-	fmt.Fprintln(os.Stderr, "  -x            ip:port for proxy address")
-	fmt.Fprintln(os.Stderr, "  -auth         user:password for proxy")
-	fmt.Fprintln(os.Stderr, "  -tls          Enable TLS encryption")
-	fmt.Fprintln(os.Stderr, "  -4            Use IPv4 (default is tcp)")
-	fmt.Fprintln(os.Stderr, "  -6            Use IPv6")
-	fmt.Fprintln(os.Stderr, "  -U            Use Unix socket")
-	fmt.Fprintln(os.Stderr, "  -psk <key>    Use pre-shared key for TLS verification")
-	fmt.Fprintln(os.Stderr, "  <host>        Target host (ignored if using Unix socket)")
-	fmt.Fprintln(os.Stderr, "  <port>        Target port (path if using Unix socket)")
-	fmt.Fprintln(os.Stderr, "usage:")
+// App_pf_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
+func App_pf_usage_flagSet(fs *flag.FlagSet) {
+	fmt.Fprintln(os.Stderr, "-app-pf Usage: [options] <host> <port>")
+	fmt.Fprintln(os.Stderr, "Or:    [options] -U <UNIX-domain-socket-path>")
+	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
+	fmt.Fprintln(os.Stderr, "\nExamples:")
 	fmt.Fprintln(os.Stderr, "  -app-pf -4 -tls <host> <port>")
 	fmt.Fprintln(os.Stderr, "  -app-pf -U <UNIX-domain>")
 }
@@ -148,17 +159,55 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	if config.network == "unix" {
 		address = config.port
 	}
-	dialer, err := createProxyClient(config.proxyProt, config.proxyAddress, config.proxyAuth)
-	if err != nil {
-		return
+
+	var localAddr net.Addr
+	var err error
+	var targetConn net.Conn
+	if config.localAddr == "" {
+		dialer, err := createProxyClient(config.proxyProt, config.proxyAddress, config.proxyAuth)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error createProxyClient: %v\n", err)
+			return
+		}
+		targetConn, err = dialer.DialTimeout(config.network, address, 20*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error DialTimeout: %v\n", err)
+			return
+		}
+	} else {
+		switch {
+		case strings.HasPrefix(config.network, "tcp"):
+			localAddr, err = net.ResolveTCPAddr(config.network, config.localAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error ResolveTCPAddr: %v\n", err)
+				return
+			}
+		case strings.HasPrefix(config.network, "udp"):
+			localAddr, err = net.ResolveUDPAddr(config.network, config.localAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error ResolveUDPAddr: %v\n", err)
+				return
+			}
+		}
+		dialer := &net.Dialer{
+			LocalAddr: localAddr,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		targetConn, err = dialer.DialContext(ctx, config.network, net.JoinHostPort(config.host, config.port))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error Dial: %v\n", err)
+			return
+		}
 	}
 
-	targetConn, err := dialer.DialTimeout(config.network, address, 20*time.Second)
-	if err != nil {
-		return
-	}
 	if config.tlsEnabled {
-		tlsconn, err := pf_do_TLS(ctx, targetConn, config)
+		var tlsconn net.Conn
+		if strings.HasPrefix(config.network, "tcp") {
+			tlsconn, err = pf_do_TLS(ctx, targetConn, config)
+		} else {
+			tlsconn, err = pf_do_DTLS(ctx, targetConn, config)
+		}
 		if err != nil {
 			return
 		}
@@ -196,4 +245,47 @@ func pf_do_TLS(ctx context.Context, conn net.Conn, config *AppPFConfig) (net.Con
 		return nil, err
 	}
 	return conn_tls, nil
+}
+
+func pf_do_DTLS(ctx context.Context, conn net.Conn, config *AppPFConfig) (net.Conn, error) {
+	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
+	allCiphers := []dtls.CipherSuiteID{
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	}
+
+	// DTLS 配置
+	dtlsConfig := &dtls.Config{
+		CipherSuites:         allCiphers,
+		InsecureSkipVerify:   true, // 和 tls.Config 一样，跳过证书校验
+		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		FlightInterval:       2 * time.Second,
+	}
+
+	var dtlsConn *dtls.Conn
+	var err error
+	var certs []tls.Certificate
+
+	if config.cert != nil {
+		certs = append(certs, *config.cert)
+	}
+
+	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	dtlsConfig.ServerName = config.host
+	if config.presharedKey != "" {
+		dtlsConfig.Certificates = certs
+		dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.presharedKey)
+	}
+	dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	err = dtlsConn.HandshakeContext(ctx)
+	if err != nil {
+		dtlsConn.Close()
+		return nil, err
+	}
+
+	return dtlsConn, nil
 }

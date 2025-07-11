@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -1767,38 +1768,52 @@ type AppS5SConfig struct {
 	password string
 }
 
+// AppS5SConfigByArgs 解析给定的 []string 参数，生成 AppS5SConfig
 func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 	config := &AppS5SConfig{}
 
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "-auth":
-			// 检查是否有-auth对应的值
-			if i+1 >= len(args) {
-				return nil, fmt.Errorf("missing value for -auth. Expected user:pass")
-			}
-			authFlag := args[i+1]
+	// 创建一个新的 FlagSet 实例
+	fs := flag.NewFlagSet("AppS5SConfig", flag.ContinueOnError)
 
-			// 解析 user:pass
-			authParts := strings.SplitN(authFlag, ":", 2)
-			if len(authParts) != 2 {
-				return nil, fmt.Errorf("invalid auth format for -auth: %s. Expected user:pass", authFlag)
-			}
-			config.username, config.password = authParts[0], authParts[1]
-			i++ // 跳过已经处理过的-auth的值
-		default:
-			return nil, fmt.Errorf("unknown argument: %s", arg)
+	var authString string // 用于接收 -auth 的值
+	fs.StringVar(&authString, "auth", "", "Username and password for SOCKS5 authentication (format: user:pass)")
+
+	// 设置自定义的 Usage 函数
+	fs.Usage = func() {
+		App_s5s_usage_flagSet(fs)
+	}
+
+	// 解析传入的 args 切片
+	err := fs.Parse(args)
+	if err != nil {
+		return nil, err // 解析错误直接返回
+	}
+
+	// 检查是否有未解析的（非标志）参数
+	if len(fs.Args()) > 0 {
+		return nil, fmt.Errorf("unknown positional arguments: %v", fs.Args())
+	}
+
+	// 如果 -auth 标志被提供
+	if authString != "" {
+		authParts := strings.SplitN(authString, ":", 2)
+		if len(authParts) != 2 {
+			return nil, fmt.Errorf("invalid auth format for -auth: %s. Expected user:pass", authString)
 		}
+		config.username = authParts[0]
+		config.password = authParts[1]
 	}
 
 	return config, nil
 }
 
-func App_s5s_usage() {
-	fmt.Fprintln(os.Stderr, "Usage: -app-s5s [options]")
-	fmt.Fprintln(os.Stderr, "Options:")
-	fmt.Fprintln(os.Stderr, "  -auth user:pass   Set username and password for SOCKS5 authentication")
+// App_s5s_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
+func App_s5s_usage_flagSet(fs *flag.FlagSet) {
+	fmt.Fprintln(os.Stderr, "-app-s5s Usage: [options]")
+	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
+	fmt.Fprintln(os.Stderr, "\nExample:")
+	fmt.Fprintln(os.Stderr, "  -app-s5s -auth user:password")
 }
 
 func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {

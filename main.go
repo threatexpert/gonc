@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -47,6 +48,7 @@ var (
 	proxyAddr         = flag.String("x", "", "ip:port for proxy_address")
 	auth              = flag.String("auth", "", "user:password for proxy")
 	sendfile          = flag.String("send", "", "path to file to send (optional)")
+	writefile         = flag.String("write", "", "write to file")
 	tlsEnabled        = flag.Bool("tls", false, "Enable TLS connection")
 	tlsServerMode     = flag.Bool("tlsserver", false, "force as TLS server while connecting")
 	tls10_forced      = flag.Bool("tls10", false, "force negotiation to specify TLS version")
@@ -56,6 +58,8 @@ var (
 	tlsECCertEnabled  = flag.Bool("tlsec", true, "enable TLS EC cert")
 	tlsRSACertEnabled = flag.Bool("tlsrsa", false, "enable TLS RSA cert")
 	tlsSNI            = flag.String("sni", "", "specify TLS SNI")
+	sslCertFile       = flag.String("ssl-cert", "", "Specify SSL certificate file (PEM) for listening")
+	sslKeyFile        = flag.String("ssl-key", "", "Specify SSL private key (PEM) for listening")
 	presharedKey      = flag.String("psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM); also key for TCP/KCP encryption")
 	enableCRLF        = flag.Bool("C", false, "enable CRLF")
 	listenMode        = flag.Bool("l", false, "listen mode")
@@ -116,34 +120,46 @@ func init_TLS(genCertForced bool) []tls.Certificate {
 			*tlsServerMode = true
 		}
 		if genCertForced || *tlsServerMode {
-			if !*tlsECCertEnabled && !*tlsRSACertEnabled {
-				fmt.Fprintf(os.Stderr, "EC and RSA both are disabled\n")
-				os.Exit(1)
-			}
-			if *tlsECCertEnabled {
-				if *presharedKey != "" {
-					fmt.Fprintf(os.Stderr, "Generating ECDSA(PSK-derived) cert for secure communication...")
-				} else {
-					fmt.Fprintf(os.Stderr, "Generating ECDSA(randomly) cert for secure communication...")
-				}
-				cert, err := misc.GenerateECDSACertificate(*tlsSNI, *presharedKey)
+			if *sslCertFile != "" && *sslKeyFile != "" {
+				fmt.Fprintf(os.Stderr, "Loading cert...")
+				cert, err := misc.LoadCertificate(*sslCertFile, *sslKeyFile)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error generating EC certificate: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Error load certificate: %v\n", err)
 					os.Exit(1)
 				}
 				certs = append(certs, *cert)
-			}
-			if *tlsRSACertEnabled {
-				fmt.Fprintf(os.Stderr, "Generating RSA cert...")
-				cert, err := misc.GenerateRSACertificate(*tlsSNI)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error generating RSA certificate: %v\n", err)
+				*tlsECCertEnabled = false
+				*tlsRSACertEnabled = false
+			} else {
+				if !*tlsECCertEnabled && !*tlsRSACertEnabled {
+					fmt.Fprintf(os.Stderr, "EC and RSA both are disabled\n")
 					os.Exit(1)
 				}
-				certs = append(certs, *cert)
+				if *tlsECCertEnabled {
+					if *presharedKey != "" {
+						fmt.Fprintf(os.Stderr, "Generating ECDSA(PSK-derived) cert for secure communication...")
+					} else {
+						fmt.Fprintf(os.Stderr, "Generating ECDSA(randomly) cert for secure communication...")
+					}
+					cert, err := misc.GenerateECDSACertificate(*tlsSNI, *presharedKey)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error generating EC certificate: %v\n", err)
+						os.Exit(1)
+					}
+					certs = append(certs, *cert)
+				}
+				if *tlsRSACertEnabled {
+					fmt.Fprintf(os.Stderr, "Generating RSA cert...")
+					cert, err := misc.GenerateRSACertificate(*tlsSNI)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error generating RSA certificate: %v\n", err)
+						os.Exit(1)
+					}
+					certs = append(certs, *cert)
+				}
 			}
-			fmt.Fprintf(os.Stderr, "completed.\n")
 
+			fmt.Fprintf(os.Stderr, "completed.\n")
 		}
 	}
 	return certs
@@ -421,7 +437,7 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9.5")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.6")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -457,8 +473,8 @@ func conflictCheck() {
 		fmt.Fprintf(os.Stderr, "-p2p and (-p2p-tcp) cannot be used together\n")
 		os.Exit(1)
 	}
-	if *presharedKey != "" && *tlsRSACertEnabled {
-		fmt.Fprintf(os.Stderr, "-psk and -tlsrsa cannot be used together\n")
+	if *presharedKey != "" && (*tlsRSACertEnabled || (*sslCertFile != "" && *sslKeyFile != "")) {
+		fmt.Fprintf(os.Stderr, "-psk and (-tlsrsa -ssl-cert -ssl-key) cannot be used together\n")
 		os.Exit(1)
 	}
 	if *useIPv4 && *useIPv6 {
@@ -471,6 +487,18 @@ func conflictCheck() {
 	}
 	if *runAppFileServ != "" && (*appMuxListenMode || *appMuxListenOn != "") {
 		fmt.Fprintf(os.Stderr, "-httpserver and (-httplocal -download) cannot be used together\n")
+		os.Exit(1)
+	}
+	if (*sslCertFile != "" && *sslKeyFile == "") || (*sslCertFile == "" && *sslKeyFile != "") {
+		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key both must be set, only one given")
+		os.Exit(1)
+	}
+	if (*sslCertFile != "" && *sslKeyFile != "") && !isTLSEnabled() {
+		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key set without -tls ?")
+		os.Exit(1)
+	}
+	if (*sslCertFile != "" && *sslKeyFile != "") && (*autoP2P != "" || *autoP2PTCP != "") {
+		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
 		os.Exit(1)
 	}
 }
@@ -499,14 +527,12 @@ func preinitBuiltinAppConfig() {
 		app_s5s_Config, err = AppS5SConfigByArgs(args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
-			App_s5s_usage()
 			os.Exit(1)
 		}
 	} else if builtinApp == "app-pf" {
 		app_pf_Config, err = AppPFConfigByArgs(args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
-			App_pf_usage()
 			os.Exit(1)
 		}
 	}
@@ -782,8 +808,14 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error listening on UDP address: %v\n", err)
 				os.Exit(1)
 			}
-			configUDPConn(uconn)
 			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
+
+			logDiscard := log.New(io.Discard, "", log.LstdFlags)
+			usessListener, err := easyp2p.NewUDPCustomListener(uconn, logDiscard)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error NewUDPCustomListener: %v\n", err)
+				os.Exit(1)
+			}
 
 			if *keepOpen {
 				// 创建进度统计
@@ -797,33 +829,28 @@ func main() {
 				}
 
 				for {
-					fmt.Fprintf(os.Stderr, "Waiting for initial UDP packet to establish session...\n")
-					uconn.SetReadDeadline(time.Time{})
-					buconn := easyp2p.NewBoundUDPConn(uconn, "", true)
-					buconn.SetIdleTimeout(0)
-					if err = buconn.WaitAndLockRemote(); err != nil {
-						fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
-						os.Exit(1)
+					newSess, err := usessListener.Accept()
+					if err != nil {
+						if err == net.ErrClosed {
+							fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
+							os.Exit(1)
+							return
+						}
+						continue
 					}
-					fmt.Fprintf(os.Stderr, "Received a UDP packet from %s\n", buconn.RemoteAddr().String())
-					if isKCPEnabled() {
-						buconn.SetIdleTimeout(time.Duration(easyp2p.UDPIdleTimeoutSecond) * time.Second)
-					}
-					handleConnection(connConfig, buconn, stats_in, stats_out)
-					time.Sleep(1 * time.Second)
+
+					fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
+					go handleConnection(connConfig, newSess, stats_in, stats_out)
 				}
 			} else {
-				buconn := easyp2p.NewBoundUDPConn(uconn, "", false)
-				if err = buconn.WaitAndLockRemote(); err != nil {
-					fmt.Fprintf(os.Stderr, "ReadFromUDP failed: %v\n", err)
+				// 只接受一个连接
+				newSess, err := usessListener.Accept()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
 					os.Exit(1)
 				}
-				if isKCPEnabled() {
-					buconn.SetIdleTimeout(time.Duration(easyp2p.UDPIdleTimeoutSecond) * time.Second)
-				}
-				easyp2p.SetUDPTTL(uconn, 64)
-				fmt.Fprintf(os.Stderr, "Received first UDP packet from %s\n", buconn.RemoteAddr().String())
-				conn = buconn
+				fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
+				conn = newSess
 			}
 		} else {
 			var listener net.Listener
@@ -954,7 +981,6 @@ func main() {
 			os.Exit(1)
 		}
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-			configUDPConn(conn)
 			if *proxyAddr == "" {
 				fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", net.JoinHostPort(host, port))
 			} else {
@@ -986,12 +1012,15 @@ func main() {
 }
 
 // 用于在数据传输时显示进度
-func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, stats *misc.ProgressStats) {
+func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats) {
 	bufsize := blocksize
 	if bufsize < 32*1024 {
 		bufsize = 32 * 1024 //reader的缓存可以大一些，提高性能
 	}
-	reader := bufio.NewReaderSize(src, bufsize)
+	reader := src
+	if bufferedReader {
+		reader = bufio.NewReaderSize(src, bufsize)
+	} //udp的不能要用缓冲区积累包，否则读取的时候粘包就麻烦了
 	buf := make([]byte, blocksize) //buf的大小按用户指定的bufsize来，如果dst是UDP可以限制每个写入发出去的UDP的大小
 	var n int
 	var err, err1 error
@@ -1011,7 +1040,9 @@ func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, stats *misc.P
 			break
 		}
 
-		stats.Update(int64(n))
+		if stats != nil {
+			stats.Update(int64(n))
+		}
 		if err1 == io.EOF {
 			break
 		}
@@ -1048,7 +1079,9 @@ func copyCharDeviceWithProgress(dst io.Writer, src io.Reader, stats *misc.Progre
 				break
 			}
 			writer.Flush()
-			stats.Update(int64(n))
+			if stats != nil {
+				stats.Update(int64(n))
+			}
 		}
 
 		if err1 == io.EOF {
@@ -1274,12 +1307,19 @@ func do_Negotiation(cfg *connectionConfig, rawconn net.Conn) (*negotiatedConn, e
 	default:
 	}
 
-	if cfg.kcpWithUDP && nconn.isUDP {
-		sess_kcp := do_KCP(ctx, cfg, nconn.connLayers[0], rawconn, 30*time.Second)
-		if sess_kcp == nil {
-			return nil, fmt.Errorf("failed to establish KCP session")
+	if nconn.isUDP {
+		if cfg.kcpWithUDP {
+			sess_kcp := do_KCP(ctx, cfg, nconn.connLayers[0], rawconn, 30*time.Second)
+			if sess_kcp == nil {
+				return nil, fmt.Errorf("failed to establish KCP session")
+			}
+			nconn.connLayers = append([]net.Conn{sess_kcp}, nconn.connLayers...)
+		} else {
+			pktconn := easyp2p.NewPacketConnWrapper(nconn.connLayers[0], nconn.connLayers[0].RemoteAddr())
+			buconn := easyp2p.NewBoundUDPConn(pktconn, nconn.connLayers[0].RemoteAddr().String(), false)
+			buconn.SetIdleTimeout(5 * time.Minute)
+			nconn.connLayers = append([]net.Conn{buconn}, nconn.connLayers...)
 		}
-		nconn.connLayers = append([]net.Conn{sess_kcp}, nconn.connLayers...)
 	}
 
 	nconn.ctx = ctx
@@ -1298,6 +1338,7 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 	var bufsize int = 32 * 1024
 	blocksize := bufsize
 	if nconn.isUDP {
+		//往udp连接拷贝数据，如果源是文件，应该限制每次拷贝到udp包的大小
 		blocksize = udpOutputBlockSize
 	}
 
@@ -1329,6 +1370,29 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 
 		input = file
 		output = os.Stdout
+	} else if *writefile != "" {
+		// 如果指定了 writefile 参数，写入指定的文件
+		var file *os.File
+		var writePath string
+		if *writefile == "/dev/null" {
+			// 判断操作系统
+			if runtime.GOOS == "windows" {
+				writePath = "NUL"
+			} else {
+				writePath = "/dev/null"
+			}
+		} else {
+			writePath = *writefile
+		}
+		file, err = os.Create(writePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening file for writing: %v\n", err)
+			os.Exit(1)
+		}
+		defer file.Close()
+
+		input = os.Stdin
+		output = file
 	} else if *runCmd != "" {
 		// 分割命令和参数（支持带空格的参数）
 		args, err := parseCommandLine(*runCmd)
@@ -1360,6 +1424,10 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
+			if strings.Contains(app_pf_Config.network, "udp") {
+				//udp的端口转发，避免截断数据包，也不应该会粘包（pipeConn内部是net.Pipe()，它无内置缓冲区）
+				blocksize = bufsize
+			}
 			go App_pf_main_withconfig(pipeConn, app_pf_Config)
 		} else {
 
@@ -1432,12 +1500,12 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
-				copyWithProgress(conn, input, blocksize, stats_out)
+				copyWithProgress(conn, input, blocksize, !nconn.isUDP, stats_out)
 			} else {
 				copyCharDeviceWithProgress(conn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(conn, input, blocksize, stats_out)
+			copyWithProgress(conn, input, blocksize, !nconn.isUDP, stats_out)
 		}
 
 		time.Sleep(1 * time.Second)
@@ -1453,7 +1521,7 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(output, conn, bufsize, stats_in)
+		copyWithProgress(output, conn, bufsize, !nconn.isUDP, stats_in)
 		time.Sleep(1 * time.Second)
 	}()
 
@@ -1581,46 +1649,14 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 	startUDPKeepAlive(ctx, rawconn, []byte(*punchData), 2*time.Second, intervalChange)
 
 	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	buconn := easyp2p.NewBoundUDPConn(pktconn, conn.RemoteAddr().String(), false)
+	buconn.SetIdleTimeout(time.Duration(easyp2p.UDPIdleTimeoutSecond) * time.Second)
+
 	if !config.isClient {
 		if blockCrypt == nil {
 			fmt.Fprintf(os.Stderr, "%sPerforming KCP-S handshake...", config.label)
 		} else {
 			fmt.Fprintf(os.Stderr, "%sPerforming encrypted(%s) KCP-S handshake...", config.label, config.keyType)
-		}
-		listener, err := kcp.ServeConn(blockCrypt, 10, 3, pktconn)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ServeConn failed: %v\n", err)
-			return nil
-		}
-		listener.SetDeadline(time.Now().Add(timeout))
-
-		sessChan := make(chan *kcp.UDPSession, 1)
-		errChan := make(chan error, 1)
-
-		go func() {
-			for {
-				s, e := listener.AcceptKCP()
-				if e != nil {
-					if easyp2p.IsConnRefused(e) {
-						continue
-					}
-					errChan <- e
-					return
-				}
-				sessChan <- s
-				return
-			}
-
-		}()
-
-		select {
-		case sess = <-sessChan:
-		case err = <-errChan:
-			fmt.Fprintf(os.Stderr, "AcceptKCP failed: %v\n", err)
-			return nil
-		case <-time.After(timeout):
-			fmt.Fprintf(os.Stderr, "timeout\n")
-			return nil
 		}
 	} else {
 		if blockCrypt == nil {
@@ -1628,11 +1664,11 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 		} else {
 			fmt.Fprintf(os.Stderr, "%sPerforming encrypted(%s) KCP-C handshake using...", config.label, config.keyType)
 		}
-		sess, err = kcp.NewConn(conn.RemoteAddr().String(), blockCrypt, 10, 3, pktconn)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "NewConn failed: %v\n", err)
-			return nil
-		}
+	}
+	sess, err = kcp.NewConn3(0, conn.RemoteAddr(), blockCrypt, 10, 3, buconn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "NewConn failed: %v\n", err)
+		return nil
 	}
 
 	// 简单握手
@@ -1665,7 +1701,15 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 
 	sess.SetNoDelay(1, 10, 2, 1)
 	sess.SetWindowSize(kcpWindowSize, kcpWindowSize)
-	sess.SetMtu(1400)
+	//kcp header 24字节SetMtu时就暗含其中。但实际发出包可能还多出28字节。根据情况把mtu再调小，防止超过udpOutputBlockSize
+	mtu := udpOutputBlockSize - 8 // 8: fecHeaderSizePlus2
+	if blockCrypt != nil {
+		mtu -= 20 //20: nonceSize+crcSize
+	}
+	if strings.Contains(config.secureLayer, "tls") {
+		mtu -= 60
+	}
+	sess.SetMtu(mtu)
 
 	return sess
 }

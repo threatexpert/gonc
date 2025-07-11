@@ -14,7 +14,7 @@ import (
 )
 
 type BoundUDPConn struct {
-	conn           *net.UDPConn
+	conn           net.PacketConn
 	connmu         sync.Mutex
 	remoteAddr     *net.UDPAddr
 	keepOpen       bool
@@ -29,7 +29,7 @@ type BoundUDPConn struct {
 }
 
 // NewBoundUDPConn 创建连接，remoteAddr为nil时允许任意源地址
-func NewBoundUDPConn(conn *net.UDPConn, raddr string, keepOpen bool) *BoundUDPConn {
+func NewBoundUDPConn(conn net.PacketConn, raddr string, keepOpen bool) *BoundUDPConn {
 	var udpaddr *net.UDPAddr
 	var err error
 	if raddr != "" {
@@ -55,12 +55,15 @@ func (b *BoundUDPConn) SetIdleTimeout(timeout time.Duration) {
 func (b *BoundUDPConn) WaitAndLockRemote() error {
 	b.conn.SetReadDeadline(time.Time{})
 	buf := make([]byte, 65507)
-	n, addr, err := b.conn.ReadFromUDP(buf)
+	n, addr, err := b.conn.ReadFrom(buf)
 	if err != nil {
 		return err
 	}
-
-	b.remoteAddr = addr
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return fmt.Errorf("received address is not a *net.UDPAddr, it's a %T", addr)
+	}
+	b.remoteAddr = udpAddr
 	b.firstPacket = buf[:n]
 	return nil
 }
@@ -114,12 +117,16 @@ func (b *BoundUDPConn) Read(p []byte) (int, error) {
 			return 0, fmt.Errorf("invalid conn object")
 		}
 		b.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-		n, addr, err := b.conn.ReadFromUDP(p)
+		n, addr, err := b.conn.ReadFrom(p)
 		b.connmu.Unlock()
 
 		switch {
 		case err == nil:
-			addrValid := b.remoteAddr == nil || (addr.IP.Equal(b.remoteAddr.IP) && addr.Port == b.remoteAddr.Port)
+			udpAddr, ok := addr.(*net.UDPAddr)
+			if !ok {
+				return 0, fmt.Errorf("received address is not a *net.UDPAddr, it's a %T", addr)
+			}
+			addrValid := b.remoteAddr == nil || (udpAddr.IP.Equal(b.remoteAddr.IP) && udpAddr.Port == b.remoteAddr.Port)
 			if addrValid {
 				b.lastPacketAddr = addr.String()
 				b.lastActiveTime = time.Now() // 更新最后活动时间
@@ -151,7 +158,27 @@ func (b *BoundUDPConn) Write(p []byte) (int, error) {
 	if b.remoteAddr == nil {
 		return 0, fmt.Errorf("remote address not set")
 	}
-	return b.conn.WriteToUDP(p, b.remoteAddr)
+	return b.conn.WriteTo(p, b.remoteAddr)
+}
+
+func (b *BoundUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, err = b.Read(p)
+	if err == nil {
+		return n, b.remoteAddr, err
+	}
+	return 0, nil, err
+}
+
+func (b *BoundUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if b.remoteAddr == nil {
+		return 0, fmt.Errorf("remote address not set")
+	}
+
+	daddr, ok := addr.(*net.UDPAddr)
+	if !ok || !(b.remoteAddr.IP.Equal(daddr.IP) && b.remoteAddr.Port == daddr.Port) {
+		return 0, fmt.Errorf("cannot write to %s, only bound to %s", addr.String(), b.remoteAddr.String())
+	}
+	return b.conn.WriteTo(p, b.remoteAddr)
 }
 
 // CloseWrite 半关闭（保持不变）
@@ -279,6 +306,8 @@ type UDPCustomConn struct {
 	writeDeadline time.Time
 	logger        *log.Logger // 添加日志器字段
 	localIP       net.IP
+	// 用于被动连接的标志，表示这个连接是由Accept创建的
+	accepted bool
 }
 
 func (c *UDPCustomConn) Read(b []byte) (n int, err error) {
@@ -333,13 +362,14 @@ func (c *UDPCustomConn) Write(b []byte) (n int, err error) {
 		timer = time.NewTimer(duration)
 		timeoutCh = timer.C
 	}
-
+	dataCopy := make([]byte, len(b))
+	copy(dataCopy, b)
 	select {
-	case c.writeCh <- b:
+	case c.writeCh <- dataCopy:
 		if timer != nil {
 			timer.Stop()
 		}
-		return len(b), nil
+		return len(dataCopy), nil
 	case <-c.closed:
 		if timer != nil {
 			timer.Stop()
@@ -409,13 +439,15 @@ func (c *UDPCustomConn) SetWriteDeadline(t time.Time) error {
 
 // UDPCustomDialer 结构体定义 (省略大部分方法实现，只保留需要注入logger的部分)
 type UDPCustomDialer struct {
-	conn          *net.UDPConn
-	conns         map[string][]*UDPCustomConn
-	mu            sync.RWMutex
-	maxPacketSize int
-	closed        chan struct{}
-	wg            sync.WaitGroup
-	logger        *log.Logger // 添加日志器字段
+	conn              *net.UDPConn
+	conns             map[string][]*UDPCustomConn
+	mu                sync.RWMutex
+	maxPacketSize     int
+	closed            chan struct{}
+	wg                sync.WaitGroup
+	logger            *log.Logger // 添加日志器字段
+	acceptCh          chan net.Conn
+	listenerCloseOnce sync.Once
 }
 
 // NewUDPCustomDialer 创建一个新的 UDPCustomDialer。
@@ -429,7 +461,8 @@ func NewUDPCustomDialer(localUDPConn *net.UDPConn, maxPacketSize int, logger *lo
 		conns:         make(map[string][]*UDPCustomConn),
 		maxPacketSize: maxPacketSize,
 		closed:        make(chan struct{}),
-		logger:        logger, // 注入日志器
+		logger:        logger,                 // 注入日志器
+		acceptCh:      make(chan net.Conn, 5), // 缓冲接受连接的通道
 	}
 
 	d.wg.Add(1)
@@ -454,7 +487,6 @@ func (d *UDPCustomDialer) DialUDP(network string, remoteAddr *net.UDPAddr) (net.
 	}
 
 	// Step 1: Use net.Dial to determine the actual local IP that would be used
-
 	tmpConn, err := net.Dial(network, remoteAddr.String())
 	if err != nil {
 		d.logger.Printf("Failed to establish dummy connection to %s to determine local IP: %v", remoteAddr, err)
@@ -483,6 +515,7 @@ func (d *UDPCustomDialer) DialUDP(network string, remoteAddr *net.UDPAddr) (net.
 		closed:     make(chan struct{}),
 		logger:     d.logger, // 注入日志器
 		localIP:    localIP,
+		accepted:   false, // 这是主动拨号建立的连接
 	}
 
 	d.conns[remoteAddrStr] = append(d.conns[remoteAddrStr], newConn)
@@ -554,13 +587,8 @@ func (d *UDPCustomDialer) readLoop() {
 				//d.logger.Printf("Read from UDP timeout, continuing.")
 				continue
 			}
-			if err.Error() == "use of closed network connection" {
-				d.logger.Printf("Underlying UDP connection closed, stopping readLoop.")
-				return
-			}
-			//d.logger.Printf("Error reading from UDP: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
+			d.logger.Printf("Error reading from UDP: %v", err)
+			return
 		}
 
 		remoteAddrStr := remoteAddr.String()
@@ -577,13 +605,67 @@ func (d *UDPCustomDialer) readLoop() {
 				case conn.readCh <- dataCopy:
 				case <-conn.closed:
 					d.logger.Printf("Skipping closed conn %s for %s", conn.RemoteAddr().String(), remoteAddrStr)
-				default:
-					d.logger.Printf("Read channel for conn %s to %s is full, dropping packet.",
-						conn.RemoteAddr().String(), remoteAddrStr)
 				}
 			}
 		} else {
-			d.logger.Printf("No custom connections found for received data from %s. Data dropped.", remoteAddrStr)
+			// **核心修改：当没有匹配的连接时，尝试被动建立一个连接**
+			d.logger.Printf("No custom connections found for received data from %s. Attempting to accept a new connection.", remoteAddrStr)
+
+			// 模拟 net.Dial 来获取 localIP，虽然对于被动连接，localIP 通常是 listener 的 IP
+			// 但为了和DialUDP行为一致，我们仍然尝试获取一个“有效”的 localIP
+			var localIP net.IP
+			listenerAddr := d.conn.LocalAddr().(*net.UDPAddr)
+			if listenerAddr != nil {
+				localIP = listenerAddr.IP
+			} else {
+				// 极端情况下的fallback
+				tmpConn, err := net.Dial("udp", remoteAddr.String())
+				if err == nil {
+					localIP = tmpConn.LocalAddr().(*net.UDPAddr).IP
+					tmpConn.Close()
+				} else {
+					d.logger.Printf("Warning: Could not determine local IP for new incoming connection from %s, using empty IP.", remoteAddrStr)
+				}
+			}
+
+			newAcceptedConn := &UDPCustomConn{
+				dialer:     d,
+				remoteAddr: remoteAddr,
+				readCh:     make(chan []byte, 100),
+				writeCh:    make(chan []byte, 100),
+				closed:     make(chan struct{}),
+				logger:     d.logger,
+				localIP:    localIP,
+				accepted:   true, // 标记为被动接受的连接
+			}
+
+			// 将接收到的第一个包发送给新的连接
+			dataCopy := append([]byte(nil), buffer[:n]...)
+			select {
+			case newAcceptedConn.readCh <- dataCopy:
+				d.mu.Lock()
+				d.conns[remoteAddrStr] = append(d.conns[remoteAddrStr], newAcceptedConn)
+				d.mu.Unlock()
+				d.wg.Add(1)
+				go d.writeLoop(newAcceptedConn)
+
+				select {
+				case d.acceptCh <- newAcceptedConn:
+					d.logger.Printf("Accepted new Custom UDP Conn from %s. Total conns for %s: %d",
+						remoteAddrStr, remoteAddrStr, len(d.conns[remoteAddrStr]))
+				case <-d.closed:
+					d.logger.Printf("Dialer closed while trying to send new accepted conn to acceptCh for %s.", remoteAddrStr)
+					newAcceptedConn.Close() // 关闭新连接
+				default:
+					d.logger.Printf("Accept channel is full, dropping new accepted conn from %s. Data dropped.", remoteAddrStr)
+					newAcceptedConn.Close() // 关闭新连接
+				}
+			case <-newAcceptedConn.closed:
+				d.logger.Printf("New accepted conn from %s closed before receiving first packet.", remoteAddrStr)
+			default:
+				d.logger.Printf("Read channel for new accepted conn from %s is full, dropping first packet.", remoteAddrStr)
+				newAcceptedConn.Close() // 关闭新连接
+			}
 		}
 	}
 }
@@ -639,7 +721,10 @@ func (d *UDPCustomDialer) Close() error {
 	default:
 	}
 
-	close(d.closed)
+	d.listenerCloseOnce.Do(func() {
+		close(d.closed)
+		close(d.acceptCh) // 关闭 acceptCh
+	})
 
 	d.mu.Lock()
 	for _, conns := range d.conns {
@@ -680,4 +765,58 @@ func (e *timeoutError) Temporary() bool {
 
 func newTimeoutError(op string, isTimeout bool) error {
 	return &timeoutError{op: op, timeout: isTimeout}
+}
+
+// UDPCustomListener 结构体，模仿 net.Listener
+type UDPCustomListener struct {
+	dialer *UDPCustomDialer
+	addr   net.Addr
+}
+
+// NewUDPCustomListener 创建并返回一个 UDPCustomListener。
+// localAddr 是监听地址，例如 "udp://:8080"
+func NewUDPCustomListener(localUDPConn *net.UDPConn, logger *log.Logger) (*UDPCustomListener, error) {
+
+	dialer, err := NewUDPCustomDialer(localUDPConn, 4096, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create UDPCustomDialer: %w", err)
+	}
+
+	return &UDPCustomListener{
+		dialer: dialer,
+		addr:   localUDPConn.LocalAddr(),
+	}, nil
+}
+
+// Accept 实现了 net.Listener 接口的 Accept 方法。
+// 它会阻塞直到有一个新的入站连接被建立。
+func (l *UDPCustomListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.dialer.acceptCh:
+		if conn == nil {
+			// acceptCh 已关闭，表示监听器已关闭
+			return nil, net.ErrClosed
+		}
+		l.dialer.logger.Printf("Accepted new incoming UDP connection from %s.", conn.RemoteAddr().String())
+		return conn, nil
+	case <-l.dialer.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+// Close 实现了 net.Listener 接口的 Close 方法。
+// 它关闭底层的 UDPCustomDialer 和 UDPConn。
+func (l *UDPCustomListener) Close() error {
+	l.dialer.logger.Printf("Closing UDPCustomListener on %s...", l.addr.String())
+	err := l.dialer.Close()
+	if err != nil {
+		l.dialer.logger.Printf("Error closing UDPCustomDialer: %v", err)
+	}
+	l.dialer.logger.Printf("UDPCustomListener on %s closed.", l.addr.String())
+	return err
+}
+
+// Addr 返回监听器的本地网络地址。
+func (l *UDPCustomListener) Addr() net.Addr {
+	return l.addr
 }
