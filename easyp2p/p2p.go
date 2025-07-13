@@ -1323,6 +1323,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	//打洞有时候有多个连接都打洞成功了，通过doHandshake实现双向确认，共同选择同一条连接，其他关闭
 	doHandshake := func(conn net.Conn, isClient bool, tag string) error {
 		var success bool
+		buf := make([]byte, len(punchAckPayload))
 		if isClient {
 			//所有C主动发送Ack
 			_, writeErr := conn.Write(punchAckPayload)
@@ -1331,9 +1332,9 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			}
 
 			//然后进入等待S回复ACK。
-			buf := make([]byte, len(punchAckPayload))
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, readErr := conn.Read(buf)
+
 			if readErr != nil {
 				return fmt.Errorf("connection(%s) failed to read: %v", tag, readErr)
 			}
@@ -1350,22 +1351,20 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				return fmt.Errorf("connection(%s) not selected", tag)
 			}
 		} else {
-			// S端只挑选一个C尝试接收ACK并回复ACK。确保只有一个C收到ACK，其他C都会关闭连接。
+			// S端尝试接收C, 然后从收到ACK的连接里只挑选一个回复ACK。确保只有一个C收到ACK，其他C都会关闭连接。
 			errS := fmt.Errorf("connection(%s) not selected", tag)
-			punchAckOnce.Do(func() {
-				buf := make([]byte, len(punchAckPayload))
-				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				n, readErr := conn.Read(buf)
-				if readErr != nil {
-					errS = fmt.Errorf("connection(%s) failed to read: %v", tag, readErr)
-					return
-				}
-				if !bytes.Equal(buf[:n], punchAckPayload) {
-					errS = fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
-					return
-				}
-				conn.SetReadDeadline(time.Time{})
 
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, readErr := conn.Read(buf)
+			if readErr != nil {
+				return errS
+			}
+			if !bytes.Equal(buf[:n], punchAckPayload) {
+				return fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
+			}
+			conn.SetReadDeadline(time.Time{})
+
+			punchAckOnce.Do(func() {
 				_, writeErr := conn.Write(punchAckPayload)
 				if writeErr != nil {
 					errS = fmt.Errorf("connection(%s) failed to write: %v", tag, writeErr)
@@ -1403,6 +1402,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		if err == nil && (clientIP == remoteIP || (sameNAT && similarLAN && IsSameLAN(clientIP, remoteIP))) {
 			select {
 			case connChan <- ConnWithTag{Conn: conn, Tag: "accept"}:
+				cancel()
 			default:
 				conn.Close()
 			}
@@ -1470,11 +1470,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		//相同子网的，以及easy对easy的，就尝试一下直接连接
 		if inSameLAN || (p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy") {
 			select {
-			// 如果有连接接受成功，直接转发回主流程
 			case <-ctx.Done():
-				return
-			case connInfo := <-connChan:
-				connChan <- connInfo
 				return
 			default:
 			}
@@ -1500,10 +1496,6 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		for i := 0; i < 3 && (randomDstPort || randomSrcPort); i++ {
 			select {
 			case <-ctx.Done():
-				return
-			case connInfo := <-connChan:
-				// 有连接成功，直接转发回主流程
-				connChan <- connInfo
 				return
 			default:
 			}
@@ -1554,17 +1546,31 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			// Wait for all workers to complete
 			wg.Wait()
 		}
-
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		errChan <- fmt.Errorf("all connection attempts failed")
 	}()
 
 	// Wait for results
 	select {
 	case connInfo := <-connChan:
+		cancel()
 		conn := connInfo.Conn    // 获取实际的连接对象
 		connType := connInfo.Tag // 获取连接类型描述
-		cancel()
 		fmt.Fprintf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
+
+		//connChan可能又有数据了
+		go func() { //排空，防止conn泄露
+			for extraConnInfo := range connChan {
+				if extraConnInfo.Conn != nil {
+					extraConnInfo.Conn.Close()
+				}
+			}
+		}()
+
 		return conn, isClient, sharedKey, nil
 	case errCh := <-errChan:
 		return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed: %s", errCh.Error())
