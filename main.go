@@ -1339,14 +1339,14 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 		sessionReady = true
 	}
 
-	var input io.ReadCloser
-	var output io.WriteCloser
-	var binaryMode = true
+	// 默认使用标准输入输出
+	var input io.ReadCloser = os.Stdin
+	var output io.WriteCloser = os.Stdout
+	var binaryInputMode = false
 	var cmd *exec.Cmd
 	var err error
 
 	if *sendfile != "" {
-		// 如果指定了 sendfile 参数，发送指定的文件
 		var file io.ReadCloser
 		if *sendfile == "/dev/zero" || *sendfile == "/dev/urandom" {
 			file, err = misc.NewPseudoDevice(*sendfile)
@@ -1358,11 +1358,11 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 			os.Exit(1)
 		}
 		defer file.Close()
-
 		input = file
-		output = os.Stdout
-	} else if *writefile != "" {
-		// 如果指定了 writefile 参数，写入指定的文件
+		binaryInputMode = true
+	}
+
+	if *writefile != "" {
 		var file *os.File
 		var writePath string
 		if *writefile == "/dev/null" {
@@ -1381,10 +1381,11 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 			os.Exit(1)
 		}
 		defer file.Close()
-
-		input = os.Stdin
 		output = file
-	} else if *runCmd != "" {
+	}
+
+	if *runCmd != "" {
+		binaryInputMode = true
 		// 分割命令和参数（支持带空格的参数）
 		args, err := parseCommandLine(*runCmd)
 		if err != nil {
@@ -1463,12 +1464,6 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 				}
 			}
 		}
-
-	} else {
-		// 使用标准输入输出
-		input = os.Stdin
-		output = os.Stdout
-		binaryMode = false
 	}
 
 	var wg sync.WaitGroup
@@ -1483,7 +1478,7 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 		defer close(outExited)
 
 		info, err := os.Stdin.Stat()
-		if err == nil && info.Mode()&os.ModeCharDevice != 0 && !binaryMode {
+		if err == nil && info.Mode()&os.ModeCharDevice != 0 && !binaryInputMode {
 			if *enablePty {
 				term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
 				if err != nil {
