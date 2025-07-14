@@ -1294,6 +1294,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	errChan := make(chan error, 1)
 	punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
 	var punchAckOnce sync.Once
+	var commitOnce sync.Once
 
 	// Start listener
 	lc := net.ListenConfig{Control: ControlTCP}
@@ -1318,6 +1319,22 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
 	} else {
 		fmt.Fprintf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
+	}
+
+	tryCommit := func(conn net.Conn, tag string) bool {
+		committed := false
+		commitOnce.Do(func() {
+			connChan <- ConnWithTag{Conn: conn, Tag: tag}
+			cancel()
+			committed = true
+		})
+
+		<-ctx.Done()
+
+		if !committed {
+			conn.Close()
+		}
+		return committed
 	}
 
 	//打洞有时候有多个连接都打洞成功了，通过doHandshake实现双向确认，共同选择同一条连接，其他关闭
@@ -1381,7 +1398,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	}
 
 	// Start accepting connections in goroutine
-	go func() {
+	doAccept := func() {
 		deadline := time.Now().Add(time.Duration(timeoutMax) * time.Second)
 		listener.(*net.TCPListener).SetDeadline(deadline)
 		conn, err := listener.Accept()
@@ -1400,12 +1417,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		// Verify the connection is from expected peer
 		clientIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 		if err == nil && (clientIP == remoteIP || (sameNAT && similarLAN && IsSameLAN(clientIP, remoteIP))) {
-			select {
-			case connChan <- ConnWithTag{Conn: conn, Tag: "accept"}:
-				cancel()
-			default:
-				conn.Close()
-			}
+			tryCommit(conn, "accept")
 		} else {
 			conn.Close()
 			if err == nil {
@@ -1413,14 +1425,10 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			}
 			errChan <- err
 		}
-	}()
-
-	// Delay for passive side
-	if !isClient {
-		time.Sleep(2 * time.Second)
 	}
+
 	// Start concurrent dialing
-	go func() {
+	doPunching := func() {
 		defer cancel()
 
 		// Setup worker pool for concurrent dialing
@@ -1456,12 +1464,8 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 					return false
 				}
 
-				select {
-				case connChan <- ConnWithTag{Conn: conn, Tag: tag}:
-					cancel() // Cancel other attempts
+				if tryCommit(conn, tag) {
 					return true
-				default:
-					conn.Close()
 				}
 			}
 			return false
@@ -1552,7 +1556,14 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		default:
 		}
 		errChan <- fmt.Errorf("all connection attempts failed")
-	}()
+	}
+
+	go doAccept()
+	// Delay for passive side
+	if !isClient {
+		time.Sleep(2 * time.Second)
+	}
+	go doPunching()
 
 	// Wait for results
 	select {
@@ -1561,16 +1572,6 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		conn := connInfo.Conn    // 获取实际的连接对象
 		connType := connInfo.Tag // 获取连接类型描述
 		fmt.Fprintf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
-
-		//connChan可能又有数据了
-		go func() { //排空，防止conn泄露
-			for extraConnInfo := range connChan {
-				if extraConnInfo.Conn != nil {
-					extraConnInfo.Conn.Close()
-				}
-			}
-		}()
-
 		return conn, isClient, sharedKey, nil
 	case errCh := <-errChan:
 		return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed: %s", errCh.Error())
