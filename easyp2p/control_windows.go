@@ -1,8 +1,10 @@
 package easyp2p
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -50,4 +52,17 @@ func ControlTCPTTL(network, address string, c syscall.RawConn) (err error) {
 	})
 
 	return
+}
+
+// isMessageSizeError checks for the "message too long" error on Windows.
+func isMessageSizeError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			// On Windows, the error is WSAEMSGSIZE
+			return sysErr.Err == windows.WSAEMSGSIZE
+		}
+	}
+	return false
 }

@@ -3,8 +3,10 @@
 package easyp2p
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -71,4 +73,18 @@ func SetUDPTTL(conn *net.UDPConn, ttl int) error {
 		return err
 	}
 	return nil
+}
+
+// isMessageSizeError 检查是否为 "message too long" 错误 (Unix 版本)
+func isMessageSizeError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			// 在类 Unix 系统上，检查 EMSGSIZE
+			return sysErr.Err == unix.EMSGSIZE
+		}
+	}
+	// 兼容旧的或一些特殊情况
+	return errors.Is(err, syscall.EMSGSIZE)
 }

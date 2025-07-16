@@ -99,6 +99,7 @@ var (
 func init() {
 	flag.StringVar(runCmd, "e", "", "alias for -exec")
 	flag.BoolVar(progressEnabled, "P", false, "alias for -progress")
+	flag.BoolVar(keepOpen, "k", false, "alias for -keep-open")
 	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
 	flag.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
 	flag.StringVar(&easyp2p.TopicExchangeWait, "mqtt-wait-topic", easyp2p.TopicExchangeWait, "")
@@ -168,7 +169,7 @@ func isTLSEnabled() bool {
 	return *tlsServerMode || *tlsEnabled || *tls10_forced || *tls11_forced || *tls12_forced || *tls13_forced
 }
 
-func do_TLS(config *connectionConfig, conn net.Conn) net.Conn {
+func do_TLS(ctx context.Context, config *connectionConfig, conn net.Conn, logWriter io.Writer) net.Conn {
 	// 获取所有安全加密套件
 	safeCiphers := tls.CipherSuites()
 	// 获取所有不安全加密套件
@@ -206,9 +207,6 @@ func do_TLS(config *connectionConfig, conn net.Conn) net.Conn {
 		tlsConfig.MinVersion = tls.VersionTLS13
 		tlsConfig.MaxVersion = tls.VersionTLS13
 	}
-	timeout_sec := 20
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
-	defer cancel()
 	// 使用 TLS 握手
 	var conn_tls *tls.Conn
 	var certs []tls.Certificate = config.certs
@@ -218,31 +216,31 @@ func do_TLS(config *connectionConfig, conn net.Conn) net.Conn {
 		if config.key != "" && config.keyType == "PSK" {
 			tlsConfig.ClientAuth = tls.RequireAnyClientCert
 			tlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
-			fmt.Fprintf(os.Stderr, "%sPerforming TLS-S handshake (PSK-based mutual authentication)...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sPerforming TLS-S handshake...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake...", config.label)
 		}
 		conn_tls = tls.Server(conn, tlsConfig)
 	} else {
-		tlsConfig.ServerName = *tlsSNI
+		tlsConfig.ServerName = config.tlsSNI
 		if config.key != "" && config.keyType == "PSK" {
 			tlsConfig.Certificates = certs
 			tlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
-			fmt.Fprintf(os.Stderr, "%sPerforming TLS-C handshake (PSK-based mutual authentication)...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sPerforming TLS-C handshake...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake...", config.label)
 		}
 		conn_tls = tls.Client(conn, tlsConfig)
 	}
 	if err := conn_tls.HandshakeContext(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "failed: %v\n", err)
+		fmt.Fprintf(logWriter, "failed: %v\n", err)
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "completed.\n")
+	fmt.Fprintf(logWriter, "completed.\n")
 	return conn_tls
 }
 
-func do_DTLS(config *connectionConfig, conn net.Conn) net.Conn {
+func do_DTLS(ctx context.Context, config *connectionConfig, conn net.Conn, logWriter io.Writer) net.Conn {
 	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
 	allCiphers := []dtls.CipherSuiteID{
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -260,81 +258,52 @@ func do_DTLS(config *connectionConfig, conn net.Conn) net.Conn {
 	// DTLS Server / Client 模式
 	var dtlsConn *dtls.Conn
 	var err error
-	timeout_sec := 20
-
 	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
-
-	intervalChange := make(chan time.Duration, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
-	defer cancel()
-	// 开启NAT打洞， 首包是4秒后发出punch包
-	startUDPKeepAlive(ctx, conn, []byte(*punchData), 4*time.Second, intervalChange)
 
 	if !config.isClient {
 		dtlsConfig.Certificates = config.certs
 		if config.key != "" && config.keyType == "PSK" {
 			dtlsConfig.ClientAuth = dtls.RequireAnyClientCert
 			dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
-			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-S handshake (PSK-based mutual authentication)...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-S handshake...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake...", config.label)
 		}
-		//dtls.Server 不会主动发包，startUDPKeepAlive4秒后发出punch包有助于P2P建立通信
 		dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
 	} else {
-		dtlsConfig.ServerName = *tlsSNI
+		dtlsConfig.ServerName = config.tlsSNI
 		if config.key != "" && config.keyType == "PSK" {
 			dtlsConfig.Certificates = config.certs
 			dtlsConfig.VerifyPeerCertificate = misc.VerifyPeerCertificateByPSK(config.key)
-			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-C handshake (PSK-based mutual authentication)...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake (PSK-based mutual authentication)...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sPerforming DTLS-C handshake...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake...", config.label)
 		}
-		//dtls.Client 会立刻发出hello包，dtls.Server
 		dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "DTLS initialization failed: %v\n", err)
+		fmt.Fprintf(logWriter, "DTLS initialization failed: %v\n", err)
 		return nil
 	}
-
-	// 超时控制通道
-	timeoutChan := make(chan struct{})
-	defer close(timeoutChan) // 确保通道最终被关闭
-
-	// 超时检测协程
-	go func() {
-		select {
-		case <-time.After(time.Duration(timeout_sec) * time.Second):
-			// 超时后强制关闭连接
-			cancel()
-			time.Sleep(500 * time.Millisecond)
-			dtlsConn.Close()
-		case <-timeoutChan:
-			// 正常完成握手，退出协程
-			return
-		}
-	}()
 
 	firstRefusedLogged := false
 	for {
 		if err = dtlsConn.HandshakeContext(ctx); err != nil {
 			if easyp2p.IsConnRefused(err) {
 				if !firstRefusedLogged {
-					fmt.Fprintf(os.Stderr, "(ECONNREFUSED)...")
+					fmt.Fprintf(logWriter, "(ECONNREFUSED)...")
 					firstRefusedLogged = true
 				}
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "failed: %v\n", err)
+			fmt.Fprintf(logWriter, "failed: %v\n", err)
 			dtlsConn.Close()
 			return nil
 		}
-		timeoutChan <- struct{}{}
 		break
 	}
-	fmt.Fprintf(os.Stderr, "completed.\n")
+	fmt.Fprintf(logWriter, "completed.\n")
 	return dtlsConn
 }
 
@@ -1134,6 +1103,7 @@ type connectionConfig struct {
 	isClient      bool
 	secureLayer   string //tls tls13 dtls ss
 	certs         []tls.Certificate
+	tlsSNI        string
 	kcpWithUDP    bool
 	kcpEncryption bool //是否开启kcp加密
 	key           string
@@ -1145,6 +1115,7 @@ func preinitConnectionConfig() (*connectionConfig, error) {
 
 	genCertForced := *presharedKey != ""
 	config.certs = init_TLS(genCertForced)
+	config.tlsSNI = *tlsSNI
 
 	if *listenMode || *kcpSEnabled || *tlsServerMode {
 		config.isClient = false
@@ -1163,6 +1134,8 @@ func preinitConnectionConfig() (*connectionConfig, error) {
 			config.secureLayer = "dtls"
 		} else if config.kcpWithUDP && config.key != "" {
 			config.kcpEncryption = true
+		} else if config.key != "" {
+			config.secureLayer = "dss"
 		}
 	} else {
 		if isTLSEnabled() {
@@ -1240,7 +1213,7 @@ func (nconn *negotiatedConn) SetWriteDeadline(t time.Time) error {
 	return nconn.connLayers[0].SetWriteDeadline(t)
 }
 
-func do_Negotiation(cfg *connectionConfig, rawconn net.Conn) (*negotiatedConn, error) {
+func do_Negotiation(cfg *connectionConfig, rawconn net.Conn, logWriter io.Writer) (*negotiatedConn, error) {
 	nconn := &negotiatedConn{
 		connLayers: []net.Conn{rawconn},
 	}
@@ -1263,38 +1236,47 @@ func do_Negotiation(cfg *connectionConfig, rawconn net.Conn) (*negotiatedConn, e
 		configTCPKeepalive(rawconn)
 	}
 
+	timeout_sec := 20
+	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
+	defer cancelTimeout()
+
 	switch {
 	case strings.HasPrefix(cfg.secureLayer, "tls"):
-		conn_tls := do_TLS(cfg, nconn.connLayers[0])
+		conn_tls := do_TLS(ctxTimeout, cfg, nconn.connLayers[0], logWriter)
 		if conn_tls == nil {
 			return nil, fmt.Errorf("failed to establish TLS connection")
 		}
 		nconn.connLayers = append([]net.Conn{conn_tls}, nconn.connLayers...)
 	case cfg.secureLayer == "dtls":
-		conn_dtls := do_DTLS(cfg, nconn.connLayers[0])
+		conn_dtls := do_DTLS(ctxTimeout, cfg, nconn.connLayers[0], logWriter)
 		if conn_dtls == nil {
 			return nil, fmt.Errorf("failed to establish DTLS connection")
 		}
 		nconn.connLayers = append([]net.Conn{conn_dtls}, nconn.connLayers...)
-	case cfg.secureLayer == "ss":
+	case cfg.secureLayer == "ss" || cfg.secureLayer == "dss":
 		var key32 [32]byte
 		if cfg.keyType == "ECDHE" {
 			copy(key32[:], []byte(cfg.key))
-			fmt.Fprintf(os.Stderr, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.label)
+			fmt.Fprintf(logWriter, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.label)
 		} else if cfg.keyType == "PSK" {
 			k, err := misc.DerivePSK(cfg.key)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%sFailed to derive key for secure stream: %v\n", cfg.label, err)
+				fmt.Fprintf(logWriter, "%sFailed to derive key for secure stream: %v\n", cfg.label, err)
 				return nil, err
 			}
 			copy(key32[:], k)
-			fmt.Fprintf(os.Stderr, "%sCommunication is encrypted(PSK) with AES.\n", cfg.label)
+			fmt.Fprintf(logWriter, "%sCommunication is encrypted(PSK) with AES.\n", cfg.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sMissing key type for secure stream\n", cfg.label)
+			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.label)
 			return nil, fmt.Errorf("missing key type for secure stream")
 		}
-		connss := misc.NewSecureStreamConn(nconn.connLayers[0], key32)
-		nconn.connLayers = append([]net.Conn{connss}, nconn.connLayers...)
+		if cfg.secureLayer == "dss" {
+			connss := misc.NewSecurePacketConn(nconn.connLayers[0], key32)
+			nconn.connLayers = append([]net.Conn{connss}, nconn.connLayers...)
+		} else {
+			connss := misc.NewSecureStreamConn(nconn.connLayers[0], key32)
+			nconn.connLayers = append([]net.Conn{connss}, nconn.connLayers...)
+		}
 	default:
 	}
 
@@ -1547,7 +1529,7 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 }
 
 func handleConnection(cfg *connectionConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
-	nconn, err := do_Negotiation(cfg, conn)
+	nconn, err := do_Negotiation(cfg, conn, os.Stderr)
 	if err != nil {
 		conn.Close()
 		return
@@ -1822,7 +1804,7 @@ func do_P2P(network, sessionKey string) (*negotiatedConn, error) {
 		config.secureLayer = "tls13"
 	}
 
-	nconn, err := do_Negotiation(&config, conn)
+	nconn, err := do_Negotiation(&config, conn, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

@@ -587,6 +587,9 @@ func (d *UDPCustomDialer) readLoop() {
 				//d.logger.Printf("Read from UDP timeout, continuing.")
 				continue
 			}
+			if isMessageSizeError(err) {
+				continue
+			}
 			d.logger.Printf("Error reading from UDP: %v", err)
 			return
 		}
