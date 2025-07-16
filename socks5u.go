@@ -594,10 +594,18 @@ func handleLocalUDPToTunnel(localUDPConn *net.UDPConn, tunnelStream net.Conn, cl
 	wg.Wait()
 }
 
-func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort int) error {
-
+func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort int, localbind string) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-	targetConn, err := net.Dial("tcp", targetAddr)
+	dialer := &net.Dialer{}
+	if localbind != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localbind, "0"))
+		if err != nil {
+			return err
+		}
+		dialer.LocalAddr = localAddr
+	}
+
+	targetConn, err := dialer.DialContext(context.Background(), "tcp", targetAddr)
 	log.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
 
 	if err != nil {
@@ -790,12 +798,12 @@ func handleSocks5uModeForRemote(cfg MuxSessionConfig) error {
 			log.Printf("Failed to accept mux stream: %v", err)
 			return err
 		}
-		go handleSocks5ClientOnStream(stream) // 为每个新流启动一个 goroutine 处理
+		go handleSocks5ClientOnStream(stream, "") // 为每个新流启动一个 goroutine 处理
 	}
 }
 
 // handleSocks5ClientOnMuxStream 处理每个通过 MuxSession 传入的 Stream
-func handleSocks5ClientOnStream(tunnelStream net.Conn) {
+func handleSocks5ClientOnStream(tunnelStream net.Conn, localbind string) {
 	defer tunnelStream.Close()
 
 	// 读取流的第一个请求行
@@ -808,9 +816,9 @@ func handleSocks5ClientOnStream(tunnelStream net.Conn) {
 
 	if strings.HasPrefix(requestLine, TUNNEL_REQ_TCP) {
 		targetAddr := strings.TrimPrefix(requestLine, TUNNEL_REQ_TCP)
-		handleRemoteTCPConnect(tunnelStream, targetAddr)
+		handleRemoteTCPConnect(tunnelStream, targetAddr, localbind)
 	} else if strings.HasPrefix(requestLine, TUNNEL_REQ_UDP) {
-		handleRemoteUDPAssociate(tunnelStream)
+		handleRemoteUDPAssociate(tunnelStream, localbind)
 	} else {
 		log.Printf("Unknown request type from mux stream: %s", requestLine)
 		// 向流写入错误响应
@@ -823,10 +831,19 @@ func handleSocks5ClientOnStream(tunnelStream net.Conn) {
 }
 
 // handleRemoteTCPConnect 处理远端 TCP CONNECT 代理
-func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string) {
+func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string, localbind string) {
 	log.Printf("TCP-Connect: %s", targetAddr)
 	d := &net.Dialer{
 		Timeout: 20 * time.Second,
+	}
+	if localbind != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localbind, "0"))
+		if err != nil {
+			log.Printf("Failed to ResolveTCPAddr: %v", err)
+			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: %v\n", err)))
+			return
+		}
+		d.LocalAddr = localAddr
 	}
 	targetConn, err := d.Dial("tcp", targetAddr)
 	if err != nil {
@@ -855,10 +872,16 @@ func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string) {
 // 它只创建一个 UDP socket (localUDPConn)，
 // 所有从 tunnelStream 接收的 SOCKS5 UDP 数据报都通过这个 socket 发送出去，
 // 并且所有从这个 socket 接收的 UDP 响应包都封装后通过 tunnelStream 传回本地代理。
-func handleRemoteUDPAssociate(tunnelStream net.Conn) {
+func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string) {
 	// 远端创建一个通用的 UDP socket，用于向任意目标发送和接收 UDP 包
 	// 绑定到 0.0.0.0:0，让操作系统选择一个可用端口
-	remoteLocalUDPConn, err := net.ListenUDP("udp", nil)
+	localAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(localbind, "0"))
+	if err != nil {
+		tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to ResolveUDPAddr: %v\n", err)))
+		return
+	}
+
+	remoteLocalUDPConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
 		log.Printf("Failed to listen on remote local UDP: %v", err)
 		// 如果这里失败，需要向隧道流写回错误信息
@@ -1770,6 +1793,7 @@ type AppS5SConfig struct {
 	enableConnect bool
 	enableUDP     bool
 	enableBind    bool
+	localbind     string
 }
 
 // AppS5SConfigByArgs 解析给定的 []string 参数，生成 AppS5SConfig
@@ -1781,9 +1805,10 @@ func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 
 	var authString string // 用于接收 -auth 的值
 	fs.StringVar(&authString, "auth", "", "Username and password for SOCKS5 authentication (format: user:pass)")
-	fs.BoolVar(&config.enableConnect, "c", true, "support CONNECT command (TCP Connect)")
-	fs.BoolVar(&config.enableBind, "b", false, "support BIND command (TCP Listen)")
-	fs.BoolVar(&config.enableUDP, "u", false, "support UDP ASSOCIATE command (UDP proxy)")
+	fs.BoolVar(&config.enableConnect, "c", true, "Allow SOCKS5 CONNECT command")
+	fs.BoolVar(&config.enableBind, "b", false, "Allow SOCKS5 BIND command")
+	fs.BoolVar(&config.enableUDP, "u", false, "Allow SOCKS5 UDP ASSOCIATE command")
+	fs.StringVar(&config.localbind, "local", "", "Set local bind address for outbound connections (format: ip)")
 
 	// 设置自定义的 Usage 函数
 	fs.Usage = func() {
@@ -1855,7 +1880,7 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 	conn.SetReadDeadline(time.Time{})
 
 	if req.Command == "CONNECT" && config.enableConnect {
-		err = handleDirectTCPConnect(conn, req.Host, req.Port)
+		err = handleDirectTCPConnect(conn, req.Host, req.Port, config.localbind)
 		if err != nil {
 			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 		}
@@ -1871,7 +1896,7 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
-			handleSocks5ClientOnStream(c)
+			handleSocks5ClientOnStream(c, config.localbind)
 		}(fakeTunnelS)
 
 		err = handleUDPAssociateViaTunnel(conn, fakeTunnelC, req.Host, req.Port)

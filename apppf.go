@@ -19,7 +19,7 @@ type AppPFConfig struct {
 	cert         *tls.Certificate // 如果tlsEnabled是true，这个就需要用到
 	network      string           // 默认是tcp，然而如果有参数-4 -6 -u -U，则可能是tcp4 tcp6 udp4 udp6 unix
 	host, port   string           // 是最后 two args
-	localAddr    string
+	localbind    string
 	presharedKey string // -psk <psk-string>
 	proxyProt    string // -X 代理协议，可能是 connect或5，或空
 	proxyAddress string // -x 代理服务器地址 host:port
@@ -50,7 +50,7 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	fs.BoolVar(&config.kcpWithUDP, "kcp", false, "KCP over udp")
 
 	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM); also key for TCP/KCP encryption")
-	fs.StringVar(&config.localAddr, "local", "", "Bind on address")
+	fs.StringVar(&config.localbind, "local", "", "Set local bind address for outbound connections (format: ip)")
 	fs.StringVar(&config.proxyProt, "X", "", `Proxy protocol. Supported protocols are "5" (SOCKS v.5) and "connect"`)
 	fs.StringVar(&config.proxyAddress, "x", "", "ip:port for proxy address")
 	fs.StringVar(&config.proxyAuth, "auth", "", "user:password for proxy")
@@ -174,7 +174,7 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	targetConfig := &connectionConfig{
 		isClient: true,
 	}
-	if config.localAddr == "" {
+	if config.localbind == "" {
 		dialer, err := createProxyClient(config.proxyProt, config.proxyAddress, config.proxyAuth)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error createProxyClient: %v\n", err)
@@ -188,13 +188,13 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	} else {
 		switch {
 		case strings.HasPrefix(config.network, "tcp"):
-			localAddr, err = net.ResolveTCPAddr(config.network, config.localAddr)
+			localAddr, err = net.ResolveTCPAddr(config.network, net.JoinHostPort(config.localbind, "0"))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error ResolveTCPAddr: %v\n", err)
 				return
 			}
 		case strings.HasPrefix(config.network, "udp"):
-			localAddr, err = net.ResolveUDPAddr(config.network, config.localAddr)
+			localAddr, err = net.ResolveUDPAddr(config.network, net.JoinHostPort(config.localbind, "0"))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error ResolveUDPAddr: %v\n", err)
 				return
