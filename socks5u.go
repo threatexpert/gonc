@@ -1576,7 +1576,8 @@ func (u *UDPConnWrapper) Read(b []byte) (n int, err error) {
 	respBuf := make([]byte, 65535) // Buffer to receive full SOCKS5 UDP packet
 	nResp, err := u.localUDPConn.Read(respBuf)
 	if err != nil {
-		return 0, fmt.Errorf("read from local UDP error: %w", err)
+		//直接返回err，不影响调用者判断err是否Timeout
+		return 0, err
 	}
 
 	// 2. 解析 SOCKS5 UDP 响应报头
@@ -1764,8 +1765,11 @@ func (u *UDPConnWrapper) SetWriteDeadline(t time.Time) error {
 }
 
 type AppS5SConfig struct {
-	username string
-	password string
+	username      string
+	password      string
+	enableConnect bool
+	enableUDP     bool
+	enableBind    bool
 }
 
 // AppS5SConfigByArgs 解析给定的 []string 参数，生成 AppS5SConfig
@@ -1777,6 +1781,9 @@ func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 
 	var authString string // 用于接收 -auth 的值
 	fs.StringVar(&authString, "auth", "", "Username and password for SOCKS5 authentication (format: user:pass)")
+	fs.BoolVar(&config.enableConnect, "c", true, "support CONNECT command (TCP Connect)")
+	fs.BoolVar(&config.enableBind, "b", false, "support BIND command (TCP Listen)")
+	fs.BoolVar(&config.enableUDP, "u", false, "support UDP ASSOCIATE command (UDP proxy)")
 
 	// 设置自定义的 Usage 函数
 	fs.Usage = func() {
@@ -1809,11 +1816,11 @@ func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 
 // App_s5s_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
 func App_s5s_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, "-app-s5s Usage: [options]")
+	fmt.Fprintln(os.Stderr, ":s5s Usage: [options]")
 	fmt.Fprintln(os.Stderr, "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
 	fmt.Fprintln(os.Stderr, "\nExample:")
-	fmt.Fprintln(os.Stderr, "  -app-s5s -auth user:password")
+	fmt.Fprintln(os.Stderr, "  :s5s -auth user:password")
 }
 
 func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
@@ -1847,17 +1854,17 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 
 	conn.SetReadDeadline(time.Time{})
 
-	if req.Command == "CONNECT" {
+	if req.Command == "CONNECT" && config.enableConnect {
 		err = handleDirectTCPConnect(conn, req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 		}
-	} else if req.Command == "BIND" {
+	} else if req.Command == "BIND" && config.enableBind {
 		err = handleTCPListen(conn, req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
 		}
-	} else if req.Command == "UDP" {
+	} else if req.Command == "UDP" && config.enableUDP {
 		fakeTunnelC, fakeTunnelS := net.Pipe()
 		var wg sync.WaitGroup
 		wg.Add(1)

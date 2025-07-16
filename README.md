@@ -75,7 +75,7 @@ golang版 netcat, 更方便的建立点对点通信。
 
     `gonc.exe -p2p randomString -socks5local-port 3888`
 
-    http文件服务器（-httpserver c:/RootDir等同于-e "-app-mux httpserver c:/RootDir"）
+    http文件服务器（-httpserver c:/RootDir等同于-e ":mux httpserver c:/RootDir"）
 
     `gonc.exe -p2p randomString -httpserver c:/RootDir`
 
@@ -92,19 +92,19 @@ golang版 netcat, 更方便的建立点对点通信。
 
     `gonc.exe -keep-open -exec ". -tls www.baidu.com 443" -l 8000`
     
-    如果需要避免大量子进程，-app-pf是内置的专门中转流量的模块。
+    如果需要避免大量子进程，:pf是内置的专门中转流量的模块。
 
-    `gonc.exe -keep-open -exec "-app-pf -tls www.baidu.com 443" -l 8000`
+    `gonc.exe -keep-open -exec ":pf -tls www.baidu.com 443" -l 8000`
 
 
 - 支持客户端模式配置socks5代理
 
     `gonc.exe -x s.s.s.s:port x.x.x.x 1234`
 
-- 内置socks5代理服务端应用，使用-e -app-s5s提供socks5标准服务，也支持socks5 over tls（对udp代理不会over tls）
+- 内置socks5代理服务端应用，使用-e :s5s提供socks5标准服务，也支持socks5 over tls（对udp代理不会over tls）
 
-    `gonc.exe -e "-app-s5s -auth user:passwd" -keep-open -tls -l 1080`
+    `gonc.exe -e ":s5s -auth user:passwd" -keep-open -tls -l 1080`
 
-- 使用-app-pf -tls 把socks5 over tls转为本地标准socks5提供其他客户端接入
+- 使用:pf -tls 把socks5 over tls转为本地标准socks5提供其他客户端接入
 
-    `gonc.exe -e "-app-pf -tls x.x.x.x:1080" -keep-open -l 1080`
+    `gonc.exe -e ":pf -tls x.x.x.x:1080" -keep-open -l 1080`

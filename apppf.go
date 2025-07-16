@@ -139,20 +139,20 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 
 // App_pf_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
 func App_pf_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, "-app-pf Usage: [options] <host> <port>")
+	fmt.Fprintln(os.Stderr, ":pf Usage: [options] <host> <port>")
 	fmt.Fprintln(os.Stderr, "Or:    [options] -U <UNIX-domain-socket-path>")
 	fmt.Fprintln(os.Stderr, "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
 	fmt.Fprintln(os.Stderr, "\nExamples:")
-	fmt.Fprintln(os.Stderr, "  -app-pf -4 -tls <host> <port>")
-	fmt.Fprintln(os.Stderr, "  -app-pf -U <UNIX-domain>")
+	fmt.Fprintln(os.Stderr, "  :pf -4 -tls <host> <port>")
+	fmt.Fprintln(os.Stderr, "  :pf -U <UNIX-domain>")
 }
 
 // Port Forwarding
 func App_pf_main(conn net.Conn, args []string) {
 	config, err := AppPFConfigByArgs(args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing app-pf args: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error parsing :pf args: %v\n", err)
 		return
 	}
 

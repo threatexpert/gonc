@@ -138,11 +138,11 @@ func handleProxy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 
 func App_mux_usage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "   -app-mux target_host target_port")
-	fmt.Fprintln(os.Stderr, "   -app-mux socks5")
-	fmt.Fprintln(os.Stderr, "   -app-mux httpserver <rootDir>")
-	fmt.Fprintln(os.Stderr, "   -app-mux httpclient <saveDir>")
-	fmt.Fprintln(os.Stderr, "   -app-mux -l listen_port")
+	fmt.Fprintln(os.Stderr, "   :mux target_host target_port")
+	fmt.Fprintln(os.Stderr, "   :mux socks5")
+	fmt.Fprintln(os.Stderr, "   :mux httpserver <rootDir>")
+	fmt.Fprintln(os.Stderr, "   :mux httpclient <saveDir>")
+	fmt.Fprintln(os.Stderr, "   :mux -l listen_port")
 }
 
 // type stdioConn struct{}
@@ -186,11 +186,11 @@ func App_mux_usage() {
 // 	}
 
 // 	if *udpProtocol {
-// 		fmt.Fprintf(os.Stderr, "-app-mux and -u cannot be used together\n")
+// 		fmt.Fprintf(os.Stderr, ":mux and -u cannot be used together\n")
 // 		os.Exit(1)
 // 	}
 // 	if *runCmd != "" {
-// 		fmt.Fprintf(os.Stderr, "-app-mux and -exec cannot be used together\n")
+// 		fmt.Fprintf(os.Stderr, ":mux and -exec cannot be used together\n")
 // 		os.Exit(1)
 // 	}
 
@@ -277,7 +277,7 @@ func App_mux_usage() {
 // 	}
 // 	err = handleMuxSession(cfg)
 // 	if err != nil {
-// 		fmt.Fprintf(os.Stderr, "app-mux: %v\n", err)
+// 		fmt.Fprintf(os.Stderr, ":mux: %v\n", err)
 // 	}
 // }
 
@@ -306,7 +306,7 @@ func AppMuxConfigByArgs(args []string) (*AppMuxConfig, error) {
 		config.Port = args[1]
 		config.AppMode = "forward"
 	} else {
-		return nil, fmt.Errorf("invalid arguments for app-mux")
+		return nil, fmt.Errorf("invalid arguments for :mux")
 	}
 
 	return config, nil
@@ -322,7 +322,7 @@ func App_mux_main_withconfig(conn net.Conn, config *AppMuxConfig) {
 
 	err := handleMuxSession(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "app-mux: %v\n", err)
+		fmt.Fprintf(os.Stderr, ":mux: %v\n", err)
 	}
 }
 
@@ -387,7 +387,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	if done != nil {
 		defer done()
 	}
-	fmt.Fprintln(os.Stderr, "Waiting for app-mux handshake...")
+	fmt.Fprintln(os.Stderr, "Waiting for :mux handshake...")
 	hello := make([]byte, 16)
 	if _, err := io.ReadFull(cfg.SessionConn, hello); err != nil {
 		return fmt.Errorf("mux read hello failed: %v", err)

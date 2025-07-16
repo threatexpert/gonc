@@ -77,23 +77,22 @@ var (
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
 	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
-	//appMux            = flag.Bool("app-mux", false, "a Stream Multiplexing based proxy app")
-	keepAlive        = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
-	punchData        = flag.String("punchdata", "ping\n", "UDP punch payload")
-	MQTTServers      = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
-	autoP2P          = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
-	useMutilPath     = flag.Bool("mp", false, "enable multipath(NOT IMPL)")
-	MQTTWait         = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
-	MQTTPush         = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
-	useIPv4          = flag.Bool("4", false, "Forces to use IPv4 addresses only")
-	useIPv6          = flag.Bool("6", false, "Forces to use IPv4 addresses only")
-	useDNS           = flag.String("dns", "", "set DNS Server")
-	runAppFileServ   = flag.String("httpserver", "", "http server root directory")
-	runAppFileGet    = flag.String("download", "", "http client download directory")
-	appMuxListenMode = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
-	appMuxListenOn   = flag.String("httplocal-port", "", "local listen port for remote httpserver")
-	appMuxSocksMode  = flag.Bool("socks5server", false, "for socks5 tunnel")
-	disableCompress  = flag.Bool("no-compress", false, "disable compression for http download")
+	keepAlive         = flag.Int("keepalive", 0, "none 0 will enable TCP keepalive feature")
+	punchData         = flag.String("punchdata", "ping\n", "UDP punch payload")
+	MQTTServers       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
+	autoP2P           = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
+	useMutilPath      = flag.Bool("mp", false, "enable multipath(NOT IMPL)")
+	MQTTWait          = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
+	MQTTPush          = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
+	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
+	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
+	useDNS            = flag.String("dns", "", "set DNS Server")
+	runAppFileServ    = flag.String("httpserver", "", "http server root directory")
+	runAppFileGet     = flag.String("download", "", "http client download directory")
+	appMuxListenMode  = flag.Bool("httplocal", false, "local listen mode for remote httpserver")
+	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for remote httpserver")
+	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
+	disableCompress   = flag.Bool("no-compress", false, "disable compression for http download")
 )
 
 func init() {
@@ -404,11 +403,24 @@ func showProgress(statsIn, statsOut *misc.ProgressStats, done chan bool, wg *syn
 	}()
 }
 
+func usage_full() {
+	usage()
+	flag.PrintDefaults()
+	fmt.Fprintln(os.Stderr, "Built-in commands for -e option:")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":mux", "Stream-multiplexing proxy")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":s5s", "SOCKS5 server")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":pf", "Port forwarding")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "To get help for a built-in command, run:")
+	fmt.Fprintln(os.Stderr, "  gonc -e \":pf -h\"")
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "go-netcat v1.9.6")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
+	fmt.Fprintln(os.Stderr, "         [-e \":builtin-command [args]\" or \"external-command [args]\"]")
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
 
@@ -479,21 +491,21 @@ func preinitBuiltinAppConfig() {
 		os.Exit(1)
 	}
 
-	builtinApp := strings.TrimLeft(args[0], "-")
-	if builtinApp == "app-mux" {
+	builtinApp := args[0]
+	if builtinApp == ":mux" {
 		app_mux_Config, err = AppMuxConfigByArgs(args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
 			App_mux_usage()
 			os.Exit(1)
 		}
-	} else if builtinApp == "app-s5s" {
+	} else if builtinApp == ":s5s" {
 		app_s5s_Config, err = AppS5SConfigByArgs(args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
 			os.Exit(1)
 		}
-	} else if builtinApp == "app-pf" {
+	} else if builtinApp == ":pf" {
 		app_pf_Config, err = AppPFConfigByArgs(args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
@@ -504,6 +516,9 @@ func preinitBuiltinAppConfig() {
 
 func main() {
 	var err error
+	flag.Usage = func() {
+		usage_full()
+	}
 	flag.Parse()
 
 	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
@@ -513,7 +528,7 @@ func main() {
 
 	if *runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
-		*runCmd = fmt.Sprintf("-app-mux httpserver \"%s\"", escapedPath)
+		*runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
 		if *MQTTWait == "" {
 			*MQTTWait = "hello"
 		}
@@ -521,7 +536,7 @@ func main() {
 		*keepOpen = true
 	} else if *runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileGet, "\\", "/")
-		*runCmd = fmt.Sprintf("-app-mux httpclient \"%s\"", escapedPath)
+		*runCmd = fmt.Sprintf(":mux httpclient \"%s\"", escapedPath)
 		if *appMuxListenOn != "" {
 			muxLastListenAddress = *appMuxListenOn
 		}
@@ -530,7 +545,7 @@ func main() {
 		}
 		*keepOpen = true
 	} else if *appMuxSocksMode {
-		*runCmd = "-app-mux socks5"
+		*runCmd = ":mux socks5"
 		if *MQTTWait == "" {
 			*MQTTWait = "hello"
 		}
@@ -540,7 +555,7 @@ func main() {
 		if *appMuxListenOn == "" {
 			*appMuxListenOn = "0"
 		}
-		*runCmd = fmt.Sprintf("-app-mux -l %s", *appMuxListenOn)
+		*runCmd = fmt.Sprintf(":mux -l %s", *appMuxListenOn)
 		if *MQTTPush == "" {
 			*MQTTPush = "hello"
 		}
@@ -1380,20 +1395,20 @@ func handleNegotiatedConnection(nconn *negotiatedConn, stats_in, stats_out *misc
 			return
 		}
 
-		builtinApp := strings.TrimLeft(args[0], "-")
-		if builtinApp == "app-mux" {
+		builtinApp := args[0]
+		if builtinApp == ":mux" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_mux_main_withconfig(pipeConn, app_mux_Config)
-		} else if builtinApp == "app-s5s" {
+		} else if builtinApp == ":s5s" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_s5s_main_withconfig(pipeConn, app_s5s_Config)
-		} else if builtinApp == "app-pf" {
+		} else if builtinApp == ":pf" {
 			pipeConn := misc.NewPipeConn(conn)
 			input = pipeConn.In
 			output = pipeConn.Out
