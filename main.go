@@ -1282,7 +1282,7 @@ func do_Negotiation(cfg *connectionConfig, rawconn net.Conn, logWriter io.Writer
 
 	if nconn.isUDP {
 		if cfg.kcpWithUDP {
-			sess_kcp := do_KCP(ctx, cfg, nconn.connLayers[0], rawconn, 30*time.Second)
+			sess_kcp := do_KCP(ctx, cfg, nconn.connLayers[0], rawconn, 30*time.Second, logWriter)
 			if sess_kcp == nil {
 				return nil, fmt.Errorf("failed to establish KCP session")
 			}
@@ -1590,7 +1590,7 @@ func isKCPEnabled() bool {
 	return *udpProtocol && (*kcpEnabled || *kcpSEnabled)
 }
 
-func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Conn, timeout time.Duration) net.Conn {
+func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
@@ -1598,13 +1598,13 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 		if config.keyType == "ECDHE" {
 			blockCrypt, err = createKCPBlockCryptFromKey([]byte(config.key))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%screateKCPBlockCryptFromKey failed: %v\n", config.label, err)
+				fmt.Fprintf(logWriter, "%screateKCPBlockCryptFromKey failed: %v\n", config.label, err)
 				return nil
 			}
 		} else if config.keyType == "PSK" {
 			blockCrypt, err = createKCPBlockCrypt(config.key, []byte("1234567890abcdef"))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%screateKCPBlockCrypt failed: %v\n", config.label, err)
+				fmt.Fprintf(logWriter, "%screateKCPBlockCrypt failed: %v\n", config.label, err)
 				return nil
 			}
 		}
@@ -1622,20 +1622,20 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 
 	if !config.isClient {
 		if blockCrypt == nil {
-			fmt.Fprintf(os.Stderr, "%sPerforming KCP-S handshake...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming KCP-S handshake...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sPerforming encrypted(%s) KCP-S handshake...", config.label, config.keyType)
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-S handshake...", config.label, config.keyType)
 		}
 	} else {
 		if blockCrypt == nil {
-			fmt.Fprintf(os.Stderr, "%sPerforming KCP-C handshake...", config.label)
+			fmt.Fprintf(logWriter, "%sPerforming KCP-C handshake...", config.label)
 		} else {
-			fmt.Fprintf(os.Stderr, "%sPerforming encrypted(%s) KCP-C handshake using...", config.label, config.keyType)
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake using...", config.label, config.keyType)
 		}
 	}
 	sess, err = kcp.NewConn3(0, conn.RemoteAddr(), blockCrypt, 10, 3, buconn)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "NewConn failed: %v\n", err)
+		fmt.Fprintf(logWriter, "NewConn failed: %v\n", err)
 		return nil
 	}
 
@@ -1643,7 +1643,7 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 	handshake := []byte("HELLO")
 	_, err = sess.Write(handshake)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "send handshake failed: %v\n", err)
+		fmt.Fprintf(logWriter, "send handshake failed: %v\n", err)
 		return nil
 	}
 
@@ -1653,10 +1653,10 @@ func do_KCP(ctx context.Context, config *connectionConfig, conn, rawconn net.Con
 	buf := make([]byte, len(handshake))
 	n, err := io.ReadFull(sess, buf)
 	if err != nil || n != len(handshake) || !bytes.Equal(buf, handshake) {
-		fmt.Fprintf(os.Stderr, "recv handshake failed: %v\n", err)
+		fmt.Fprintf(logWriter, "recv handshake failed: %v\n", err)
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "completed.\n")
+	fmt.Fprintf(logWriter, "completed.\n")
 
 	// 取消超时（恢复成无超时）
 	sess.SetReadDeadline(time.Time{})
