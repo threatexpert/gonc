@@ -23,6 +23,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/threatexpert/gonc/acl"
 	"github.com/threatexpert/gonc/easyp2p"
 	"github.com/threatexpert/gonc/misc"
 
@@ -43,6 +44,7 @@ var (
 	app_mux_Config             *AppMuxConfig
 	app_s5s_Config             *AppS5SConfig
 	app_pf_Config              *AppPFConfig
+	accessControl              *acl.ACL
 	// 定义命令行参数
 	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
 	proxyAddr         = flag.String("x", "", "ip:port for proxy_address")
@@ -93,6 +95,7 @@ var (
 	appMuxListenOn    = flag.String("httplocal-port", "", "local listen port for remote httpserver")
 	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
 	disableCompress   = flag.Bool("no-compress", false, "disable compression for http download")
+	fileACL           = flag.String("acl", "", "ACL file for inbound/outbound connections")
 )
 
 func init() {
@@ -416,7 +419,7 @@ func usage_full() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v1.9.6")
+	fmt.Fprintln(os.Stderr, "go-netcat v1.9.7")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -499,12 +502,14 @@ func preinitBuiltinAppConfig() {
 			App_mux_usage()
 			os.Exit(1)
 		}
+		app_mux_Config.accessCtrl = accessControl
 	} else if builtinApp == ":s5s" {
 		app_s5s_Config, err = AppS5SConfigByArgs(args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
 			os.Exit(1)
 		}
+		app_s5s_Config.accessCtrl = accessControl
 	} else if builtinApp == ":pf" {
 		app_pf_Config, err = AppPFConfigByArgs(args[1:])
 		if err != nil {
@@ -578,6 +583,14 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+		}
+	}
+
+	if *fileACL != "" {
+		accessControl, err = acl.LoadACL(*fileACL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load ACL file: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
@@ -813,6 +826,11 @@ func main() {
 						}
 						continue
 					}
+					if !acl.ACL_inbound_allow(accessControl, newSess.RemoteAddr()) {
+						fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
+						newSess.Close()
+						continue
+					}
 
 					fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
 					go handleConnection(connConfig, newSess, stats_in, stats_out)
@@ -822,6 +840,11 @@ func main() {
 				newSess, err := usessListener.Accept()
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
+					os.Exit(1)
+				}
+				if !acl.ACL_inbound_allow(accessControl, newSess.RemoteAddr()) {
+					fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
+					newSess.Close()
 					os.Exit(1)
 				}
 				fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
@@ -877,6 +900,11 @@ func main() {
 					if conn.LocalAddr().Network() == "unix" {
 						fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
 					} else {
+						if !acl.ACL_inbound_allow(accessControl, conn.RemoteAddr()) {
+							fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
+							conn.Close()
+							continue
+						}
 						fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
 					}
 					go handleConnection(connConfig, conn, stats_in, stats_out)
@@ -891,6 +919,11 @@ func main() {
 				if conn.LocalAddr().Network() == "unix" {
 					fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
 				} else {
+					if !acl.ACL_inbound_allow(accessControl, conn.RemoteAddr()) {
+						fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
+						conn.Close()
+						os.Exit(1)
+					}
 					fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
 				}
 			}

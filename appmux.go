@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/threatexpert/gonc/acl"
 	"github.com/threatexpert/gonc/httpfileshare"
 	"github.com/xtaci/smux"
 )
@@ -27,11 +28,12 @@ var (
 )
 
 type AppMuxConfig struct {
-	Engine  string
-	AppMode string
-	Host    string // for forward
-	Port    string
-	HttpDir string // for httpserver/httpclient
+	Engine     string
+	AppMode    string
+	Host       string // for forward
+	Port       string
+	HttpDir    string // for httpserver/httpclient
+	accessCtrl *acl.ACL
 }
 
 type MuxSessionConfig struct {
