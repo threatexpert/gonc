@@ -1,4 +1,4 @@
-package main
+package apps
 
 import (
 	"bufio"
@@ -107,7 +107,7 @@ type ProxyClient struct {
 	Username  string // 用户名 (可选)
 	Password  string // 密码 (可选)
 
-	dialer Dialer // 实际的拨号器
+	Dialer Dialer // 实际的拨号器
 }
 
 // NewProxyClient 构造函数
@@ -121,11 +121,11 @@ func NewProxyClient(proxyProt, proxyAddr, username, password string) (*ProxyClie
 
 	switch pc.ProxyProt {
 	case "socks5":
-		pc.dialer = NewSocks5Client(proxyAddr, username, password)
+		pc.Dialer = NewSocks5Client(proxyAddr, username, password)
 	case "http":
-		pc.dialer = NewHttpConnectClient(proxyAddr, username, password)
+		pc.Dialer = NewHttpConnectClient(proxyAddr, username, password)
 	case "":
-		pc.dialer = &DirectDialer{}
+		pc.Dialer = &DirectDialer{}
 	default:
 		return nil, fmt.Errorf("unsupported proxy protocol: %s", proxyProt)
 	}
@@ -145,13 +145,50 @@ func (c *DirectDialer) Listen(network, address string) (net.Listener, error) {
 
 // Dial 实现 ProxyClient 的拨号逻辑，委托给内部的 dialer
 func (c *ProxyClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
-	if c.dialer == nil {
+	if c.Dialer == nil {
 		return nil, fmt.Errorf("proxy client not initialized, call NewProxyClient first")
 	}
-	return c.dialer.DialTimeout(network, address, timeout)
+	return c.Dialer.DialTimeout(network, address, timeout)
 }
 
 func (c *ProxyClient) SupportBIND() bool {
 	// 目前仅 SOCKS5 支持 BIND
 	return c.ProxyProt == "socks5"
+}
+
+func CreateProxyClient(proxyProt, proxyAddr, proxyAuth string) (*ProxyClient, error) {
+	if proxyAddr != "" {
+		user, pass := "", ""
+		if proxyAuth != "" {
+			authParts := strings.SplitN(proxyAuth, ":", 2)
+			if len(authParts) != 2 {
+				return nil, fmt.Errorf("invalid auth format: expected user:pass")
+			}
+			user, pass = authParts[0], authParts[1]
+		}
+
+		switch proxyProt {
+		case "", "5":
+			client, err := NewProxyClient("socks5", proxyAddr, user, pass)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create socks5 client: %w", err)
+			}
+			return client, nil
+		case "connect":
+			client, err := NewProxyClient("http", proxyAddr, user, pass)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create http client: %w", err)
+			}
+			return client, nil
+		default:
+			return nil, fmt.Errorf("invalid proxy protocol: %s", proxyProt)
+		}
+	}
+
+	// 没有代理时，返回默认的直连客户端
+	client, err := NewProxyClient("", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create direct client: %w", err)
+	}
+	return client, nil
 }

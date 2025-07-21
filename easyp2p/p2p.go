@@ -42,7 +42,6 @@ var (
 	DebugServerRole         string
 	PunchingShortTTL        int = 5
 	PunchingRandomPortCount int = 600
-	UDPIdleTimeoutSecond    int = 41
 )
 
 type P2PAddressInfo struct {
@@ -1119,24 +1118,30 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 
 	// 等待结果
 	var errFin error
+	var uconnBrandnew *net.UDPConn
 	select {
 	case addrPair := <-gotHoleCh:
+		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
 		buconn.Close()
-		uconn, err = net.ListenUDP(network, addrPair.Local)
+		uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote)
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
 		} else {
 			//这个新的socket立刻主动发包打通本机防火墙
-			uconn.WriteToUDP(punchPayload, addrPair.Remote)
-			buconn = NewBoundUDPConn(uconn, addrPair.Remote.String(), false)
-			buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
-			fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
-			SetUDPTTL(uconn, 64)
+			uconnBrandnew.Write(punchPayload)
 		}
 	case <-recvChan:
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
-		buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
-		SetUDPTTL(uconn, 64)
+		laddr := uconn.LocalAddr()
+		raddr := buconn.RemoteAddr()
+		buconn.Close()
+		uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr)
+		if err != nil {
+			errFin = fmt.Errorf("error binding UDP address: %v", err)
+		} else {
+			//这个新的socket立刻主动发包打通本机防火墙
+			uconnBrandnew.Write(punchPayload)
+		}
 	case errFin = <-errChan:
 		buconn.Close()
 	case <-ctxRound.Done():
@@ -1148,7 +1153,23 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	if errFin != nil {
 		return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
 	}
-	return buconn, isClient, sharedKey, nil
+	return uconnBrandnew, isClient, sharedKey, nil
+}
+
+func CreateUDPConnFromAddr(laddr, raddr net.Addr) (*net.UDPConn, error) {
+	// 类型断言：必须是 *net.UDPAddr
+	la, ok1 := laddr.(*net.UDPAddr)
+	ra, ok2 := raddr.(*net.UDPAddr)
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("both laddr and raddr must be *net.UDPAddr, got %T and %T", laddr, raddr)
+	}
+
+	// 使用 net.DialUDP 绑定本地地址并连接远程地址
+	conn, err := net.DialUDP("udp", la, ra)
+	if err != nil {
+		return nil, fmt.Errorf("DialUDP failed: %w", err)
+	}
+	return conn, nil
 }
 
 func Mqtt_P2P_Round_Sync(sessionUid string, isClient bool, round int, timeout time.Duration, logWriter io.Writer) error {

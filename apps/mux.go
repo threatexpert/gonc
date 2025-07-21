@@ -1,9 +1,8 @@
-package main
+package apps
 
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -21,10 +20,10 @@ import (
 var (
 	//muxSessionMode       = flag.String("mux-mode", "stdio", "connect | listen | stdio")
 	//muxSessionAddress    = flag.String("mux-address", "", "host:port (for connect or listen mode)")
-	muxEngine                    = flag.String("mux-engine", "smux", "yamux | smux")
-	httpServeDir                 = "."
-	muxLastListenAddress         = ""
-	httpDownloadNoCompress *bool = new(bool)
+	VarmuxEngine                    = "smux"
+	httpServeDir                    = "."
+	VarmuxLastListenAddress         = ""
+	VarhttpDownloadNoCompress *bool = new(bool)
 )
 
 type AppMuxConfig struct {
@@ -33,7 +32,7 @@ type AppMuxConfig struct {
 	Host       string // for forward
 	Port       string
 	HttpDir    string // for httpserver/httpclient
-	accessCtrl *acl.ACL
+	AccessCtrl *acl.ACL
 }
 
 type MuxSessionConfig struct {
@@ -122,6 +121,9 @@ func (s *streamWrapper) SetWriteDeadline(t time.Time) error {
 }
 
 func proxy_copy(dst io.WriteCloser, src io.Reader, errCh chan<- ChanError, id int) {
+	type closeWriter interface {
+		CloseWrite() error
+	}
 	_, err := io.Copy(dst, src)
 	if tcpConn, ok := dst.(closeWriter); ok {
 		tcpConn.CloseWrite()
@@ -285,7 +287,7 @@ func App_mux_usage() {
 
 func AppMuxConfigByArgs(args []string) (*AppMuxConfig, error) {
 	config := &AppMuxConfig{
-		Engine:  *muxEngine,
+		Engine:  VarmuxEngine,
 		HttpDir: httpServeDir,
 	}
 	if len(args) == 2 && args[0] == "-l" {
@@ -368,7 +370,7 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 			LoggerOutput:           os.Stderr,
 			ProgressOutput:         os.Stderr,
 			ProgressUpdateInterval: 1 * time.Second,
-			NoCompress:             *httpDownloadNoCompress,
+			NoCompress:             *VarhttpDownloadNoCompress,
 		}
 
 		c, err := httpfileshare.NewClient(httpcfg)
@@ -405,8 +407,8 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	}
 
 	laddr := cfg.Port
-	if muxLastListenAddress != "" {
-		laddr = muxLastListenAddress
+	if VarmuxLastListenAddress != "" {
+		laddr = VarmuxLastListenAddress
 	}
 	if !strings.Contains(laddr, ":") {
 		laddr = "127.0.0.1:" + laddr
@@ -424,7 +426,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 		fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser\n", port)
 	}
 	if cfg.Port == "0" {
-		muxLastListenAddress = ln.Addr().String()
+		VarmuxLastListenAddress = ln.Addr().String()
 	}
 
 	if notifyAddrChan != nil { // 检查 channel 是否为 nil，因为其他模式调用 handleListenMode 时可能不需要通知

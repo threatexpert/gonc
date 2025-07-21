@@ -107,4 +107,4 @@ golang版 netcat, 更方便的建立点对点通信。
 
 - 使用:pf -tls 把socks5 over tls转为本地标准socks5提供其他客户端接入
 
-    `gonc.exe -e ":pf -tls x.x.x.x:1080" -keep-open -l 1080`
+    `gonc.exe -e ":pf -tls x.x.x.x 1080" -keep-open -l 1080`

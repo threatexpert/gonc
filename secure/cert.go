@@ -1,6 +1,7 @@
-package misc
+package secure
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -16,8 +17,40 @@ import (
 	"math/big"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 )
+
+func ReadPSKFile(filepath string) (string, error) {
+	// 检查是否以@开头
+	if !strings.HasPrefix(filepath, "@") {
+		return filepath, nil // 如果不是文件路径，直接返回原内容
+	}
+
+	// 提取实际文件路径（去掉@符号）
+	filename := strings.TrimPrefix(filepath, "@")
+
+	// 打开文件
+	file, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// 读取第一行
+	scanner := bufio.NewScanner(file)
+	if scanner.Scan() {
+		// 去除首尾空白字符和换行符
+		line := strings.TrimSpace(scanner.Text())
+		return line, nil
+	}
+
+	// 处理文件为空的情况
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", nil // 空文件返回空字符串
+}
 
 // DeriveECDSAPrivateKey 从预共享密钥（PSK）派生出一个 ECDSA 私钥（secp256r1）
 func DeriveECDSAPrivateKey(psk string) (*ecdsa.PrivateKey, error) {

@@ -1,0 +1,507 @@
+package secure
+
+import (
+	"bytes"
+	"context"
+	"crypto/pbkdf2"
+	"crypto/sha1"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/threatexpert/gonc/easyp2p"
+
+	"github.com/pion/dtls/v3"
+	"github.com/xtaci/kcp-go/v5"
+)
+
+type NegotiationConfig struct {
+	Label                string
+	IsClient             bool
+	SecureLayer          string //tls tls13 dtls ss
+	Certs                []tls.Certificate
+	TlsSNI               string
+	KcpWithUDP           bool
+	KcpEncryption        bool //是否开启kcp加密
+	Key                  string
+	KeyType              string // ECDHE or PSK
+	UdpOutputBlockSize   int
+	KcpWindowSize        int
+	KeepAlive            int
+	UdpKeepAlivePayload  string
+	KCPIdleTimeoutSecond int
+	UDPIdleTimeoutSecond int
+}
+
+var (
+	UdpOutputBlockSize   int    = 1320
+	KcpWindowSize        int    = 1500
+	KeepAlive            int    = 0
+	UdpKeepAlivePayload  string = "ping\n"
+	KCPIdleTimeoutSecond int    = 41
+	UDPIdleTimeoutSecond int    = 60 * 5
+)
+
+func NewNegotiationConfig() *NegotiationConfig {
+	return &NegotiationConfig{
+		UdpOutputBlockSize:   UdpOutputBlockSize,
+		KcpWindowSize:        KcpWindowSize,
+		KeepAlive:            KeepAlive,
+		UdpKeepAlivePayload:  UdpKeepAlivePayload,
+		KCPIdleTimeoutSecond: KCPIdleTimeoutSecond,
+		UDPIdleTimeoutSecond: UDPIdleTimeoutSecond,
+	}
+}
+
+type NegotiatedConn struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	ConnLayers []net.Conn
+	IsUDP      bool
+}
+
+func (nconn *NegotiatedConn) Close() error {
+	if nconn.cancel != nil {
+		nconn.cancel()
+	}
+	for _, c := range nconn.ConnLayers {
+		c.Close()
+	}
+	nconn.ConnLayers = []net.Conn{}
+	nconn.ctx = nil
+	nconn.cancel = nil
+	return nil
+}
+
+func (nconn *NegotiatedConn) Read(b []byte) (int, error) {
+	return nconn.ConnLayers[0].Read(b)
+}
+
+func (nconn *NegotiatedConn) Write(b []byte) (int, error) {
+	return nconn.ConnLayers[0].Write(b)
+}
+
+func (nconn *NegotiatedConn) CloseWrite() error {
+	if cw, ok := nconn.ConnLayers[0].(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nconn.ConnLayers[0].Close()
+}
+
+func (nconn *NegotiatedConn) LocalAddr() net.Addr {
+	return nconn.ConnLayers[0].LocalAddr()
+}
+
+func (nconn *NegotiatedConn) RemoteAddr() net.Addr {
+	return nconn.ConnLayers[0].RemoteAddr()
+}
+
+func (nconn *NegotiatedConn) SetDeadline(t time.Time) error {
+	return nconn.ConnLayers[0].SetDeadline(t)
+}
+
+func (nconn *NegotiatedConn) SetReadDeadline(t time.Time) error {
+	return nconn.ConnLayers[0].SetReadDeadline(t)
+}
+
+func (nconn *NegotiatedConn) SetWriteDeadline(t time.Time) error {
+	return nconn.ConnLayers[0].SetWriteDeadline(t)
+}
+
+func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer) (*NegotiatedConn, error) {
+	nconn := &NegotiatedConn{
+		ConnLayers: []net.Conn{rawconn},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		if nconn.cancel == nil {
+			cancel()
+			for i, c := range nconn.ConnLayers {
+				if i != len(nconn.ConnLayers)-1 { // 最后一个连接是原始连接，发送错误时不关闭，还给调用者处置
+					c.Close()
+				}
+			}
+		}
+	}()
+
+	if strings.HasPrefix(rawconn.LocalAddr().Network(), "udp") {
+		nconn.IsUDP = true
+		configUDPConn(rawconn)
+	} else {
+		configTCPKeepalive(rawconn, cfg.KeepAlive)
+	}
+
+	timeout_sec := 20
+	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
+	defer cancelTimeout()
+
+	switch {
+	case strings.HasPrefix(cfg.SecureLayer, "tls"):
+		conn_tls := doTLS(ctxTimeout, cfg, nconn.ConnLayers[0], logWriter)
+		if conn_tls == nil {
+			return nil, fmt.Errorf("failed to establish TLS connection")
+		}
+		nconn.ConnLayers = append([]net.Conn{conn_tls}, nconn.ConnLayers...)
+	case cfg.SecureLayer == "dtls":
+		conn_dtls := doDTLS(ctxTimeout, cfg, nconn.ConnLayers[0], logWriter)
+		if conn_dtls == nil {
+			return nil, fmt.Errorf("failed to establish DTLS connection")
+		}
+		nconn.ConnLayers = append([]net.Conn{conn_dtls}, nconn.ConnLayers...)
+	case cfg.SecureLayer == "ss" || cfg.SecureLayer == "dss":
+		var key32 [32]byte
+		if cfg.KeyType == "ECDHE" {
+			copy(key32[:], []byte(cfg.Key))
+			fmt.Fprintf(logWriter, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.Label)
+		} else if cfg.KeyType == "PSK" {
+			k, err := DerivePSK(cfg.Key)
+			if err != nil {
+				fmt.Fprintf(logWriter, "%sFailed to derive key for secure stream: %v\n", cfg.Label, err)
+				return nil, err
+			}
+			copy(key32[:], k)
+			fmt.Fprintf(logWriter, "%sCommunication is encrypted(PSK) with AES.\n", cfg.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.Label)
+			return nil, fmt.Errorf("missing key type for secure stream")
+		}
+		if cfg.SecureLayer == "dss" {
+			connss := NewSecurePacketConn(nconn.ConnLayers[0], key32)
+			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
+		} else {
+			connss := NewSecureStreamConn(nconn.ConnLayers[0], key32)
+			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
+		}
+	default:
+	}
+
+	if nconn.IsUDP {
+		if cfg.KcpWithUDP {
+			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], rawconn, 30*time.Second, logWriter)
+			if sess_kcp == nil {
+				return nil, fmt.Errorf("failed to establish KCP session")
+			}
+			nconn.ConnLayers = append([]net.Conn{sess_kcp}, nconn.ConnLayers...)
+		} else {
+			pktconn := easyp2p.NewPacketConnWrapper(nconn.ConnLayers[0], nconn.ConnLayers[0].RemoteAddr())
+			buconn := easyp2p.NewBoundUDPConn(pktconn, nconn.ConnLayers[0].RemoteAddr().String(), false)
+			buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
+			nconn.ConnLayers = append([]net.Conn{buconn}, nconn.ConnLayers...)
+		}
+	}
+
+	nconn.ctx = ctx
+	nconn.cancel = cancel
+	return nconn, nil
+}
+
+func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWriter io.Writer) net.Conn {
+	// 获取所有安全加密套件
+	safeCiphers := tls.CipherSuites()
+	// 获取所有不安全加密套件
+	insecureCiphers := tls.InsecureCipherSuites()
+	// 合并两个列表
+	var allCiphers []uint16
+	for _, cipher := range safeCiphers {
+		allCiphers = append(allCiphers, cipher.ID)
+	}
+	for _, cipher := range insecureCiphers {
+		allCiphers = append(allCiphers, cipher.ID)
+	}
+
+	// 创建 TLS 配置
+	tlsConfig := &tls.Config{
+		CipherSuites:             allCiphers,
+		InsecureSkipVerify:       true,             // 忽略证书验证（可选）
+		MinVersion:               tls.VersionTLS10, // 至少 TLSv1
+		MaxVersion:               tls.VersionTLS13, // 最大支持 TLSv1.3
+		PreferServerCipherSuites: true,             // 优先使用服务器的密码套件
+	}
+	if config.SecureLayer == "tls10" {
+		tlsConfig.MinVersion = tls.VersionTLS10
+		tlsConfig.MaxVersion = tls.VersionTLS10
+	}
+	if config.SecureLayer == "tls11" {
+		tlsConfig.MinVersion = tls.VersionTLS11
+		tlsConfig.MaxVersion = tls.VersionTLS11
+	}
+	if config.SecureLayer == "tls12" {
+		tlsConfig.MinVersion = tls.VersionTLS12
+		tlsConfig.MaxVersion = tls.VersionTLS12
+	}
+	if config.SecureLayer == "tls13" {
+		tlsConfig.MinVersion = tls.VersionTLS13
+		tlsConfig.MaxVersion = tls.VersionTLS13
+	}
+	// 使用 TLS 握手
+	var conn_tls *tls.Conn
+	var certs []tls.Certificate = config.Certs
+
+	if !config.IsClient {
+		tlsConfig.Certificates = config.Certs
+		if config.Key != "" && config.KeyType == "PSK" {
+			tlsConfig.ClientAuth = tls.RequireAnyClientCert
+			tlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake (PSK-based mutual authentication)...", config.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake...", config.Label)
+		}
+		conn_tls = tls.Server(conn, tlsConfig)
+	} else {
+		tlsConfig.ServerName = config.TlsSNI
+		if config.Key != "" && config.KeyType == "PSK" {
+			tlsConfig.Certificates = certs
+			tlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake (PSK-based mutual authentication)...", config.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake...", config.Label)
+		}
+		conn_tls = tls.Client(conn, tlsConfig)
+	}
+	if err := conn_tls.HandshakeContext(ctx); err != nil {
+		fmt.Fprintf(logWriter, "failed: %v\n", err)
+		return nil
+	}
+	fmt.Fprintf(logWriter, "completed.\n")
+	return conn_tls
+}
+
+func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWriter io.Writer) net.Conn {
+	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
+	allCiphers := []dtls.CipherSuiteID{
+		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	}
+
+	// DTLS 配置
+	dtlsConfig := &dtls.Config{
+		CipherSuites:         allCiphers,
+		InsecureSkipVerify:   true, // 和 tls.Config 一样，跳过证书校验
+		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		FlightInterval:       2 * time.Second,
+	}
+
+	// DTLS Server / Client 模式
+	var dtlsConn *dtls.Conn
+	var err error
+	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+
+	if !config.IsClient {
+		dtlsConfig.Certificates = config.Certs
+		if config.Key != "" && config.KeyType == "PSK" {
+			dtlsConfig.ClientAuth = dtls.RequireAnyClientCert
+			dtlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake (PSK-based mutual authentication)...", config.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake...", config.Label)
+		}
+		dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
+	} else {
+		dtlsConfig.ServerName = config.TlsSNI
+		if config.Key != "" && config.KeyType == "PSK" {
+			dtlsConfig.Certificates = config.Certs
+			dtlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake (PSK-based mutual authentication)...", config.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake...", config.Label)
+		}
+		dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
+	}
+	if err != nil {
+		fmt.Fprintf(logWriter, "DTLS initialization failed: %v\n", err)
+		return nil
+	}
+
+	//dtlsConn.HandshakeContext似乎有bug，无法在ctx取消后返回，
+	//dtlsConn.SetDeadline似乎也有bug
+	//这里从conn加一个SetDeadline
+	conn.SetDeadline(time.Now().Add(20 * time.Second)) // 设置握手超时
+	firstRefusedLogged := false
+	for {
+		if err = dtlsConn.HandshakeContext(ctx); err != nil {
+			if easyp2p.IsConnRefused(err) {
+				if !firstRefusedLogged {
+					fmt.Fprintf(logWriter, "(ECONNREFUSED)...")
+					firstRefusedLogged = true
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			fmt.Fprintf(logWriter, "failed: %v\n", err)
+			dtlsConn.Close()
+			return nil
+		}
+		break
+	}
+	conn.SetDeadline(time.Time{}) // 取消握手超时
+	fmt.Fprintf(logWriter, "completed.\n")
+	return dtlsConn
+}
+
+func createKCPBlockCrypt(passphrase string, salt []byte) (kcp.BlockCrypt, error) {
+	// 使用 PBKDF2 派生 32 字节密钥
+	key, err := pbkdf2.Key(sha1.New, passphrase, salt, 1024, 32)
+	if err != nil {
+		return nil, fmt.Errorf("pbkdf2 key derivation failed: %v", err)
+	}
+
+	// 使用派生密钥创建 AES 加密器
+	blockCrypt, err := kcp.NewAESBlockCrypt(key)
+	if err != nil {
+		return nil, fmt.Errorf("kcp NewAESBlockCrypt failed: %v", err)
+	}
+
+	return blockCrypt, nil
+}
+
+func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("invalid key length: expected 32, got %d", len(key))
+	}
+	blockCrypt, err := kcp.NewAESBlockCrypt(key[:]) // key[:] 转为 []byte
+	if err != nil {
+		return nil, fmt.Errorf("kcp NewAESBlockCrypt failed: %v", err)
+	}
+	return blockCrypt, nil
+}
+
+func doKCP(ctx context.Context, config *NegotiationConfig, conn, rawconn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
+	var sess *kcp.UDPSession
+	var err error
+	var blockCrypt kcp.BlockCrypt
+	if config.KcpEncryption {
+		if config.KeyType == "ECDHE" {
+			blockCrypt, err = createKCPBlockCryptFromKey([]byte(config.Key))
+			if err != nil {
+				fmt.Fprintf(logWriter, "%screateKCPBlockCryptFromKey failed: %v\n", config.Label, err)
+				return nil
+			}
+		} else if config.KeyType == "PSK" {
+			blockCrypt, err = createKCPBlockCrypt(config.Key, []byte("1234567890abcdef"))
+			if err != nil {
+				fmt.Fprintf(logWriter, "%screateKCPBlockCrypt failed: %v\n", config.Label, err)
+				return nil
+			}
+		}
+	}
+
+	// 通知keepalive调整间隔
+	intervalChange := make(chan time.Duration, 1)
+
+	// 启动 keepalive
+	startUDPKeepAlive(ctx, rawconn, []byte(config.UdpKeepAlivePayload), 2*time.Second, intervalChange)
+
+	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	buconn := easyp2p.NewBoundUDPConn(pktconn, conn.RemoteAddr().String(), false)
+	buconn.SetIdleTimeout(time.Duration(config.KCPIdleTimeoutSecond) * time.Second)
+
+	if !config.IsClient {
+		if blockCrypt == nil {
+			fmt.Fprintf(logWriter, "%sPerforming KCP-S handshake...", config.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-S handshake...", config.Label, config.KeyType)
+		}
+	} else {
+		if blockCrypt == nil {
+			fmt.Fprintf(logWriter, "%sPerforming KCP-C handshake...", config.Label)
+		} else {
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake using...", config.Label, config.KeyType)
+		}
+	}
+	sess, err = kcp.NewConn3(0, conn.RemoteAddr(), blockCrypt, 10, 3, buconn)
+	if err != nil {
+		fmt.Fprintf(logWriter, "NewConn failed: %v\n", err)
+		return nil
+	}
+
+	// 简单握手
+	handshake := []byte("HELLO")
+	_, err = sess.Write(handshake)
+	if err != nil {
+		fmt.Fprintf(logWriter, "send handshake failed: %v\n", err)
+		return nil
+	}
+
+	// 设置握手超时
+	sess.SetReadDeadline(time.Now().Add(timeout))
+
+	buf := make([]byte, len(handshake))
+	n, err := io.ReadFull(sess, buf)
+	if err != nil || n != len(handshake) || !bytes.Equal(buf, handshake) {
+		fmt.Fprintf(logWriter, "recv handshake failed: %v\n", err)
+		return nil
+	}
+	fmt.Fprintf(logWriter, "completed.\n")
+
+	// 取消超时（恢复成无超时）
+	sess.SetReadDeadline(time.Time{})
+
+	// 告诉keep alive协程，把间隔调成13秒
+	select {
+	case intervalChange <- 13 * time.Second:
+	default:
+	}
+
+	sess.SetNoDelay(1, 10, 2, 1)
+	sess.SetWindowSize(config.KcpWindowSize, config.KcpWindowSize)
+	//kcp header 24字节SetMtu时就暗含其中。但实际发出包可能还多出28字节。根据情况把mtu再调小，防止超过udpOutputBlockSize
+	mtu := config.UdpOutputBlockSize - 8 // 8: fecHeaderSizePlus2
+	if blockCrypt != nil {
+		mtu -= 20 //20: nonceSize+crcSize
+	}
+	if strings.Contains(config.SecureLayer, "tls") {
+		mtu -= 60
+	}
+	sess.SetMtu(mtu)
+
+	return sess
+}
+
+func configTCPKeepalive(conn net.Conn, keepAlive int) {
+	if keepAlive > 0 {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			ka := net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     time.Duration(keepAlive) * time.Second, // 空闲多久后开始探测
+				Count:    9,                                      // 最多发几次探测包
+				Interval: time.Duration(keepAlive) * time.Second, // 探测包之间的间隔
+			}
+			tcpConn.SetKeepAliveConfig(ka)
+		}
+	}
+}
+
+func configUDPConn(conn net.Conn) {
+	udpConn, ok := conn.(*net.UDPConn)
+	if ok {
+		udpConn.SetReadBuffer(512 * 1024)
+		udpConn.SetWriteBuffer(512 * 1024)
+	}
+}
+
+func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInterval time.Duration, intervalChange <-chan time.Duration) {
+	go func() {
+		keepAliveInterval := initInterval
+		ticker := time.NewTicker(keepAliveInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case newInterval := <-intervalChange:
+				ticker.Stop()
+				keepAliveInterval = newInterval
+				ticker = time.NewTicker(keepAliveInterval)
+			case <-ticker.C:
+				if _, err := conn.Write(data); err != nil {
+					//fmt.Fprintf(os.Stderr, "keepAlive send failed: %v\n", err)
+					// 不退出，继续重试
+				}
+			}
+		}
+	}()
+}
