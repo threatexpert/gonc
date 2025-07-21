@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/threatexpert/gonc/acl"
+	"github.com/threatexpert/gonc/v2/acl"
 )
 
 // SOCKS5 协议常量

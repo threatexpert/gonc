@@ -1,4 +1,4 @@
-module github.com/threatexpert/gonc
+module github.com/threatexpert/gonc/v2
 
 go 1.24.3
 

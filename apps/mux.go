@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
-	"github.com/threatexpert/gonc/acl"
-	"github.com/threatexpert/gonc/httpfileshare"
+	"github.com/threatexpert/gonc/v2/acl"
+	"github.com/threatexpert/gonc/v2/httpfileshare"
 	"github.com/xtaci/smux"
 )
 

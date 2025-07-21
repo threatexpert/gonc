@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/threatexpert/gonc/easyp2p"
+	"github.com/threatexpert/gonc/v2/easyp2p"
 
 	"github.com/pion/dtls/v3"
 	"github.com/xtaci/kcp-go/v5"

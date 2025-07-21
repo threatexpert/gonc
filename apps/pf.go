@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/threatexpert/gonc/secure"
+	"github.com/threatexpert/gonc/v2/secure"
 )
 
 type AppPFConfig struct {

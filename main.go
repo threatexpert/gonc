@@ -22,11 +22,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/threatexpert/gonc/acl"
-	"github.com/threatexpert/gonc/apps"
-	"github.com/threatexpert/gonc/easyp2p"
-	"github.com/threatexpert/gonc/misc"
-	"github.com/threatexpert/gonc/secure"
+	"github.com/threatexpert/gonc/v2/acl"
+	"github.com/threatexpert/gonc/v2/apps"
+	"github.com/threatexpert/gonc/v2/easyp2p"
+	"github.com/threatexpert/gonc/v2/misc"
+	"github.com/threatexpert/gonc/v2/secure"
 
 	// "net/http"
 	// _ "net/http/pprof"
