@@ -80,7 +80,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     ```bash
     gonc -p2p randomString -httpserver c:/RootDir
     ```
-- 另一端访问文件列表（需手动打开浏览器访问http://127.0.0.1:9999可实现浏览对端的文件列表和下载文件）：
+- 另一端访问文件列表（需手动打开浏览器访问 http://127.0.0.1:9999 可实现浏览对端的文件列表和下载文件）：
     ```bash
     gonc -p2p randomString -httplocal-port 9999
     ```
