@@ -45,14 +45,18 @@ var (
 )
 
 type P2PAddressInfo struct {
-	Network       string
-	LocalLAN      string
-	LocalNAT      string
-	LocalNATType  string
-	RemoteLAN     string
-	RemoteNAT     string
-	RemoteNATType string
-	SharedKey     [32]byte
+	Network               string
+	LocalLAN              string
+	LocalNAT              string
+	LocalNATType          string
+	RemoteLAN             string
+	RemoteNAT             string
+	RemoteNATType         string
+	SharedKey             [32]byte
+	LocalPublicIPv4Count  int
+	LocalPublicIPv6Count  int
+	RemotePublicIPv4Count int
+	RemotePublicIPv6Count int
 }
 
 type securePayload struct {
@@ -440,6 +444,10 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 
 	var finalResults []*P2PAddressInfo
 	haveCommonNetwork := false
+	LocalPublicIPv4Count := countUniquePublicIPs(myInfoForExchange.Addresses, "4")
+	LocalPublicIPv6Count := countUniquePublicIPs(myInfoForExchange.Addresses, "6")
+	RemotePublicIPv4Count := countUniquePublicIPs(remotePayload.Addresses, "4")
+	RemotePublicIPv6Count := countUniquePublicIPs(remotePayload.Addresses, "6")
 
 	for _, myNetInfo := range myInfoForExchange.Addresses {
 		// 获取我们自己的地址组，支持多个地址
@@ -459,14 +467,18 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 			remoteNAT := remoteNetInfo.Nat
 
 			item := &P2PAddressInfo{
-				Network:       net,
-				LocalLAN:      myLAN,
-				LocalNAT:      myNAT,
-				LocalNATType:  myNATType,
-				RemoteLAN:     remoteLAN,
-				RemoteNAT:     remoteNAT,
-				RemoteNATType: rNATType,
-				SharedKey:     sharedKey,
+				Network:               net,
+				LocalLAN:              myLAN,
+				LocalNAT:              myNAT,
+				LocalNATType:          myNATType,
+				RemoteLAN:             remoteLAN,
+				RemoteNAT:             remoteNAT,
+				RemoteNATType:         rNATType,
+				SharedKey:             sharedKey,
+				LocalPublicIPv4Count:  LocalPublicIPv4Count,
+				LocalPublicIPv6Count:  LocalPublicIPv6Count,
+				RemotePublicIPv4Count: RemotePublicIPv4Count,
+				RemotePublicIPv6Count: RemotePublicIPv6Count,
 			}
 
 			//Priority == 0 means invalid type
@@ -671,16 +683,16 @@ func p2pInfoPrint(logWriter io.Writer, p2pInfo *P2PAddressInfo) {
 	}
 }
 
-func countUniqueV4IPs(infos []*P2PAddressInfo) int {
+func countUniquePublicIPs(infos []PunchingAddressInfo, ver string) int {
 	uniqueIPs := make(map[string]struct{})
 
 	for _, info := range infos {
-		if info == nil || !strings.HasSuffix(info.Network, "4") {
+		if !strings.HasSuffix(info.Network, ver) {
 			continue
 		}
-		host, _, err := net.SplitHostPort(info.LocalNAT)
+		host, _, err := net.SplitHostPort(info.Nat)
 		if err != nil {
-			host = info.LocalNAT
+			host = info.Nat
 		}
 		uniqueIPs[host] = struct{}{}
 	}
@@ -758,7 +770,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, logWriter io
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, p2pInfos, false, round+1, logWriter)
+			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
 			if err2 == nil {
 				mconn = append(mconn, conn)
 				if role == 0 {
@@ -822,7 +834,7 @@ func generateRandomPorts(count int) []int {
 	return ports
 }
 
-func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, allIPInfos []*P2PAddressInfo, needSharedKey bool, round int, logWriter io.Writer) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, logWriter io.Writer) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 10
@@ -872,7 +884,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		//只有先发包的，适合用小ttl值。
 		ttl = PunchingShortTTL
 		//多出口IP的环境，可能网络稍微复杂，nat的位置可能在更远的跳数
-		if ttl == 5 && strings.HasSuffix(p2pInfo.Network, "4") && countUniqueV4IPs(allIPInfos) > 1 {
+		if ttl == 5 && strings.HasSuffix(p2pInfo.Network, "4") && p2pInfo.LocalPublicIPv4Count > 1 {
 			ttl = 10
 		}
 	}
