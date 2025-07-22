@@ -153,10 +153,11 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 		nconn.ConnLayers = append([]net.Conn{conn_dtls}, nconn.ConnLayers...)
 	case cfg.SecureLayer == "ss" || cfg.SecureLayer == "dss":
 		var key32 [32]byte
-		if cfg.KeyType == "ECDHE" {
+		switch cfg.KeyType {
+		case "ECDHE":
 			copy(key32[:], []byte(cfg.Key))
 			fmt.Fprintf(logWriter, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.Label)
-		} else if cfg.KeyType == "PSK" {
+		case "PSK":
 			k, err := DerivePSK(cfg.Key)
 			if err != nil {
 				fmt.Fprintf(logWriter, "%sFailed to derive key for secure stream: %v\n", cfg.Label, err)
@@ -164,7 +165,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 			}
 			copy(key32[:], k)
 			fmt.Fprintf(logWriter, "%sCommunication is encrypted(PSK) with AES.\n", cfg.Label)
-		} else {
+		default:
 			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.Label)
 			return nil, fmt.Errorf("missing key type for secure stream")
 		}
@@ -180,7 +181,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 
 	if nconn.IsUDP {
 		if cfg.KcpWithUDP {
-			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], rawconn, 30*time.Second, logWriter)
+			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], 30*time.Second, logWriter)
 			if sess_kcp == nil {
 				return nil, fmt.Errorf("failed to establish KCP session")
 			}
@@ -188,7 +189,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 		} else {
 			pktconn := easyp2p.NewPacketConnWrapper(nconn.ConnLayers[0], nconn.ConnLayers[0].RemoteAddr())
 			buconn := easyp2p.NewBoundUDPConn(pktconn, nconn.ConnLayers[0].RemoteAddr().String(), false)
-			buconn.SetIdleTimeout(time.Duration(UDPIdleTimeoutSecond) * time.Second)
+			buconn.SetIdleTimeout(time.Duration(cfg.UDPIdleTimeoutSecond) * time.Second)
 			nconn.ConnLayers = append([]net.Conn{buconn}, nconn.ConnLayers...)
 		}
 	}
@@ -368,18 +369,19 @@ func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
 	return blockCrypt, nil
 }
 
-func doKCP(ctx context.Context, config *NegotiationConfig, conn, rawconn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
+func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
 	if config.KcpEncryption {
-		if config.KeyType == "ECDHE" {
+		switch config.KeyType {
+		case "ECDHE":
 			blockCrypt, err = createKCPBlockCryptFromKey([]byte(config.Key))
 			if err != nil {
 				fmt.Fprintf(logWriter, "%screateKCPBlockCryptFromKey failed: %v\n", config.Label, err)
 				return nil
 			}
-		} else if config.KeyType == "PSK" {
+		case "PSK":
 			blockCrypt, err = createKCPBlockCrypt(config.Key, []byte("1234567890abcdef"))
 			if err != nil {
 				fmt.Fprintf(logWriter, "%screateKCPBlockCrypt failed: %v\n", config.Label, err)
@@ -392,9 +394,9 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn, rawconn net.Con
 	intervalChange := make(chan time.Duration, 1)
 
 	// 启动 keepalive
-	startUDPKeepAlive(ctx, rawconn, []byte(config.UdpKeepAlivePayload), 2*time.Second, intervalChange)
 
 	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	startUDPKeepAlive(ctx, pktconn, conn.RemoteAddr(), []byte(config.UdpKeepAlivePayload), 2*time.Second, intervalChange)
 	buconn := easyp2p.NewBoundUDPConn(pktconn, conn.RemoteAddr().String(), false)
 	buconn.SetIdleTimeout(time.Duration(config.KCPIdleTimeoutSecond) * time.Second)
 
@@ -482,7 +484,7 @@ func configUDPConn(conn net.Conn) {
 	}
 }
 
-func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInterval time.Duration, intervalChange <-chan time.Duration) {
+func startUDPKeepAlive(ctx context.Context, conn net.PacketConn, raddr net.Addr, data []byte, initInterval time.Duration, intervalChange <-chan time.Duration) {
 	go func() {
 		keepAliveInterval := initInterval
 		ticker := time.NewTicker(keepAliveInterval)
@@ -497,7 +499,7 @@ func startUDPKeepAlive(ctx context.Context, conn net.Conn, data []byte, initInte
 				keepAliveInterval = newInterval
 				ticker = time.NewTicker(keepAliveInterval)
 			case <-ticker.C:
-				if _, err := conn.Write(data); err != nil {
+				if _, err := conn.WriteTo(data, raddr); err != nil {
 					//fmt.Fprintf(os.Stderr, "keepAlive send failed: %v\n", err)
 					// 不退出，继续重试
 				}

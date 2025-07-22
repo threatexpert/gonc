@@ -333,11 +333,16 @@ func MQTT_Exchange_Symmetric(sendData, topicSalt, sessionUid string, timeout tim
 	}
 }
 
-// exchangePayload 是用于在 Broker 上交换的统一数据结构
-// 它包含了所有网络类型的地址信息和一个公钥
+type PunchingAddressInfo struct {
+	Network string `json:"network"` // 网络名称, 例如 "tcp", "udp"
+	NatType string `json:"nattype"` // NAT 类型
+	Lan     string `json:"lan"`     // 局域网地址
+	Nat     string `json:"nat"`     // 公网地址
+}
+
 type exchangePayload struct {
-	// network -> {nattype, lan, nat}
-	Addresses map[string]map[string]string `json:"addrs"`
+	// 地址信息列表
+	Addresses []PunchingAddressInfo `json:"addrs"`
 	// 公钥的 Base64 编码字符串
 	PubKey string `json:"pk"`
 }
@@ -345,7 +350,7 @@ type exchangePayload struct {
 func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, logWriter io.Writer) ([]*P2PAddressInfo, error) {
 
 	myInfoForExchange := exchangePayload{
-		Addresses: make(map[string]map[string]string),
+		Addresses: []PunchingAddressInfo{},
 	}
 
 	fmt.Fprintf(logWriter, "    Getting local public IP info via %d STUN servers...", len(STUNServers))
@@ -355,16 +360,15 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 		fmt.Fprintln(logWriter, "Failed")
 	} else {
 		analyzed := analyzeSTUNResults(allResults)
-		nets := []string{}
 		for _, item := range analyzed {
-			myInfoForExchange.Addresses[item.Network] = map[string]string{
-				"nattype": item.NATType,
-				"lan":     item.LAN,
-				"nat":     item.NAT,
-			}
-			nets = append(nets, item.Network)
+			myInfoForExchange.Addresses = append(myInfoForExchange.Addresses, PunchingAddressInfo{
+				Network: item.Network,
+				NatType: item.NATType,
+				Lan:     item.LAN,
+				Nat:     item.NAT,
+			})
 		}
-		if len(nets) == 0 {
+		if len(myInfoForExchange.Addresses) == 0 {
 			fmt.Fprintln(logWriter, "Failed")
 		} else {
 			fmt.Fprintf(logWriter, "OK\n")
@@ -382,7 +386,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 		myInfoForExchange.PubKey = base64.StdEncoding.EncodeToString(pubBytes)
 	}
 
-	myKey := deriveKey("p2p-exchange-v1.9.2", sessionUid)
+	myKey := deriveKey("p2p-exchange-v2.0.1", sessionUid)
 	infoBytes, _ := json.Marshal(myInfoForExchange)
 	encPayload, _ := encryptAES(myKey[:], infoBytes)
 	encPayloadBytes, _ := json.Marshal(encPayload)
@@ -437,21 +441,22 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 	var finalResults []*P2PAddressInfo
 	haveCommonNetwork := false
 
-	for net, myNetInfo := range myInfoForExchange.Addresses {
+	for _, myNetInfo := range myInfoForExchange.Addresses {
 		// 获取我们自己的地址组，支持多个地址
-		myNATType := myNetInfo["nattype"]
-		myLAN := myNetInfo["lan"]
-		myNAT := myNetInfo["nat"]
+		net := myNetInfo.Network
+		myNATType := myNetInfo.NatType
+		myLAN := myNetInfo.Lan
+		myNAT := myNetInfo.Nat
 
 		// 检查对方是否也返回了相同网络类型的信息
-		for rnet, remoteNetInfo := range remotePayload.Addresses {
-			if rnet != net {
+		for _, remoteNetInfo := range remotePayload.Addresses {
+			if remoteNetInfo.Network != net {
 				continue
 			}
 			haveCommonNetwork = true
-			rNATType := remoteNetInfo["nattype"]
-			remoteLAN := remoteNetInfo["lan"]
-			remoteNAT := remoteNetInfo["nat"]
+			rNATType := remoteNetInfo.NatType
+			remoteLAN := remoteNetInfo.Lan
+			remoteNAT := remoteNetInfo.Nat
 
 			item := &P2PAddressInfo{
 				Network:       net,
@@ -510,11 +515,12 @@ func Do_autoP2P(network string, sessionUid string, stunServers, brokerServers []
 	return p2pInfos[0], nil
 }
 
-func addressesPrint(logWriter io.Writer, Addresses map[string]map[string]string) {
-	for net, info := range Addresses {
-		nattype := info["nattype"]
-		lan := info["lan"]
-		nat := info["nat"]
+func addressesPrint(logWriter io.Writer, Addresses []PunchingAddressInfo) {
+	for _, info := range Addresses {
+		net := info.Network
+		nattype := info.NatType
+		lan := info.Lan
+		nat := info.Nat
 		if lan == nat {
 			fmt.Fprintf(logWriter, "      %-5s: %s (%s)\n", net, nat, nattype)
 		} else {
@@ -665,6 +671,23 @@ func p2pInfoPrint(logWriter io.Writer, p2pInfo *P2PAddressInfo) {
 	}
 }
 
+func countUniqueV4IPs(infos []*P2PAddressInfo) int {
+	uniqueIPs := make(map[string]struct{})
+
+	for _, info := range infos {
+		if info == nil || !strings.HasSuffix(info.Network, "4") {
+			continue
+		}
+		host, _, err := net.SplitHostPort(info.LocalNAT)
+		if err != nil {
+			host = info.LocalNAT
+		}
+		uniqueIPs[host] = struct{}{}
+	}
+
+	return len(uniqueIPs)
+}
+
 type P2PConnInfo struct {
 	Conns     []net.Conn
 	SharedKey [32]byte
@@ -735,7 +758,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, logWriter io
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
+			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, p2pInfos, false, round+1, logWriter)
 			if err2 == nil {
 				mconn = append(mconn, conn)
 				if role == 0 {
@@ -799,7 +822,7 @@ func generateRandomPorts(count int) []int {
 	return ports
 }
 
-func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, logWriter io.Writer) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, allIPInfos []*P2PAddressInfo, needSharedKey bool, round int, logWriter io.Writer) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 10
@@ -848,6 +871,10 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	if isClient {
 		//只有先发包的，适合用小ttl值。
 		ttl = PunchingShortTTL
+		//多出口IP的环境，可能网络稍微复杂，nat的位置可能在更远的跳数
+		if ttl == 5 && strings.HasSuffix(p2pInfo.Network, "4") && countUniqueV4IPs(allIPInfos) > 1 {
+			ttl = 10
+		}
 	}
 	if !inSameLAN && (p2pInfo.LocalNATType != "easy" || p2pInfo.RemoteNATType != "easy") {
 		count = 4 + RPP_TIMEOUT*2
@@ -1101,6 +1128,9 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 					//前面几次用普通方式打洞
 					sendPing(i)
 				} else {
+					if isClient {
+						ttl += 1
+					}
 					if randomSrcPort {
 						sendRSPPing(RPP_TIMEOUT * time.Second)
 					} else if randomDstPort {

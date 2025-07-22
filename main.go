@@ -243,7 +243,7 @@ func usage_full() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v2.0.0")
+	fmt.Fprintln(os.Stderr, "go-netcat v2.0.1")
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
