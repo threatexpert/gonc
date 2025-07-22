@@ -2,13 +2,15 @@ package secure
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"io"
 	"math/big"
 	"strings"
 	"time"
 	"unicode"
 
-	"golang.org/x/crypto/scrypt"
+	"golang.org/x/crypto/hkdf"
 )
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -89,8 +91,10 @@ func IsWeakPassword(password string) bool {
 
 func DerivePSK(password string) ([]byte, error) {
 	salt := []byte("gonc-psk-salt")
-	key, err := scrypt.Key([]byte(password), salt, 1<<15, 8, 1, 32) // 输出 256bit PSK
-	if err != nil {
+	hkdf := hkdf.New(sha256.New, []byte(password), salt, nil)
+
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf, key); err != nil {
 		return nil, err
 	}
 	return key, nil
