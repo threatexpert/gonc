@@ -1,12 +1,15 @@
-package easyp2p
+package netx
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"testing"
 	"time"
+
+	pkgerr "github.com/pkg/errors" // 引入 pkg/errors 来模拟错误包装
 )
 
 func TestUDP1toN(t *testing.T) {
@@ -189,4 +192,87 @@ func TestUDP1toN(t *testing.T) {
 
 	time.Sleep(2 * time.Second) // 等待日志输出完成
 	fmt.Println("\n--- All Deadline Tests Complete ---")
+}
+
+// TestIsTimeout 是 isTimeout 函数的单元测试函数
+func TestIsTimeout(t *testing.T) {
+
+	// --- 模拟各种错误场景的辅助函数 ---
+	// 1. 标准库 net.OpError 超时
+	getStandardTimeoutError := func() error {
+		return &net.OpError{
+			Op:  "dial",
+			Net: "tcp",
+			Err: os.ErrDeadlineExceeded, // 关键的超时错误
+		}
+	}
+	// 2. 被包装过的标准库超时错误
+	getWrappedStandardTimeoutError := func() error {
+		return pkgerr.Wrap(getStandardTimeoutError(), "failed to connect to server")
+	}
+	// 3. KCP 的超时错误
+	getKcpTimeoutError := func() error {
+		return newTimeoutError("test-timeout-error", true)
+	}
+	// 4. 被包装过的 KCP 超时错误 (你遇到的原始情况)
+	getWrappedKcpTimeoutError := func() error {
+		return pkgerr.WithStack(newTimeoutError("test-timeout-error", true))
+	}
+	// 5. 一个非超时的普通错误
+	getNonTimeoutError := func() error {
+		return errors.New("a generic error")
+	}
+
+	// 定义测试用例的结构体
+	testCases := []struct {
+		name string // 测试用例的名称
+		err  error  // 输入的错误
+		want bool   // 期望的结果 (true 表示是超时)
+	}{
+		{
+			name: "Standard net.Error Timeout",
+			err:  getStandardTimeoutError(),
+			want: true,
+		},
+		{
+			name: "Wrapped standard net.Error Timeout",
+			err:  getWrappedStandardTimeoutError(),
+			want: true,
+		},
+		{
+			name: "KCP Timeout Error",
+			err:  getKcpTimeoutError(),
+			want: true,
+		},
+		{
+			name: "Wrapped KCP Timeout Error",
+			err:  getWrappedKcpTimeoutError(),
+			want: true,
+		},
+		{
+			name: "Non-timeout generic error",
+			err:  getNonTimeoutError(),
+			want: false,
+		},
+		{
+			name: "Nil error",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	// 遍历所有测试用例
+	for _, tc := range testCases {
+		// t.Run 会创建一个子测试，方便定位问题
+		t.Run(tc.name, func(t *testing.T) {
+			// 执行被测试的函数
+			got := isTimeout(tc.err)
+
+			// 断言：检查实际结果是否与期望结果相符
+			if got != tc.want {
+				// 如果不符，测试失败，并打印错误信息
+				t.Errorf("isTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

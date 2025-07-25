@@ -1,4 +1,4 @@
-package easyp2p
+package netx
 
 import (
 	"context"
@@ -283,8 +283,11 @@ func IsConnRefused(err error) bool {
 
 // 判断是否是超时错误
 func isTimeout(err error) bool {
-	netErr, ok := err.(net.Error)
-	return ok && netErr.Timeout()
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return false
 }
 
 // ============================================================================

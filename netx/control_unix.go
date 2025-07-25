@@ -1,6 +1,6 @@
 //go:build !windows
 
-package easyp2p
+package netx
 
 import (
 	"errors"
@@ -23,23 +23,6 @@ func ControlTCP(network, address string, c syscall.RawConn) error {
 			return
 		}
 
-	})
-
-	return err
-}
-
-func ControlTCPTTL(network, address string, c syscall.RawConn) error {
-	var err error
-	c.Control(func(fd uintptr) {
-		if err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-			return
-		}
-		if err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-			return
-		}
-		if err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, PunchingShortTTL); err != nil {
-			return
-		}
 	})
 
 	return err

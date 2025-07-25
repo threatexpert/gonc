@@ -2,12 +2,18 @@ package apps
 
 import (
 	"bufio"
+	"crypto/tls"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/threatexpert/gonc/v2/secure"
 )
 
 type Dialer interface {
@@ -16,16 +22,12 @@ type Dialer interface {
 }
 
 type HttpConnectClient struct {
-	ProxyAddr string // HTTP CONNECT 代理服务器地址
-	Username  string // 用户名 (可选)
-	Password  string // 密码 (可选)
+	Config *ProxyClientConfig
 }
 
-func NewHttpConnectClient(proxyAddr, username, password string) *HttpConnectClient {
+func NewHttpConnectClient(config *ProxyClientConfig) *HttpConnectClient {
 	return &HttpConnectClient{
-		ProxyAddr: proxyAddr,
-		Username:  username,
-		Password:  password,
+		Config: config,
 	}
 }
 
@@ -49,9 +51,18 @@ func getFullHttpHeader(conn net.Conn) (string, error) {
 // DialTimeout 实现 HttpConnectClient 的拨号逻辑
 func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	// 1. 连接HTTP代理服务器
-	proxyConn, err := net.DialTimeout(network, c.ProxyAddr, timeout)
+	proxyConn, err := net.DialTimeout(c.Config.Network, net.JoinHostPort(c.Config.ServerHost, c.Config.ServerPort), timeout)
 	if err != nil {
 		return nil, fmt.Errorf("connect to HTTP proxy server failed: %w", err)
+	}
+	if IsSecureNegotiationNeeded(c.Config) {
+		ntconfig := BuildNTConfigFromPCConfig(c.Config)
+		nconn, err := secure.DoNegotiation(ntconfig, proxyConn, io.Discard)
+		if err != nil {
+			proxyConn.Close()
+			return nil, fmt.Errorf("DoNegotiation to HTTP proxy server failed: %w", err)
+		}
+		proxyConn = nconn
 	}
 
 	// 2. 发送CONNECT请求
@@ -61,8 +72,8 @@ func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Du
 		Host:   address,                   // Set Host header for CONNECT
 		Header: make(http.Header),
 	}
-	if c.Username != "" && c.Password != "" {
-		connectReq.SetBasicAuth(c.Username, c.Password)
+	if c.Config.User != "" && c.Config.Pass != "" {
+		connectReq.SetBasicAuth(c.Config.User, c.Config.Pass)
 	}
 	proxyConn.SetDeadline(time.Now().Add(timeout))
 
@@ -102,32 +113,29 @@ func (c *HttpConnectClient) Listen(network, address string) (net.Listener, error
 
 // ProxyClient 通用代理客户端
 type ProxyClient struct {
-	ProxyProt string // 代理协议类型："socks5" 或 "http"
-	ProxyAddr string // 代理服务器地址 (e.g., "127.0.0.1:1080")
-	Username  string // 用户名 (可选)
-	Password  string // 密码 (可选)
-
-	Dialer Dialer // 实际的拨号器
+	ProxyProt string
+	Dialer    Dialer // 实际的拨号器
 }
 
 // NewProxyClient 构造函数
-func NewProxyClient(proxyProt, proxyAddr, username, password string) (*ProxyClient, error) {
+func NewProxyClient(config *ProxyClientConfig) (*ProxyClient, error) {
+	proxyProtocol := ""
+	if config != nil {
+		proxyProtocol = config.Prot
+	}
 	pc := &ProxyClient{
-		ProxyProt: strings.ToLower(proxyProt),
-		ProxyAddr: proxyAddr,
-		Username:  username,
-		Password:  password,
+		ProxyProt: proxyProtocol,
 	}
 
-	switch pc.ProxyProt {
+	switch proxyProtocol {
 	case "socks5":
-		pc.Dialer = NewSocks5Client(proxyAddr, username, password)
+		pc.Dialer = NewSocks5Client(config)
 	case "http":
-		pc.Dialer = NewHttpConnectClient(proxyAddr, username, password)
+		pc.Dialer = NewHttpConnectClient(config)
 	case "":
 		pc.Dialer = &DirectDialer{}
 	default:
-		return nil, fmt.Errorf("unsupported proxy protocol: %s", proxyProt)
+		return nil, fmt.Errorf("unsupported proxy protocol: %s", proxyProtocol)
 	}
 	return pc, nil
 }
@@ -156,39 +164,141 @@ func (c *ProxyClient) SupportBIND() bool {
 	return c.ProxyProt == "socks5"
 }
 
-func CreateProxyClient(proxyProt, proxyAddr, proxyAuth string) (*ProxyClient, error) {
-	if proxyAddr != "" {
-		user, pass := "", ""
-		if proxyAuth != "" {
-			authParts := strings.SplitN(proxyAuth, ":", 2)
-			if len(authParts) != 2 {
-				return nil, fmt.Errorf("invalid auth format: expected user:pass")
-			}
-			user, pass = authParts[0], authParts[1]
-		}
+type ProxyClientConfig struct {
+	Prot, User, Pass string           //代理协议类型："socks5" 或 "http"
+	TlsEnabled       bool             // -tls (bool)
+	Cert             *tls.Certificate // 如果tlsEnabled是true，这个就需要用到
+	Network          string           // 默认是tcp，然而如果有参数-4 -6 -u，则可能是tcp4 tcp6 udp4 udp6
+	ServerHost       string
+	ServerPort       string
+	PresharedKey     string // -psk <psk-string>
+	KcpWithUDP       bool
+}
 
-		switch proxyProt {
-		case "", "5":
-			client, err := NewProxyClient("socks5", proxyAddr, user, pass)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create socks5 client: %w", err)
-			}
-			return client, nil
-		case "connect":
-			client, err := NewProxyClient("http", proxyAddr, user, pass)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create http client: %w", err)
-			}
-			return client, nil
-		default:
-			return nil, fmt.Errorf("invalid proxy protocol: %s", proxyProt)
-		}
+func BuildNTConfigFromPCConfig(config *ProxyClientConfig) *secure.NegotiationConfig {
+	ntconfig := secure.NewNegotiationConfig()
+	ntconfig.IsClient = true
+
+	if config.PresharedKey != "" {
+		ntconfig.KeyType = "PSK"
+		ntconfig.Key = config.PresharedKey
 	}
 
-	// 没有代理时，返回默认的直连客户端
-	client, err := NewProxyClient("", "", "", "")
+	if config.TlsEnabled {
+		ntconfig.Certs = []tls.Certificate{*config.Cert}
+		ntconfig.TlsSNI = config.ServerHost
+	}
+
+	if strings.HasPrefix(config.Network, "udp") {
+		ntconfig.KcpWithUDP = config.KcpWithUDP
+		if config.TlsEnabled {
+			ntconfig.SecureLayer = "dtls"
+		} else if config.KcpWithUDP && config.PresharedKey != "" {
+			ntconfig.KcpEncryption = true
+		} else if config.PresharedKey != "" {
+			ntconfig.SecureLayer = "dss"
+		}
+	} else {
+		if config.TlsEnabled {
+			ntconfig.SecureLayer = "tls"
+		} else if config.PresharedKey != "" {
+			ntconfig.SecureLayer = "ss"
+		}
+	}
+	return ntconfig
+}
+
+func IsSecureNegotiationNeeded(config *ProxyClientConfig) bool {
+	return config.TlsEnabled || config.KcpWithUDP || config.PresharedKey != ""
+}
+
+func ProxyClientConfigByArgs(args []string) (*ProxyClientConfig, error) {
+	config := &ProxyClientConfig{
+		Network: "tcp", // 默认值
+	}
+
+	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
+	// 设置 ContinueOnError 允许我们捕获错误而不是直接退出
+	fs := flag.NewFlagSet("ProxyClientConfig", flag.ContinueOnError)
+
+	fs.BoolVar(&config.TlsEnabled, "tls", false, "Enable TLS encryption")
+	var is4, is6 bool
+	fs.BoolVar(&is4, "4", false, "Use IPv4 (default is tcp)")
+	fs.BoolVar(&is6, "6", false, "Use IPv6")
+	var isUdp bool
+	fs.BoolVar(&isUdp, "u", false, "UDP socket")
+	fs.BoolVar(&config.KcpWithUDP, "kcp", false, "KCP over udp")
+
+	fs.StringVar(&config.PresharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM); also key for TCP/KCP encryption")
+
+	fs.Usage = func() {
+		Proxy_usage_flagSet(fs) // 传递 fs，以便它能打印出定义好的标志
+	}
+
+	// 解析传入的 args 切片
+	// 注意：我们假设 args 已经不包含程序名 (os.Args[0])，所以直接传入
+	err := fs.Parse(args)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create direct client: %w", err)
+		return nil, err // 解析错误直接返回
 	}
-	return client, nil
+
+	if config.KcpWithUDP {
+		isUdp = true
+	}
+
+	// 处理网络类型
+	if isUdp {
+		config.Network = "udp"
+	}
+
+	if is4 {
+		config.Network += "4"
+	} else if is6 {
+		config.Network += "6"
+	}
+
+	if strings.HasPrefix(config.PresharedKey, "@") {
+		config.PresharedKey, err = secure.ReadPSKFile(config.PresharedKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read psk file: %v", err)
+		}
+	}
+
+	// 获取所有非标志参数（即位置参数）
+	positionalArgs := fs.Args()
+
+	if len(positionalArgs) == 1 {
+		if !strings.Contains(positionalArgs[0], ":") {
+			return nil, fmt.Errorf("expect host:port, got %s", positionalArgs[0])
+		}
+		config.ServerHost, config.ServerPort, err = net.SplitHostPort(positionalArgs[0])
+		if err != nil {
+			return nil, fmt.Errorf("parse host:port failed: %v", err)
+		}
+	} else if len(positionalArgs) == 2 {
+		config.ServerHost = positionalArgs[0]
+		config.ServerPort = positionalArgs[1]
+	} else {
+		return nil, fmt.Errorf("expect host and port, got %d arg", len(positionalArgs))
+	}
+
+	// 若启用 TLS 或 PSK，加载证书
+	if config.TlsEnabled {
+		var err error
+		config.Cert, err = secure.GenerateECDSACertificate(config.ServerHost, config.PresharedKey)
+		if err != nil {
+			return nil, fmt.Errorf("error generating EC certificate: %v", err)
+		}
+	}
+
+	return config, nil
+}
+
+func Proxy_usage_flagSet(fs *flag.FlagSet) {
+	fmt.Fprintln(os.Stderr, "-x Usage: [options] <host:port>")
+	fmt.Fprintln(os.Stderr, "Or:    [options]  <host> <port>")
+	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
+	fmt.Fprintln(os.Stderr, "\nExamples:")
+	fmt.Fprintln(os.Stderr, "  -x \"-tls -psk randomString <host:port>\"")
 }

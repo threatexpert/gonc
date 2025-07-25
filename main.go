@@ -26,6 +26,7 @@ import (
 	"github.com/threatexpert/gonc/v2/apps"
 	"github.com/threatexpert/gonc/v2/easyp2p"
 	"github.com/threatexpert/gonc/v2/misc"
+	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
 
 	// "net/http"
@@ -35,17 +36,19 @@ import (
 )
 
 var (
+	VERSION                                              = "v2.1.1"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
 
-	app_mux_Config *apps.AppMuxConfig
-	app_s5s_Config *apps.AppS5SConfig
-	app_pf_Config  *apps.AppPFConfig
-	accessControl  *acl.ACL
+	app_mux_Config    *apps.AppMuxConfig
+	app_s5s_Config    *apps.AppS5SConfig
+	app_pf_Config     *apps.AppPFConfig
+	arg_proxyc_Config *apps.ProxyClientConfig
+	accessControl     *acl.ACL
 	// 定义命令行参数
 	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
-	proxyAddr         = flag.String("x", "", "ip:port for proxy_address")
+	proxyAddr         = flag.String("x", "", "\"[options: -tls -psk] ip:port\" for proxy_address")
 	auth              = flag.String("auth", "", "user:password for proxy")
 	sendfile          = flag.String("send", "", "path to file to send (optional)")
 	writefile         = flag.String("write", "", "write to file")
@@ -112,6 +115,601 @@ func init() {
 	flag.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")
 	flag.StringVar(&apps.VarmuxEngine, "mux-engine", apps.VarmuxEngine, "yamux | smux")
 	apps.VarhttpDownloadNoCompress = disableCompress
+}
+
+func main() {
+	// 1. 解析标志并初始化基本设置
+	parseFlagsAndInit()
+
+	// 2. 配置内置应用程序模式（例如http服务器，socks5）
+	configureAppMode()
+
+	// 3. 配置安全功能，如PSK和ACL
+	var err error
+	accessControl, err = configureSecurity()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Security configuration failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
+	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(flag.Args())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error determining network address: %v\n", err)
+		usage()
+		os.Exit(1)
+	}
+
+	// 5. 配置TLS、DNS、会话协商参数等
+	if *tlsSNI == "" {
+		if *listenMode {
+			*tlsSNI = "localhost"
+		} else {
+			*tlsSNI = host
+		}
+	}
+	configureDNS()
+
+	connConfig = preinitNegotiationConfig()
+
+	// 6. 根据模式运行：P2P模式或标准客户端/服务器模式
+	if P2PSessionKey != "" {
+		runP2PMode(network, P2PSessionKey)
+	} else {
+		if *listenMode {
+			runListenMode(network, host, port)
+		} else {
+			runDialMode(network, host, port)
+		}
+	}
+}
+
+// parseFlagsAndInit 处理基本的标志解析和设置
+func parseFlagsAndInit() {
+	flag.Usage = func() {
+		usage_full()
+	}
+	flag.Parse()
+	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
+	easyp2p.STUNServers = parseMultiItems(*stunSrv, true)
+	conflictCheck()
+}
+
+// configureAppMode 为内置应用程序设置命令参数
+func configureAppMode() {
+	if *runAppFileServ != "" {
+		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
+		*runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
+		if *MQTTWait == "" {
+			*MQTTWait = "hello"
+		}
+		*progressEnabled = true
+		*keepOpen = true
+	} else if *runAppFileGet != "" {
+		escapedPath := strings.ReplaceAll(*runAppFileGet, "\\", "/")
+		*runCmd = fmt.Sprintf(":mux httpclient \"%s\"", escapedPath)
+		if *appMuxListenOn != "" {
+			apps.VarmuxLastListenAddress = *appMuxListenOn
+		}
+		if *MQTTPush == "" {
+			*MQTTPush = "hello"
+		}
+		*keepOpen = true
+	} else if *appMuxSocksMode {
+		*runCmd = ":mux socks5"
+		if *MQTTWait == "" {
+			*MQTTWait = "hello"
+		}
+		*progressEnabled = true
+		*keepOpen = true
+	} else if *appMuxListenMode || *appMuxListenOn != "" {
+		if *appMuxListenOn == "" {
+			*appMuxListenOn = "0"
+		}
+		*runCmd = fmt.Sprintf(":mux -l %s", *appMuxListenOn)
+		if *MQTTPush == "" {
+			*MQTTPush = "hello"
+		}
+		*keepOpen = true
+	}
+
+	if *runCmd != "" {
+		preinitBuiltinAppConfig()
+	}
+
+	if *proxyAddr != "" {
+		args, err := parseCommandLine(*proxyAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing -x proxy_address: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "Empty proxy_address\n")
+			os.Exit(1)
+		}
+
+		arg_proxyc_Config, err = apps.ProxyClientConfigByArgs(args)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error init proxy config: %v\n", err)
+			os.Exit(1)
+		}
+
+		switch *proxyProt {
+		case "", "5":
+			arg_proxyc_Config.Prot = "socks5"
+		case "connect":
+			arg_proxyc_Config.Prot = "http"
+		default:
+			fmt.Fprintf(os.Stderr, "Invalid proxy protocol: %s\n", *proxyProt)
+			os.Exit(1)
+		}
+
+		if *auth != "" {
+			authParts := strings.SplitN(*auth, ":", 2)
+			if len(authParts) != 2 {
+				fmt.Fprintf(os.Stderr, "invalid auth format: expected user:pass\n")
+				os.Exit(1)
+			}
+			arg_proxyc_Config.User, arg_proxyc_Config.Pass = authParts[0], authParts[1]
+		}
+
+	}
+}
+
+func configureSecurity() (*acl.ACL, error) {
+	var err error
+	if *presharedKey == "." {
+		*presharedKey, err = secure.GenerateSecureRandomString(22)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Fprintf(os.Stdout, "%s\n", *presharedKey)
+		os.Exit(1)
+	}
+	if *presharedKey != "" {
+		if strings.HasPrefix(*presharedKey, "@") {
+			*presharedKey, err = secure.ReadPSKFile(*presharedKey)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading PSK file: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	var aclData *acl.ACL
+	if *fileACL != "" {
+		aclData, err = acl.LoadACL(*fileACL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load ACL file: %w", err)
+		}
+	}
+	return aclData, nil
+}
+
+// determineNetworkAndAddress 解析网络协议、主机、端口和P2P密钥
+func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionKey string, err error) {
+	if *kcpEnabled || *kcpSEnabled {
+		*udpProtocol = true
+	}
+	if *udpProtocol {
+		network = "udp"
+	} else if *useUNIXdomain {
+		network = "unix"
+	} else {
+		network = "tcp"
+	}
+	if network != "unix" {
+		if *useIPv4 {
+			network += "4"
+		} else if *useIPv6 {
+			network += "6"
+		}
+	}
+
+	switch len(args) {
+	case 2:
+		host, port = args[0], args[1]
+	case 1:
+		if *listenMode {
+			port = args[0]
+		} else if *useUNIXdomain {
+			port = args[0]
+		} else {
+			return "", "", "", "", fmt.Errorf("invalid arguments")
+		}
+	case 0:
+		if *listenMode && *localbind != "" {
+			host, port, err = net.SplitHostPort(*localbind)
+			if err != nil {
+				return "", "", "", "", fmt.Errorf("invalid local address %q: %v", *localbind, err)
+			}
+		} else if !*listenMode && *remoteAddr != "" {
+			host, port, err = net.SplitHostPort(*remoteAddr)
+			if err != nil {
+				return "", "", "", "", fmt.Errorf("invalid remote address %q: %v", *remoteAddr, err)
+			}
+		} else if *autoP2P != "" {
+			if *proxyAddr != "" || arg_proxyc_Config != nil {
+				fmt.Fprintf(os.Stderr, "INFO: proxy is ignored with p2p\n")
+				*proxyAddr = ""
+				arg_proxyc_Config = nil
+			}
+			*listenMode = false
+			P2PSessionKey = *autoP2P
+			network = "any"
+			if *udpProtocol {
+				*kcpEnabled = true
+				network = "udp"
+			}
+			*tlsEnabled = true
+			if *useIPv4 {
+				network += "4"
+			} else if *useIPv6 {
+				network += "6"
+			}
+			if strings.HasPrefix(P2PSessionKey, "@") {
+				P2PSessionKey, err = secure.ReadPSKFile(P2PSessionKey)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error reading PSK file: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			if P2PSessionKey == "." {
+				P2PSessionKey, err = secure.GenerateSecureRandomString(22)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Fprintf(os.Stderr, "Keep this key secret! It is used to establish the secure P2P tunnel: %s\n", P2PSessionKey)
+			} else if secure.IsWeakPassword(P2PSessionKey) {
+				return "", "", "", "", fmt.Errorf("weak password detected")
+			}
+			*presharedKey = P2PSessionKey
+		} else {
+			return "", "", "", "", fmt.Errorf("not enough arguments")
+		}
+	default:
+		return "", "", "", "", fmt.Errorf("too many arguments")
+	}
+
+	return network, host, port, P2PSessionKey, nil
+}
+
+// configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
+func configureDNS() {
+	if *useDNS != "" {
+		setDns(*useDNS)
+	}
+	if isAndroid() {
+		setDns("8.8.8.8:53")
+	}
+}
+
+// runP2PMode 处理建立和维护P2P连接的逻辑
+func runP2PMode(network, P2PSessionKey string) {
+	stats_in := misc.NewProgressStats()
+	stats_out := misc.NewProgressStats()
+	if *progressEnabled {
+		wg := &sync.WaitGroup{}
+		done := make(chan bool)
+		defer func() {
+			done <- true
+			wg.Wait()
+		}()
+		showProgress(stats_in, stats_out, done, wg)
+	}
+
+	if *keepOpen {
+		for {
+			nconn, err := do_P2P_multipath(network, P2PSessionKey, *useMutilPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			if *MQTTWait != "" {
+				go handleNegotiatedConnection(nconn, stats_in, stats_out)
+			} else {
+				handleNegotiatedConnection(nconn, stats_in, stats_out)
+			}
+			time.Sleep(2 * time.Second)
+		}
+	} else {
+		nconn, err := do_P2P_multipath(network, P2PSessionKey, *useMutilPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
+			os.Exit(1)
+		}
+		handleNegotiatedConnection(nconn, stats_in, stats_out)
+	}
+}
+
+// runListenMode 在监听模式下启动服务器
+func runListenMode(network, host, port string) {
+	if *proxyAddr == "" {
+		if port == "0" {
+			portInt, err := easyp2p.GetFreePort()
+			if err != nil {
+				panic(err)
+			}
+			port = strconv.Itoa(portInt)
+		}
+	}
+	if *udpProtocol {
+		startUDPListener(network, host, port)
+	} else {
+		startTCPListener(network, host, port)
+	}
+}
+
+// startUDPListener 启动UDP监听器并处理传入会话
+func startUDPListener(network, host, port string) {
+	listenAddr := net.JoinHostPort(host, port)
+	addr, err := net.ResolveUDPAddr(network, listenAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving UDP address: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *useSTUN {
+		if err = ShowPublicIP(network, addr.String()); err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
+			os.Exit(1)
+		}
+		time.Sleep(1500 * time.Millisecond)
+	}
+
+	uconn, err := net.ListenUDP(network, addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listening on UDP address: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
+
+	logDiscard := log.New(io.Discard, "", log.LstdFlags)
+	usessListener, err := netx.NewUDPCustomListener(uconn, logDiscard)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error NewUDPCustomListener: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *keepOpen {
+		stats_in := misc.NewProgressStats()
+		stats_out := misc.NewProgressStats()
+		if *progressEnabled {
+			wg := &sync.WaitGroup{}
+			done := make(chan bool)
+			showProgress(stats_in, stats_out, done, wg)
+		}
+		for {
+			newSess, err := usessListener.Accept()
+			if err != nil {
+				if err == net.ErrClosed {
+					fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
+					os.Exit(1)
+				}
+				continue
+			}
+			if !acl.ACL_inbound_allow(accessControl, newSess.RemoteAddr()) {
+				fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
+				newSess.Close()
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
+			go handleConnection(connConfig, newSess, stats_in, stats_out)
+		}
+	} else {
+		newSess, err := usessListener.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
+			os.Exit(1)
+		}
+		if !acl.ACL_inbound_allow(accessControl, newSess.RemoteAddr()) {
+			fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
+			newSess.Close()
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
+		handleSingleConnection(newSess)
+	}
+}
+
+// startTCPListener 启动TCP/Unix监听器并处理传入连接
+func startTCPListener(network, host, port string) {
+	listenAddr := net.JoinHostPort(host, port)
+	if *useUNIXdomain {
+		listenAddr = port
+		if err := cleanupUnixSocket(port); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	var listener net.Listener
+	var err error
+	socks5BindMode := false
+	proxyClient, err := apps.NewProxyClient(arg_proxyc_Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error create proxy client: %v\n", err)
+		os.Exit(1)
+	}
+	if proxyClient.SupportBIND() {
+		fmt.Fprintf(os.Stderr, "Attempting SOCKS5 BIND on proxy at %s...\n", listenAddr)
+		listener, err = proxyClient.Dialer.Listen(network, listenAddr)
+		//socks5listener的Close函数是空，无需Close()
+		socks5BindMode = true
+	} else {
+		lc := net.ListenConfig{}
+		if *useSTUN {
+			if err = ShowPublicIP(network, listenAddr); err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
+				os.Exit(1)
+			}
+			lc.Control = netx.ControlTCP
+		}
+		listener, err = lc.Listen(context.Background(), network, listenAddr)
+		if err == nil {
+			defer listener.Close()
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
+	if port == "0" {
+		//记下成功绑定的端口，keepOpen的话，如果需要重新监听就继续用这个端口
+		listenAddr = listener.Addr().String()
+	}
+
+	if *keepOpen {
+		stats_in := misc.NewProgressStats()
+		stats_out := misc.NewProgressStats()
+		if *progressEnabled {
+			wg := &sync.WaitGroup{}
+			done := make(chan bool)
+			showProgress(stats_in, stats_out, done, wg)
+		}
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
+				if socks5BindMode {
+					goto RE_BIND
+				} else {
+					time.Sleep(1 * time.Second)
+					continue
+				}
+			}
+			if conn.LocalAddr().Network() == "unix" {
+				fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
+			} else {
+				if !acl.ACL_inbound_allow(accessControl, conn.RemoteAddr()) {
+					fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
+					conn.Close()
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
+			}
+			go handleConnection(connConfig, conn, stats_in, stats_out)
+		RE_BIND:
+			if socks5BindMode {
+				listener.Close()
+				for tt := 0; tt < 60; tt++ {
+					fmt.Fprintf(os.Stderr, "Re-attempting SOCKS5 BIND on proxy at %s...", listenAddr)
+					listener, err = proxyClient.Dialer.Listen(network, listenAddr)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
+						time.Sleep(5 * time.Second)
+					} else {
+						fmt.Fprintf(os.Stderr, "completed\n")
+						break
+					}
+				}
+			}
+		}
+	} else {
+		conn, err := listener.Accept()
+		listener.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
+			os.Exit((1))
+		}
+
+		if conn.LocalAddr().Network() == "unix" {
+			fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
+		} else {
+			if !acl.ACL_inbound_allow(accessControl, conn.RemoteAddr()) {
+				fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
+				conn.Close()
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
+		}
+		handleSingleConnection(conn)
+	}
+}
+
+// runDialMode 在主动连接模式下启动客户端
+func runDialMode(network, host, port string) {
+	var conn net.Conn
+	var err error
+
+	// go func() {
+	// 	log.Println(http.ListenAndServe("localhost:6060", nil))
+	// }()
+
+	proxyClient, err := apps.NewProxyClient(arg_proxyc_Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error create proxy client: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *useUNIXdomain {
+		conn, err = net.Dial("unix", port)
+	} else {
+		var localAddr net.Addr
+		if *localbind != "" {
+			switch {
+			case strings.HasPrefix(network, "tcp"):
+				localAddr, err = net.ResolveTCPAddr(network, *localbind)
+			case strings.HasPrefix(network, "udp"):
+				localAddr, err = net.ResolveUDPAddr(network, *localbind)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving address: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		if *useSTUN {
+			if *localbind == "" {
+				fmt.Fprintf(os.Stderr, "-stun need be with -bind while connecting\n")
+				os.Exit(1)
+			}
+			if err = ShowPublicIP(network, localAddr.String()); err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		if localAddr == nil {
+			conn, err = proxyClient.DialTimeout(network, net.JoinHostPort(host, port), 20*time.Second)
+		} else {
+			dialer := &net.Dialer{LocalAddr: localAddr}
+			switch {
+			case strings.HasPrefix(network, "tcp"):
+				dialer.Control = netx.ControlTCP
+			case strings.HasPrefix(network, "udp"):
+				dialer.Control = netx.ControlUDP
+			}
+			conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
+		}
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 连接成功后打印信息
+	remoteFullAddr := net.JoinHostPort(host, port)
+	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+		if *proxyAddr == "" {
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteFullAddr)
+		} else {
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s\n", net.JoinHostPort(arg_proxyc_Config.ServerHost, arg_proxyc_Config.ServerPort), remoteFullAddr)
+		}
+	} else {
+		if *proxyAddr == "" {
+			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+		} else {
+			fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteFullAddr)
+		}
+	}
+
+	handleSingleConnection(conn)
 }
 
 func init_TLS(genCertForced bool) []tls.Certificate {
@@ -243,7 +841,7 @@ func usage_full() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "go-netcat v2.1.0")
+	fmt.Fprintln(os.Stderr, "go-netcat "+VERSION)
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "    gonc [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(os.Stderr, "         [-p2p sessionKey]")
@@ -268,8 +866,8 @@ func conflictCheck() {
 		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
 		os.Exit(1)
 	}
-	if *keepOpen && *proxyAddr != "" {
-		fmt.Fprintf(os.Stderr, "-keep-open and -x cannot be used together\n")
+	if *proxyProt == "connect" && (*udpProtocol || *kcpEnabled || *kcpSEnabled) {
+		fmt.Fprintf(os.Stderr, "http proxy and udp cannot be used together\n")
 		os.Exit(1)
 	}
 	if *listenMode && (*remoteAddr != "" || *autoP2P != "") {
@@ -343,506 +941,6 @@ func preinitBuiltinAppConfig() {
 	}
 }
 
-func main() {
-	var err error
-	flag.Usage = func() {
-		usage_full()
-	}
-	flag.Parse()
-
-	easyp2p.MQTTBrokerServers = parseMultiItems(*MQTTServers, true)
-	easyp2p.STUNServers = parseMultiItems(*stunSrv, true)
-
-	conflictCheck()
-
-	if *runAppFileServ != "" {
-		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
-		*runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
-		if *MQTTWait == "" {
-			*MQTTWait = "hello"
-		}
-		*progressEnabled = true
-		*keepOpen = true
-	} else if *runAppFileGet != "" {
-		escapedPath := strings.ReplaceAll(*runAppFileGet, "\\", "/")
-		*runCmd = fmt.Sprintf(":mux httpclient \"%s\"", escapedPath)
-		if *appMuxListenOn != "" {
-			apps.VarmuxLastListenAddress = *appMuxListenOn
-		}
-		if *MQTTPush == "" {
-			*MQTTPush = "hello"
-		}
-		*keepOpen = true
-	} else if *appMuxSocksMode {
-		*runCmd = ":mux socks5"
-		if *MQTTWait == "" {
-			*MQTTWait = "hello"
-		}
-		*progressEnabled = true
-		*keepOpen = true
-	} else if *appMuxListenMode || *appMuxListenOn != "" {
-		if *appMuxListenOn == "" {
-			*appMuxListenOn = "0"
-		}
-		*runCmd = fmt.Sprintf(":mux -l %s", *appMuxListenOn)
-		if *MQTTPush == "" {
-			*MQTTPush = "hello"
-		}
-		*keepOpen = true
-	}
-	if *kcpEnabled || *kcpSEnabled {
-		*udpProtocol = true
-	}
-	if *presharedKey == "." {
-		*presharedKey, err = secure.GenerateSecureRandomString(22)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Fprintf(os.Stderr, "%s\n", *presharedKey)
-		os.Exit(1)
-	}
-	if *presharedKey != "" {
-		if strings.HasPrefix(*presharedKey, "@") {
-			*presharedKey, err = secure.ReadPSKFile(*presharedKey)
-			if err != nil {
-				panic(err)
-			}
-		}
-	}
-
-	if *fileACL != "" {
-		accessControl, err = acl.LoadACL(*fileACL)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to load ACL file: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	if *runCmd != "" {
-		preinitBuiltinAppConfig()
-	}
-
-	var wg *sync.WaitGroup
-	var done chan bool
-	var conn net.Conn
-	var network string
-	var P2PSessionKey string
-	if *udpProtocol {
-		network = "udp"
-	} else if *useUNIXdomain {
-		network = "unix"
-	} else {
-		network = "tcp"
-	}
-	if network != "unix" {
-		if *useIPv4 {
-			network += "4"
-		} else if *useIPv6 {
-			network += "6"
-		}
-	}
-
-	host := ""
-	port := ""
-	args := flag.Args()
-	if len(args) == 2 {
-		host = args[0]
-		port = args[1]
-	} else if len(args) == 1 && *listenMode {
-		port = args[0]
-	} else if len(args) == 1 && !*listenMode && *useUNIXdomain {
-		port = args[0]
-	} else if len(args) == 0 && *listenMode && *localbind != "" {
-		host, port, err = net.SplitHostPort(*localbind)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid local address %q: %v\n", *localbind, err)
-			os.Exit(1)
-		}
-	} else if len(args) == 0 && *remoteAddr != "" {
-		host, port, err = net.SplitHostPort(*remoteAddr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid remote address %q: %v\n", *remoteAddr, err)
-			os.Exit(1)
-		}
-	} else if len(args) == 0 && (*autoP2P != "") {
-		if *proxyAddr != "" {
-			fmt.Fprintf(os.Stderr, "INFO: proxy is ignored with p2p\n")
-			*proxyAddr = ""
-		}
-		*listenMode = false
-		if *autoP2P != "" && !*udpProtocol {
-			network = "any"
-			P2PSessionKey = *autoP2P
-			*tlsEnabled = true //-p2p 默认开启tls安全通信
-		} else if *autoP2P != "" && *udpProtocol {
-			P2PSessionKey = *autoP2P
-			*tlsEnabled = true //-p2p 默认开启tls安全通信
-			*kcpEnabled = true //需要kcp实现稳定传输
-			*udpProtocol = true
-			network = "udp"
-		} else {
-			os.Exit(1)
-		}
-		if *useIPv4 {
-			network += "4"
-		} else if *useIPv6 {
-			network += "6"
-		}
-		if strings.HasPrefix(P2PSessionKey, "@") {
-			P2PSessionKey, err = secure.ReadPSKFile(P2PSessionKey)
-			if err != nil {
-				panic(err)
-			}
-		}
-		if P2PSessionKey == "." {
-			P2PSessionKey, err = secure.GenerateSecureRandomString(22)
-			if err != nil {
-				panic(err)
-			}
-			fmt.Fprintf(os.Stderr, "Keep this key secret! It is used to establish the secure P2P tunnel: %s\n", P2PSessionKey)
-		} else if secure.IsWeakPassword(P2PSessionKey) {
-			fmt.Fprintf(os.Stderr, "Weak password detected. Please use at least 8 characters and avoid common or repetitive patterns.\n")
-			os.Exit(1)
-		}
-		*presharedKey = P2PSessionKey
-	} else {
-		usage()
-		os.Exit(1)
-	}
-
-	if *tlsSNI == "" {
-		if *listenMode {
-			*tlsSNI = "localhost"
-		} else {
-			*tlsSNI = host
-		}
-	}
-
-	connConfig, err = preinitNegotiationConfig()
-	if err != nil {
-		panic(err)
-	}
-
-	if *useDNS != "" {
-		setDns(*useDNS)
-	}
-	if isAndroid() {
-		if *useDNS == "" {
-			setDns("8.8.8.8:53")
-		}
-	}
-
-	//p2p模式
-	if P2PSessionKey != "" {
-		// 创建进度统计
-		stats_in := misc.NewProgressStats()
-		stats_out := misc.NewProgressStats()
-		if *progressEnabled {
-			// 启动进度显示
-			wg = &sync.WaitGroup{}
-			done = make(chan bool)
-			showProgress(stats_in, stats_out, done, wg)
-		}
-
-		if *keepOpen {
-			for {
-				nconn, err := do_P2P_multipath(network, P2PSessionKey, *useMutilPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
-					time.Sleep(10 * time.Second)
-					continue
-				}
-				if *MQTTWait != "" {
-					go handleNegotiatedConnection(nconn, stats_in, stats_out)
-				} else {
-					handleNegotiatedConnection(nconn, stats_in, stats_out)
-				}
-				time.Sleep(2 * time.Second)
-			}
-		} else {
-			nconn, err := do_P2P_multipath(network, P2PSessionKey, *useMutilPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
-				os.Exit(1)
-			}
-			handleNegotiatedConnection(nconn, stats_in, stats_out)
-		}
-		if *progressEnabled {
-			done <- true
-			wg.Wait()
-		}
-		return
-	}
-
-	proxyClient, err := apps.CreateProxyClient(*proxyProt, *proxyAddr, *auth)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error create proxy client: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 监听模式
-	if *listenMode {
-		if *proxyAddr == "" {
-			if port == "0" {
-				portInt, err := easyp2p.GetFreePort()
-				if err != nil {
-					panic(err)
-				}
-				port = strconv.Itoa(portInt)
-			}
-		}
-		listenAddr := net.JoinHostPort(host, port)
-		if *useUNIXdomain {
-			listenAddr = port
-			err := cleanupUnixSocket(port)
-			if err != nil {
-				panic(err)
-			}
-		}
-		if *udpProtocol {
-			// 绑定UDP地址
-			addr, err := net.ResolveUDPAddr(network, listenAddr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving UDP address: %v\n", err)
-				os.Exit(1)
-			}
-
-			if *useSTUN {
-				err = ShowPublicIP(network, addr.String())
-				if err != nil {
-					panic(err)
-				}
-				time.Sleep(1500 * time.Millisecond) //等待一会儿，避免立刻监听又收到stun服务器回复的udp包
-			}
-
-			uconn, err := net.ListenUDP(network, addr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error listening on UDP address: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
-
-			logDiscard := log.New(io.Discard, "", log.LstdFlags)
-			usessListener, err := easyp2p.NewUDPCustomListener(uconn, logDiscard)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error NewUDPCustomListener: %v\n", err)
-				os.Exit(1)
-			}
-
-			if *keepOpen {
-				// 创建进度统计
-				stats_in := misc.NewProgressStats()
-				stats_out := misc.NewProgressStats()
-				if *progressEnabled {
-					// 启动进度显示
-					wg = &sync.WaitGroup{}
-					done = make(chan bool)
-					showProgress(stats_in, stats_out, done, wg)
-				}
-
-				for {
-					newSess, err := usessListener.Accept()
-					if err != nil {
-						if err == net.ErrClosed {
-							fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
-							os.Exit(1)
-							return
-						}
-						continue
-					}
-					if !acl.ACL_inbound_allow(accessControl, newSess.RemoteAddr()) {
-						fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
-						newSess.Close()
-						continue
-					}
-
-					fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
-					go handleConnection(connConfig, newSess, stats_in, stats_out)
-				}
-			} else {
-				// 只接受一个连接
-				newSess, err := usessListener.Accept()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
-					os.Exit(1)
-				}
-				if !acl.ACL_inbound_allow(accessControl, newSess.RemoteAddr()) {
-					fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
-					newSess.Close()
-					os.Exit(1)
-				}
-				fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
-				conn = newSess
-			}
-		} else {
-			var listener net.Listener
-
-			if proxyClient.SupportBIND() {
-				listener, err = proxyClient.Dialer.Listen(network, listenAddr)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
-					os.Exit(1)
-				}
-			} else {
-				// TCP/unix listen
-				lc := net.ListenConfig{}
-				if *useSTUN {
-					err = ShowPublicIP(network, listenAddr)
-					if err != nil {
-						panic(err)
-					}
-				}
-				if *useSTUN {
-					lc.Control = easyp2p.ControlTCP
-				}
-				listener, err = lc.Listen(context.Background(), network, listenAddr)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
-					os.Exit(1)
-				}
-			}
-			fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
-
-			if *keepOpen {
-				// 创建进度统计
-				stats_in := misc.NewProgressStats()
-				stats_out := misc.NewProgressStats()
-				if *progressEnabled {
-					// 启动进度显示
-					wg = &sync.WaitGroup{}
-					done = make(chan bool)
-					showProgress(stats_in, stats_out, done, wg)
-				}
-				defer listener.Close()
-				for {
-					conn, err = listener.Accept()
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
-						time.Sleep(1 * time.Second)
-						continue
-					}
-					if conn.LocalAddr().Network() == "unix" {
-						fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
-					} else {
-						if !acl.ACL_inbound_allow(accessControl, conn.RemoteAddr()) {
-							fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
-							conn.Close()
-							continue
-						}
-						fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
-					}
-					go handleConnection(connConfig, conn, stats_in, stats_out)
-				}
-			} else {
-				conn, err = listener.Accept()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
-					os.Exit((1))
-				}
-				listener.Close()
-				if conn.LocalAddr().Network() == "unix" {
-					fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
-				} else {
-					if !acl.ACL_inbound_allow(accessControl, conn.RemoteAddr()) {
-						fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
-						conn.Close()
-						os.Exit(1)
-					}
-					fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
-				}
-			}
-		}
-	} else {
-		//主动连接模式
-
-		// go func() {
-		// 	log.Println(http.ListenAndServe("localhost:6060", nil))
-		// }()
-
-		var localAddr net.Addr
-		var localTcpAddr *net.TCPAddr
-
-		if *localbind != "" {
-			switch {
-			case strings.HasPrefix(network, "tcp"):
-				localTcpAddr, err = net.ResolveTCPAddr(network, *localbind)
-				if err != nil {
-					panic(err)
-				}
-				localAddr = localTcpAddr
-			case strings.HasPrefix(network, "udp"):
-				localAddr, err = net.ResolveUDPAddr(network, *localbind)
-				if err != nil {
-					panic(err)
-				}
-			}
-		}
-
-		if *useSTUN {
-			if *localbind == "" {
-				panic("-stun need be with -bind while connecting")
-			}
-			err = ShowPublicIP(network, localAddr.String())
-			if err != nil {
-				panic(err)
-			}
-		}
-
-		if *useUNIXdomain {
-			// Unix域套接字
-			conn, err = net.Dial("unix", port)
-		} else {
-			// TCP/UDP 连接
-			if localAddr == nil {
-				conn, err = proxyClient.DialTimeout(network, net.JoinHostPort(host, port), 20*time.Second)
-			} else {
-				dialer := &net.Dialer{
-					LocalAddr: localAddr,
-				}
-				switch {
-				case strings.HasPrefix(network, "tcp"):
-					dialer.Control = easyp2p.ControlTCP
-				case strings.HasPrefix(network, "udp"):
-					dialer.Control = easyp2p.ControlUDP
-				}
-				conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
-			}
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-			if *proxyAddr == "" {
-				fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", net.JoinHostPort(host, port))
-			} else {
-				fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s\n", *proxyAddr, net.JoinHostPort(host, port))
-			}
-		} else {
-			if *proxyAddr == "" {
-				fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
-			} else {
-				fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), net.JoinHostPort(host, port))
-			}
-		}
-	}
-
-	// 创建进度统计
-	stats_in := misc.NewProgressStats()
-	stats_out := misc.NewProgressStats()
-	if *progressEnabled {
-		wg = &sync.WaitGroup{}
-		done = make(chan bool)
-		showProgress(stats_in, stats_out, done, wg)
-	}
-
-	handleConnection(connConfig, conn, stats_in, stats_out)
-	if *progressEnabled {
-		done <- true
-		wg.Wait()
-	}
-}
-
 // 用于在数据传输时显示进度
 func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats) {
 	bufsize := blocksize
@@ -891,7 +989,7 @@ func copyCharDeviceWithProgress(dst io.Writer, src io.Reader, stats *misc.Progre
 	for {
 		line, err1 = reader.ReadString('\n')
 		if err1 != nil && err1 != io.EOF {
-			fmt.Fprintf(os.Stderr, "Read error: %v\n", err1)
+			fmt.Fprintf(os.Stderr, "ReadString error: %v\n", err1)
 			break
 		}
 
@@ -966,11 +1064,7 @@ func parseCommandLine(command string) ([]string, error) {
 	return args, nil
 }
 
-type closeWriter interface {
-	CloseWrite() error
-}
-
-func preinitNegotiationConfig() (*secure.NegotiationConfig, error) {
+func preinitNegotiationConfig() *secure.NegotiationConfig {
 	config := secure.NewNegotiationConfig()
 
 	genCertForced := *presharedKey != ""
@@ -1015,7 +1109,7 @@ func preinitNegotiationConfig() (*secure.NegotiationConfig, error) {
 		}
 	}
 
-	return config, nil
+	return config
 }
 
 func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_out *misc.ProgressStats) {
@@ -1024,13 +1118,11 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 
 	defer nconn.Close()
 
-	conn := nconn.ConnLayers[0]
-
 	var bufsize int = 32 * 1024
 	blocksize := bufsize
 	if nconn.IsUDP {
 		//往udp连接拷贝数据，如果源是文件，应该限制每次拷贝到udp包的大小
-		blocksize = connConfig.UdpOutputBlockSize
+		blocksize = nconn.Config.UdpOutputBlockSize
 	}
 
 	if !sessionReady {
@@ -1100,19 +1192,19 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 
 		builtinApp := args[0]
 		if builtinApp == ":mux" {
-			pipeConn := misc.NewPipeConn(conn)
+			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go apps.App_mux_main_withconfig(pipeConn, app_mux_Config)
 		} else if builtinApp == ":s5s" {
-			pipeConn := misc.NewPipeConn(conn)
+			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go apps.App_s5s_main_withconfig(pipeConn, app_s5s_Config)
 		} else if builtinApp == ":pf" {
-			pipeConn := misc.NewPipeConn(conn)
+			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
@@ -1186,28 +1278,23 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
-				copyWithProgress(conn, input, blocksize, !nconn.IsUDP, stats_out)
+				copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out)
 			} else {
-				copyCharDeviceWithProgress(conn, input, stats_out)
+				copyCharDeviceWithProgress(nconn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(conn, input, blocksize, !nconn.IsUDP, stats_out)
+			copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out)
 		}
 
 		time.Sleep(1 * time.Second)
-		// 关闭连接
-		if tcpConn, ok := conn.(closeWriter); ok {
-			tcpConn.CloseWrite()
-		} else {
-			conn.Close()
-		}
+		nconn.CloseWrite()
 	}()
 	// 从连接读取并输出到输出
 	go func() {
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(output, conn, bufsize, !nconn.IsUDP, stats_in)
+		copyWithProgress(output, nconn, bufsize, !nconn.IsUDP, stats_in)
 		time.Sleep(1 * time.Second)
 	}()
 
@@ -1232,7 +1319,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 		//fmt.Fprintf(os.Stderr, "Timeout after one routine exited.\n")
 	}
 
-	conn.Close()
+	nconn.Close()
 	if *enablePty && output != nil {
 		output.Close()
 	}
@@ -1244,6 +1331,23 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 		cmd.Process.Kill()
 		cmd.Wait()
 	}
+}
+
+func handleSingleConnection(conn net.Conn) {
+	stats_in := misc.NewProgressStats()
+	stats_out := misc.NewProgressStats()
+
+	if *progressEnabled {
+		wg := &sync.WaitGroup{}
+		done := make(chan bool)
+		showProgress(stats_in, stats_out, done, wg)
+		defer func() {
+			done <- true
+			wg.Wait()
+		}()
+	}
+
+	handleConnection(connConfig, conn, stats_in, stats_out)
 }
 
 func handleConnection(cfg *secure.NegotiationConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) {

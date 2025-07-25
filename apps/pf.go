@@ -20,10 +20,11 @@ type AppPFConfig struct {
 	Network      string           // 默认是tcp，然而如果有参数-4 -6 -u -U，则可能是tcp4 tcp6 udp4 udp6 unix
 	Host, Port   string           // 是最后 two args
 	Localbind    string
-	PresharedKey string // -psk <psk-string>
-	ProxyProt    string // -X 代理协议，可能是 connect或5，或空
-	ProxyAddress string // -x 代理服务器地址 host:port
-	ProxyAuth    string // -auth 代理认证信息，格式为 username:password
+	PresharedKey string            // -psk <psk-string>
+	ProxyProt    string            // -X 代理协议，可能是 connect或5，或空
+	ProxyAddress string            // -x 代理服务器地址 host:port
+	ProxyConfig  ProxyClientConfig // 代理配置，包含认证信息等
+	ProxyAuth    string            // -auth 代理认证信息，格式为 username:password
 	KcpWithUDP   bool
 }
 
@@ -68,16 +69,6 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		return nil, err // 解析错误直接返回
 	}
 
-	// 验证代理协议值
-	if config.ProxyProt != "" && config.ProxyProt != "5" && config.ProxyProt != "connect" {
-		return nil, fmt.Errorf("invalid proxy protocol: %s", config.ProxyProt)
-	}
-
-	// 验证代理认证格式
-	if config.ProxyAuth != "" && !strings.Contains(config.ProxyAuth, ":") {
-		return nil, fmt.Errorf("invalid format for -auth, expected user:pass")
-	}
-
 	if config.KcpWithUDP {
 		isUdp = true
 	}
@@ -90,15 +81,46 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	} // 否则保持默认 "tcp"
 
 	if is4 {
-		if strings.HasSuffix(config.Network, "4") || strings.HasSuffix(config.Network, "6") {
-			return nil, fmt.Errorf("-4 and -6 cannot be used together or with -u/-U in a conflicting way")
+		if is6 || isUnix {
+			return nil, fmt.Errorf("-4 and -6 cannot be used together or with -U in a conflicting way")
 		}
 		config.Network += "4"
 	} else if is6 {
-		if strings.HasSuffix(config.Network, "4") || strings.HasSuffix(config.Network, "6") {
-			return nil, fmt.Errorf("-4 and -6 cannot be used together or with -u/-U in a conflicting way")
+		if is4 || isUnix {
+			return nil, fmt.Errorf("-4 and -6 cannot be used together or with -U in a conflicting way")
 		}
 		config.Network += "6"
+	}
+
+	if config.ProxyAddress != "" {
+		// 验证代理协议值
+		switch config.ProxyProt {
+		case "", "5":
+			config.ProxyConfig.Prot = "socks5"
+		case "connect":
+			config.ProxyConfig.Prot = "http"
+		default:
+			return nil, fmt.Errorf("invalid proxy protocol: %s", config.ProxyProt)
+		}
+
+		// 验证代理认证格式
+		if config.ProxyAuth != "" {
+			authParts := strings.SplitN(config.ProxyAuth, ":", 2)
+			if len(authParts) != 2 {
+				fmt.Fprintf(os.Stderr, "invalid auth format: expected user:pass\n")
+				os.Exit(1)
+			}
+			config.ProxyConfig.User, config.ProxyConfig.Pass = authParts[0], authParts[1]
+		}
+		config.ProxyConfig.Network = config.Network
+		config.ProxyConfig.ServerHost, config.ProxyConfig.ServerPort, err = net.SplitHostPort(config.ProxyAddress)
+		if err != nil {
+			return nil, fmt.Errorf("invalid format for -x, expected host:port")
+		}
+
+		if (isUdp && config.ProxyConfig.Prot == "http") || (isUnix && config.ProxyConfig.Prot != "") {
+			return nil, fmt.Errorf("proxy with -U/-u in a conflicting way")
+		}
 	}
 
 	if strings.HasPrefix(config.PresharedKey, "@") {
@@ -118,11 +140,20 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		}
 		config.Port = positionalArgs[0] // 对于Unix，port字段存储路径
 	} else {
-		if len(positionalArgs) != 2 {
-			return nil, fmt.Errorf("expect host and port for network type %s, got %d", config.Network, len(positionalArgs))
+		if len(positionalArgs) == 1 {
+			if !strings.Contains(positionalArgs[0], ":") {
+				return nil, fmt.Errorf("expect host:port, got %s", positionalArgs[0])
+			}
+			config.Host, config.Port, err = net.SplitHostPort(positionalArgs[0])
+			if err != nil {
+				return nil, fmt.Errorf("parse host:port failed: %v", err)
+			}
+		} else if len(positionalArgs) == 2 {
+			config.Host = positionalArgs[0]
+			config.Port = positionalArgs[1]
+		} else {
+			return nil, fmt.Errorf("expect host and port, got %d arg", len(positionalArgs))
 		}
-		config.Host = positionalArgs[0]
-		config.Port = positionalArgs[1]
 	}
 
 	// 若启用 TLS 或 PSK，加载证书
@@ -171,11 +202,11 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	var localAddr net.Addr
 	var err error
 	var targetConn net.Conn
-	targetConfig := secure.NewNegotiationConfig()
-	targetConfig.IsClient = true
+	ntconfig := secure.NewNegotiationConfig()
+	ntconfig.IsClient = true
 
 	if config.Localbind == "" {
-		dialer, err := CreateProxyClient(config.ProxyProt, config.ProxyAddress, config.ProxyAuth)
+		dialer, err := NewProxyClient(&config.ProxyConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error CreateProxyClient: %v\n", err)
 			return
@@ -216,36 +247,36 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	fmt.Fprintf(os.Stderr, "Connected to: %s\n", targetConn.RemoteAddr().String())
 
 	if config.PresharedKey != "" {
-		targetConfig.KeyType = "PSK"
-		targetConfig.Key = config.PresharedKey
+		ntconfig.KeyType = "PSK"
+		ntconfig.Key = config.PresharedKey
 	}
 
 	if config.TlsEnabled {
-		targetConfig.Certs = []tls.Certificate{*config.Cert}
-		targetConfig.TlsSNI = config.Host
+		ntconfig.Certs = []tls.Certificate{*config.Cert}
+		ntconfig.TlsSNI = config.Host
 	}
 
 	if strings.HasPrefix(config.Network, "udp") {
-		targetConfig.KcpWithUDP = config.KcpWithUDP
+		ntconfig.KcpWithUDP = config.KcpWithUDP
 		if config.TlsEnabled {
-			targetConfig.SecureLayer = "dtls"
+			ntconfig.SecureLayer = "dtls"
 		} else if config.KcpWithUDP && config.PresharedKey != "" {
-			targetConfig.KcpEncryption = true
+			ntconfig.KcpEncryption = true
 		} else if config.PresharedKey != "" {
-			targetConfig.SecureLayer = "dss"
+			ntconfig.SecureLayer = "dss"
 		}
 	} else {
 		if config.TlsEnabled {
-			targetConfig.SecureLayer = "tls"
+			ntconfig.SecureLayer = "tls"
 		} else if config.PresharedKey != "" {
-			targetConfig.SecureLayer = "ss"
+			ntconfig.SecureLayer = "ss"
 		}
 	}
 
-	nconn, err := secure.DoNegotiation(targetConfig, targetConn, io.Discard)
+	nconn, err := secure.DoNegotiation(ntconfig, targetConn, io.Discard)
 	if err == nil {
 		defer nconn.Close()
-		handleProxy(conn, nconn.ConnLayers[0])
+		handleProxy(conn, nconn.TopLayer)
 	}
 	fmt.Fprintf(os.Stderr, "Disconnected from: %s\n", targetConn.RemoteAddr().String())
 }

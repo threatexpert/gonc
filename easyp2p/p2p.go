@@ -28,6 +28,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/threatexpert/gonc/v2/netx"
 )
 
 var (
@@ -915,9 +916,9 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	if err != nil {
 		return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
 	}
-	buconn := NewBoundUDPConn(uconn, "", false)
+	buconn := netx.NewBoundUDPConn(uconn, "", false)
 
-	SetUDPTTL(uconn, ttl)
+	netx.SetUDPTTL(uconn, ttl)
 
 	//端口监听准备好了，开始P2P
 
@@ -956,7 +957,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			if bytes.Equal(buf[:n], punchPayload) {
 				stopPunching()
 				buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
-				SetUDPTTL(uconn, 64)
+				netx.SetUDPTTL(uconn, 64)
 				buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
 				time.Sleep(250 * time.Millisecond)
 				buconn.Write(punchPayload)
@@ -1041,7 +1042,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				if err != nil {
 					continue // Skip if port is occupied
 				}
-				SetUDPTTL(conn, ttl)
+				netx.SetUDPTTL(conn, ttl)
 				conns = append(conns, conn)
 				// Stop once we have enough successful binds
 				if len(conns) >= PunchingRandomPortCount {
@@ -1085,7 +1086,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 						// 只有第一个成功的协程会执行后续操作
 						once.Do(func() {
 							// 标记成功并发送确认包
-							SetUDPTTL(c, 64)
+							netx.SetUDPTTL(c, 64)
 							_, _ = c.WriteToUDP(punchPayload, raddr)
 							time.Sleep(250 * time.Millisecond)
 							_, _ = c.WriteToUDP(punchPayload, raddr)
@@ -1360,7 +1361,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	var commitOnce sync.Once
 
 	// Start listener
-	lc := net.ListenConfig{Control: ControlTCP}
+	lc := net.ListenConfig{Control: netx.ControlTCP}
 	listener, err := lc.Listen(ctx, network, localAddr.String())
 	if err != nil {
 		return nil, false, nil, fmt.Errorf("failed to listen: %v", err)
@@ -1513,7 +1514,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				if localAddr != nil {
 					dialer.LocalAddr = localAddr
 					if reuseaddr {
-						dialer.Control = ControlTCP
+						dialer.Control = netx.ControlTCP
 					}
 				}
 

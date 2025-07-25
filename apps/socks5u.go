@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/threatexpert/gonc/v2/acl"
+	"github.com/threatexpert/gonc/v2/netx"
+	"github.com/threatexpert/gonc/v2/secure"
 )
 
 // SOCKS5 协议常量
@@ -630,7 +632,7 @@ func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort i
 }
 
 func handleTCPListen(clientConn net.Conn, targetHost string, targetPort int) error {
-	lc := net.ListenConfig{}
+	lc := net.ListenConfig{Control: netx.ControlTCP}
 	if targetHost == "" {
 		local, ok := clientConn.LocalAddr().(*net.TCPAddr)
 		if ok {
@@ -1154,17 +1156,13 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 
 // SOCKS5 客户端结构体
 type Socks5Client struct {
-	Socks5Addr string // SOCKS5 服务器地址 (e.g., "127.0.0.1:1080")
-	Username   string // 用户名 (可选)
-	Password   string // 密码 (可选)
+	Config *ProxyClientConfig
 }
 
 // NewSocks5Client 创建一个新的 SOCKS5 客户端实例
-func NewSocks5Client(socks5Addr, username, password string) *Socks5Client {
+func NewSocks5Client(config *ProxyClientConfig) *Socks5Client {
 	return &Socks5Client{
-		Socks5Addr: socks5Addr,
-		Username:   username,
-		Password:   password,
+		Config: config,
 	}
 }
 
@@ -1172,7 +1170,7 @@ func NewSocks5Client(socks5Addr, username, password string) *Socks5Client {
 func (c *Socks5Client) socks5Handshake(conn net.Conn) error {
 	// 1. 发送方法选择报文
 	var methods []byte
-	if c.Username != "" && c.Password != "" {
+	if c.Config.User != "" && c.Config.Pass != "" {
 		methods = []byte{AUTH_USERNAME_PASSWORD} // 支持用户名/密码认证
 	} else {
 		methods = []byte{AUTH_NO_AUTH} // 只支持无认证
@@ -1202,17 +1200,17 @@ func (c *Socks5Client) socks5Handshake(conn net.Conn) error {
 
 	// 3. 处理认证子协商
 	if chosenMethod == AUTH_USERNAME_PASSWORD {
-		if c.Username == "" || c.Password == "" {
+		if c.Config.User == "" || c.Config.Pass == "" {
 			return fmt.Errorf("SOCKS5 server requires authentication, but no credentials provided")
 		}
 
 		// 发送用户名/密码认证报文
 		// VER(1) | ULEN(1) | UNAME(ULEN) | PLEN(1) | PASSWD(PLEN)
 		authReq := []byte{0x01} // Auth subnegotiation version
-		authReq = append(authReq, byte(len(c.Username)))
-		authReq = append(authReq, []byte(c.Username)...)
-		authReq = append(authReq, byte(len(c.Password)))
-		authReq = append(authReq, []byte(c.Password)...)
+		authReq = append(authReq, byte(len(c.Config.User)))
+		authReq = append(authReq, []byte(c.Config.User)...)
+		authReq = append(authReq, byte(len(c.Config.Pass)))
+		authReq = append(authReq, []byte(c.Config.Pass)...)
 
 		_, err := conn.Write(authReq)
 		if err != nil {
@@ -1329,24 +1327,37 @@ func readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
 
 // Dial 方法现在统一处理 TCP 和 UDP
 func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
-	if c.Socks5Addr == "" {
-		return net.DialTimeout(network, address, timeout)
+
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address format: %w", err)
 	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port: %w", err)
+	}
+
+	serverAddress := net.JoinHostPort(c.Config.ServerHost, c.Config.ServerPort)
+	var ntconfig *secure.NegotiationConfig
+	if IsSecureNegotiationNeeded(c.Config) {
+		ntconfig = BuildNTConfigFromPCConfig(c.Config)
+	}
+
+	socks5Conn, err := net.DialTimeout(c.Config.Network, serverAddress, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", serverAddress, err)
+	}
+	if ntconfig != nil {
+		nconn, err := secure.DoNegotiation(ntconfig, socks5Conn, io.Discard)
+		if err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("DoNegotiation to SOCKS5 proxy server failed: %w", err)
+		}
+		socks5Conn = nconn
+	}
+
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		host, portStr, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("invalid address format: %w", err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port: %w", err)
-		}
-
-		socks5Conn, err := net.DialTimeout("tcp", c.Socks5Addr, timeout)
-		if err != nil {
-			return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", c.Socks5Addr, err)
-		}
 		socks5Conn.SetDeadline(time.Now().Add(timeout))
 		if err := c.socks5Handshake(socks5Conn); err != nil {
 			socks5Conn.Close()
@@ -1375,10 +1386,8 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		}
 
 		// 1. TCP 控制连接
-		serverTCPConn, err := net.DialTimeout("tcp", c.Socks5Addr, timeout)
-		if err != nil {
-			return nil, fmt.Errorf("dial SOCKS5 server %s for UDP ASSOCIATE error: %w", c.Socks5Addr, err)
-		}
+		serverTCPConn := socks5Conn
+		// 设置超时时间
 		serverTCPConn.SetDeadline(time.Now().Add(timeout))
 		if err := c.socks5Handshake(serverTCPConn); err != nil {
 			serverTCPConn.Close()
@@ -1471,24 +1480,36 @@ func (c *Socks5Client) Listen(network, address string) (net.Listener, error) {
 }
 
 func (c *Socks5Client) RemoteListen(network, address string, timeout time.Duration) (*Socks5BindConn, error) {
-	if c.Socks5Addr == "" {
-		return nil, fmt.Errorf("empty server address")
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address format: %w", err)
 	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port: %w", err)
+	}
+
+	serverAddress := net.JoinHostPort(c.Config.ServerHost, c.Config.ServerPort)
+	var ntconfig *secure.NegotiationConfig
+	if IsSecureNegotiationNeeded(c.Config) {
+		ntconfig = BuildNTConfigFromPCConfig(c.Config)
+	}
+
+	socks5Conn, err := net.DialTimeout(c.Config.Network, serverAddress, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", serverAddress, err)
+	}
+	if ntconfig != nil {
+		nconn, err := secure.DoNegotiation(ntconfig, socks5Conn, io.Discard)
+		if err != nil {
+			socks5Conn.Close()
+			return nil, fmt.Errorf("DoNegotiation to SOCKS5 proxy server failed: %w", err)
+		}
+		socks5Conn = nconn
+	}
+
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		host, portStr, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("invalid address format: %w", err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port: %w", err)
-		}
-
-		socks5Conn, err := net.DialTimeout("tcp", c.Socks5Addr, timeout)
-		if err != nil {
-			return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", c.Socks5Addr, err)
-		}
 		socks5Conn.SetDeadline(time.Now().Add(timeout))
 		if err := c.socks5Handshake(socks5Conn); err != nil {
 			socks5Conn.Close()
@@ -1794,6 +1815,10 @@ func (u *UDPConnWrapper) RemoteAddr() net.Addr {
 	if u.targetUDPAddr != nil {
 		return u.targetUDPAddr
 	} else {
+		addr, err := net.ResolveUDPAddr("udp", u.strTargetUDPAddr)
+		if err == nil {
+			return addr
+		}
 		return &net.UDPAddr{}
 	}
 }

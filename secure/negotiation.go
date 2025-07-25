@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/threatexpert/gonc/v2/easyp2p"
+	"github.com/threatexpert/gonc/v2/netx"
 
 	"github.com/pion/dtls/v3"
 	"github.com/xtaci/kcp-go/v5"
@@ -59,6 +59,9 @@ func NewNegotiationConfig() *NegotiationConfig {
 type NegotiatedConn struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
+	Config     *NegotiationConfig
+	TopLayer   net.Conn
+	ConnStack  []string
 	ConnLayers []net.Conn
 	IsUDP      bool
 }
@@ -70,6 +73,8 @@ func (nconn *NegotiatedConn) Close() error {
 	for _, c := range nconn.ConnLayers {
 		c.Close()
 	}
+	nconn.Config = nil
+	nconn.ConnStack = []string{}
 	nconn.ConnLayers = []net.Conn{}
 	nconn.ctx = nil
 	nconn.cancel = nil
@@ -77,44 +82,46 @@ func (nconn *NegotiatedConn) Close() error {
 }
 
 func (nconn *NegotiatedConn) Read(b []byte) (int, error) {
-	return nconn.ConnLayers[0].Read(b)
+	return nconn.TopLayer.Read(b)
 }
 
 func (nconn *NegotiatedConn) Write(b []byte) (int, error) {
-	return nconn.ConnLayers[0].Write(b)
+	return nconn.TopLayer.Write(b)
 }
 
 func (nconn *NegotiatedConn) CloseWrite() error {
-	if cw, ok := nconn.ConnLayers[0].(interface{ CloseWrite() error }); ok {
+	if cw, ok := nconn.TopLayer.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	return nconn.ConnLayers[0].Close()
+	return nconn.TopLayer.Close()
 }
 
 func (nconn *NegotiatedConn) LocalAddr() net.Addr {
-	return nconn.ConnLayers[0].LocalAddr()
+	return nconn.TopLayer.LocalAddr()
 }
 
 func (nconn *NegotiatedConn) RemoteAddr() net.Addr {
-	return nconn.ConnLayers[0].RemoteAddr()
+	return nconn.TopLayer.RemoteAddr()
 }
 
 func (nconn *NegotiatedConn) SetDeadline(t time.Time) error {
-	return nconn.ConnLayers[0].SetDeadline(t)
+	return nconn.TopLayer.SetDeadline(t)
 }
 
 func (nconn *NegotiatedConn) SetReadDeadline(t time.Time) error {
-	return nconn.ConnLayers[0].SetReadDeadline(t)
+	return nconn.TopLayer.SetReadDeadline(t)
 }
 
 func (nconn *NegotiatedConn) SetWriteDeadline(t time.Time) error {
-	return nconn.ConnLayers[0].SetWriteDeadline(t)
+	return nconn.TopLayer.SetWriteDeadline(t)
 }
 
 func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer) (*NegotiatedConn, error) {
 	nconn := &NegotiatedConn{
+		Config:     cfg,
 		ConnLayers: []net.Conn{rawconn},
 	}
+	var connStack []string
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		if nconn.cancel == nil {
@@ -145,12 +152,14 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 			return nil, fmt.Errorf("failed to establish TLS connection")
 		}
 		nconn.ConnLayers = append([]net.Conn{conn_tls}, nconn.ConnLayers...)
+		connStack = append(connStack, cfg.SecureLayer)
 	case cfg.SecureLayer == "dtls":
 		conn_dtls := doDTLS(ctxTimeout, cfg, nconn.ConnLayers[0], logWriter)
 		if conn_dtls == nil {
 			return nil, fmt.Errorf("failed to establish DTLS connection")
 		}
 		nconn.ConnLayers = append([]net.Conn{conn_dtls}, nconn.ConnLayers...)
+		connStack = append(connStack, cfg.SecureLayer)
 	case cfg.SecureLayer == "ss" || cfg.SecureLayer == "dss":
 		var key32 [32]byte
 		switch cfg.KeyType {
@@ -176,6 +185,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 			connss := NewSecureStreamConn(nconn.ConnLayers[0], key32)
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 		}
+		connStack = append(connStack, cfg.SecureLayer)
 	default:
 	}
 
@@ -186,16 +196,27 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				return nil, fmt.Errorf("failed to establish KCP session")
 			}
 			nconn.ConnLayers = append([]net.Conn{sess_kcp}, nconn.ConnLayers...)
+			connStack = append(connStack, "kcp")
 		} else {
-			pktconn := easyp2p.NewPacketConnWrapper(nconn.ConnLayers[0], nconn.ConnLayers[0].RemoteAddr())
-			buconn := easyp2p.NewBoundUDPConn(pktconn, nconn.ConnLayers[0].RemoteAddr().String(), false)
-			buconn.SetIdleTimeout(time.Duration(cfg.UDPIdleTimeoutSecond) * time.Second)
-			nconn.ConnLayers = append([]net.Conn{buconn}, nconn.ConnLayers...)
+			isWrappered := false
+			if nconn, ok := rawconn.(*NegotiatedConn); ok {
+				if len(nconn.ConnStack) > 0 {
+					isWrappered = true
+				}
+			}
+			if !isWrappered {
+				pktconn := netx.NewPacketConnWrapper(nconn.ConnLayers[0], nconn.ConnLayers[0].RemoteAddr())
+				buconn := netx.NewBoundUDPConn(pktconn, nconn.ConnLayers[0].RemoteAddr().String(), false)
+				buconn.SetIdleTimeout(time.Duration(cfg.UDPIdleTimeoutSecond) * time.Second)
+				nconn.ConnLayers = append([]net.Conn{buconn}, nconn.ConnLayers...)
+			}
 		}
 	}
 
 	nconn.ctx = ctx
 	nconn.cancel = cancel
+	nconn.TopLayer = nconn.ConnLayers[0]
+	nconn.ConnStack = connStack
 	return nconn, nil
 }
 
@@ -288,7 +309,7 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWr
 	// DTLS Server / Client 模式
 	var dtlsConn *dtls.Conn
 	var err error
-	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	pktconn := netx.NewPacketConnWrapper(conn, conn.RemoteAddr())
 
 	if !config.IsClient {
 		dtlsConfig.Certificates = config.Certs
@@ -323,7 +344,7 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWr
 	firstRefusedLogged := false
 	for {
 		if err = dtlsConn.HandshakeContext(ctx); err != nil {
-			if easyp2p.IsConnRefused(err) {
+			if netx.IsConnRefused(err) {
 				if !firstRefusedLogged {
 					fmt.Fprintf(logWriter, "(ECONNREFUSED)...")
 					firstRefusedLogged = true
@@ -395,9 +416,9 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 
 	// 启动 keepalive
 
-	pktconn := easyp2p.NewPacketConnWrapper(conn, conn.RemoteAddr())
+	pktconn := netx.NewPacketConnWrapper(conn, conn.RemoteAddr())
 	startUDPKeepAlive(ctx, pktconn, conn.RemoteAddr(), []byte(config.UdpKeepAlivePayload), 2*time.Second, intervalChange)
-	buconn := easyp2p.NewBoundUDPConn(pktconn, conn.RemoteAddr().String(), false)
+	buconn := netx.NewBoundUDPConn(pktconn, conn.RemoteAddr().String(), false)
 	buconn.SetIdleTimeout(time.Duration(config.KCPIdleTimeoutSecond) * time.Second)
 
 	if !config.IsClient {

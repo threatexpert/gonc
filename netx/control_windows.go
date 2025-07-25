@@ -1,4 +1,4 @@
-package easyp2p
+package netx
 
 import (
 	"errors"
@@ -39,19 +39,6 @@ func SetUDPTTL(conn *net.UDPConn, ttl int) error {
 		return err
 	}
 	return nil
-}
-
-func ControlTCPTTL(network, address string, c syscall.RawConn) (err error) {
-	c.Control(func(fd uintptr) {
-		if err = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_REUSEADDR, 1); err != nil {
-			return
-		}
-		if err = windows.SetsockoptInt(windows.Handle(fd), syscall.IPPROTO_IP, syscall.IP_TTL, PunchingShortTTL); err != nil {
-			return
-		}
-	})
-
-	return
 }
 
 // isMessageSizeError checks for the "message too long" error on Windows.

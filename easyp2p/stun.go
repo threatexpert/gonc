@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/stun"
+	"github.com/threatexpert/gonc/v2/netx"
 )
 
 var (
@@ -107,9 +108,9 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 			// 为拨号器创建一个带 context 的超时
 			dialer := &net.Dialer{LocalAddr: laddr}
 			if strings.HasPrefix(useNetwork, "tcp") {
-				dialer.Control = ControlTCP
+				dialer.Control = netx.ControlTCP
 			} else {
-				dialer.Control = ControlUDP
+				dialer.Control = netx.ControlUDP
 			}
 
 			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s ...\n", useNetwork, stunAddr)
@@ -299,7 +300,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) (
 	netLower := strings.ToLower(network)
 	isIPv6 := strings.HasSuffix(netLower, "6")
 	netProto := "udp"
-	var UDPDialer *UDPCustomDialer
+	var UDPDialer *netx.UDPCustomDialer
 	if strings.HasPrefix(netLower, "tcp") {
 		netProto = "tcp"
 	} else {
@@ -314,7 +315,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) (
 		defer sharedUDPConn.Close()
 
 		logDiscard := log.New(io.Discard, "", log.LstdFlags|log.Lshortfile)
-		UDPDialer, err = NewUDPCustomDialer(sharedUDPConn, 4096, logDiscard)
+		UDPDialer, err = netx.NewUDPCustomDialer(sharedUDPConn, 4096, logDiscard)
 		if err != nil {
 			return nil, err
 		}
@@ -376,7 +377,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) (
 			var conn net.Conn
 			dialer := &net.Dialer{LocalAddr: laddr}
 			if strings.HasPrefix(useNetwork, "tcp") {
-				dialer.Control = ControlTCP
+				dialer.Control = netx.ControlTCP
 				conn, err = dialer.DialContext(ctx, useNetwork, stunAddr)
 			} else {
 				conn, err = UDPDialer.DialContext(ctx, useNetwork, stunAddr)
