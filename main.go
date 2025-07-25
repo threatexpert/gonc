@@ -70,7 +70,7 @@ var (
 	useUNIXdomain     = flag.Bool("U", false, "Specifies to use UNIX-domain sockets.")
 	kcpEnabled        = flag.Bool("kcp", false, "use UDP+KCP protocol, -u can be omitted")
 	kcpSEnabled       = flag.Bool("kcps", false, "kcp server mode")
-	localbind         = flag.String("bind", "", "ip:port")
+	localbind         = flag.String("local", "", "ip:port")
 	remoteAddr        = flag.String("remote", "", "host:port")
 	progressEnabled   = flag.Bool("progress", false, "show transfer progress")
 	runCmd            = flag.String("exec", "", "runs a command for each connection")
@@ -101,7 +101,6 @@ func init() {
 	flag.StringVar(runCmd, "e", "", "alias for -exec")
 	flag.BoolVar(progressEnabled, "P", false, "alias for -progress")
 	flag.BoolVar(keepOpen, "k", false, "alias for -keep-open")
-	flag.StringVar(localbind, "local", "", "ip:port (alias for -bind)")
 	flag.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
 	flag.StringVar(&easyp2p.TopicExchangeWait, "mqtt-wait-topic", easyp2p.TopicExchangeWait, "")
 	flag.IntVar(&easyp2p.PunchingShortTTL, "punch-short-ttl", easyp2p.PunchingShortTTL, "")
@@ -665,7 +664,7 @@ func runDialMode(network, host, port string) {
 
 		if *useSTUN {
 			if *localbind == "" {
-				fmt.Fprintf(os.Stderr, "-stun need be with -bind while connecting\n")
+				fmt.Fprintf(os.Stderr, "-stun need be with -local while connecting\n")
 				os.Exit(1)
 			}
 			if err = ShowPublicIP(network, localAddr.String()); err != nil {
@@ -856,10 +855,6 @@ func conflictCheck() {
 	}
 	if *enablePty && *enableCRLF {
 		fmt.Fprintf(os.Stderr, "-pty and -C cannot be used together\n")
-		os.Exit(1)
-	}
-	if *proxyAddr != "" && *localbind != "" {
-		fmt.Fprintf(os.Stderr, "-bind and -x cannot be used together\n")
 		os.Exit(1)
 	}
 	if *proxyAddr != "" && *useSTUN {
