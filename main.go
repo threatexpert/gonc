@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.1"
+	VERSION                                              = "v2.1.2"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -376,11 +376,11 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 
 // configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
 func configureDNS() {
-	if *useDNS != "" {
-		setDns(*useDNS)
-	}
 	if isAndroid() {
 		setDns("8.8.8.8:53")
+	}
+	if *useDNS != "" {
+		setDns(*useDNS)
 	}
 }
 
