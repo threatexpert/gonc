@@ -132,6 +132,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if flag.NFlag() == 0 && flag.NArg() == 0 {
+		usage()
+		os.Exit(1)
+	}
+
 	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
 	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(flag.Args())
 	if err != nil {
