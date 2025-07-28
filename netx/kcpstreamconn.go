@@ -13,14 +13,15 @@ import (
 const maxFrameSize = 65535
 
 type KCPStreamConn struct {
-	sess        *kcp.UDPSession
-	writeMu     sync.Mutex
-	readMu      sync.Mutex
-	readBuf     []byte // 用于存储上一次Read调用未读完的帧数据，这是结构体自身拥有的缓冲区
-	readEOF     bool   // 是否收到 CloseWrite 帧
-	writeClosed bool   // 是否已发送过 CloseWrite
-	closeOnce   sync.Once
-	closeErr    error
+	sess           *kcp.UDPSession
+	writeMu        sync.Mutex
+	readMu         sync.Mutex
+	readBuf        []byte // 用于存储上一次Read调用未读完的帧数据，这是结构体自身拥有的缓冲区
+	readEOF        bool   // 是否收到 CloseWrite 帧
+	writeClosed    bool   // 是否已发送过 CloseWrite
+	writeCloseTime time.Time
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 // 帧缓冲池（用于 write 和 read）
@@ -138,7 +139,7 @@ func (c *KCPStreamConn) CloseWrite() error {
 		return nil
 	}
 	c.writeClosed = true
-
+	c.writeCloseTime = time.Now()
 	// 发送一个2字节，值为0的帧
 	_, err := c.sess.Write([]byte{0x00, 0x00})
 	return err
@@ -148,7 +149,11 @@ func (c *KCPStreamConn) CloseWrite() error {
 func (c *KCPStreamConn) Close() error {
 	c.closeOnce.Do(func() {
 		_ = c.CloseWrite()
-		time.Sleep(1500 * time.Millisecond) // 等待一段时间，希望 CloseWrite 被处理
+		const minWait = 1500 * time.Millisecond
+		waited := time.Since(c.writeCloseTime)
+		if waited < minWait {
+			time.Sleep(minWait - waited)
+		}
 		c.closeErr = c.sess.Close()
 	})
 	return c.closeErr
