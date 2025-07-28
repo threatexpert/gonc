@@ -120,9 +120,10 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
 ### gonc如何建立P2P？
 
- - 使用多个STUN服务探测TCP和UDP的NAT地址并研判NAT类型
- - 两端基于SessionKey的hash作为MQTT共同话题，基于MQTT协议交换地址信息
- - 优先尝试TCP相互直连，如果双方都有IPv6地址则优先用IPv6，最后才用UDP4
+ - 并发使用多个公用 STUN 服务，探测本地的 TCP / UDP NAT 映射，并智能识别 NAT 类型
+ - 通过基于 SessionKey 派生的哈希作为 MQTT 共享话题，借助公用 MQTT 服务安全交换地址信息
+ - 按优先级顺序尝试直连：IPv6 TCP > IPv4 TCP > IPv4 UDP，尽可能实现真正的点对点通信
+ - 没用设立中转服务器，不提供备用转发模式：要么连接失败，要么成功就是真的P2P
 
 ### gonc的NAT穿透成功率如何？
 
