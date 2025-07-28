@@ -115,3 +115,37 @@ README in [English](./README_en.md) and [中文](./README.md)
     On the other side, use `:pf` (built-in port forwarding command) to convert Socks5 over TLS to standard Socks5, providing local client access on 127.0.0.1:3080:
 
     `gonc.exe -e ":pf -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+
+## P2P NAT Traversal Capabilities
+### How does gonc establish a P2P connection?
+
+ - Concurrently uses multiple public STUN servers to detect local TCP/UDP NAT mappings and intelligently determine NAT type
+ - Exchanges address information securely via public MQTT servers, using a hash derived from the SessionKey as the shared topic
+ - Attempts direct connection in the following priority order: IPv6 TCP > IPv4 TCP > IPv4 UDP, aiming for true peer-to-peer communication
+ - No relay servers are used, and no fallback mechanisms are provided — either the connection fails, or it's a real P2P success
+
+### How effective is gonc at NAT traversal?
+
+#### Except in symmetric NAT scenarios on both ends, gonc achieves a very high success rate
+
+gonc classifies NAT types into three categories:
+
+ 1. Easy: A single internal port maps to the same external port across multiple STUN servers
+
+ 2. Hard: A single internal port maps to a consistent but different external port across STUN servers — harder than type 1
+
+ 3. Symmetric: A single internal port maps to different external ports depending on the destination — the most difficult type
+
+To handle these NAT types, gonc employs several traversal strategies:
+
+ - Uses multiple STUN servers to detect NAT behavior and identify multi-exit IP scenarios
+
+ - Prefers IPv6 connections when both sides support it (e.g., TCP6-to-TCP6 direct dial)
+
+ - Both peers listen on TCP while simultaneously dialing each other to increase TCP hole punching success
+
+ - The peer with the easier NAT delays its initial UDP packet to avoid triggering port changes on the harder side
+
+ - The peer with the harder NAT sends UDP packets with a low TTL to reduce interference from the remote firewall
+
+ - As a last resort, uses a "birthday paradox" strategy: the harder side uses 600 random source ports, and the other side tries 600 random destination ports, increasing the chance of a successful UDP port collision
