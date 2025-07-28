@@ -938,6 +938,9 @@ func preinitBuiltinAppConfig() {
 			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
 			os.Exit(1)
 		}
+	} else if strings.HasPrefix(builtinApp, ":") {
+		fmt.Fprintf(os.Stderr, "Unknown built-in command: %s\n", builtinApp)
+		os.Exit(1)
 	}
 }
 
