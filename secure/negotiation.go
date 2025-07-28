@@ -478,9 +478,10 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	if strings.Contains(config.SecureLayer, "tls") {
 		mtu -= 60
 	}
+	mtu -= 2 //KCPStreamConn: len header
 	sess.SetMtu(mtu)
 
-	return sess
+	return netx.NewKCPStreamConn(sess)
 }
 
 func configTCPKeepalive(conn net.Conn, keepAlive int) {

@@ -1004,6 +1004,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			default:
 				if randomDstPort {
 					randDstPorts := generateRandomPorts(PunchingRandomPortCount)
+					netx.SetUDPTTL(uconn, ttl)
 					fmt.Fprintf(logWriter, "  ↑ Sending random dst ports hole-punching packets. TTL=%d; total=%d; ...", ttl, PunchingRandomPortCount)
 					for i := 0; i < PunchingRandomPortCount; i++ {
 						addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(randDstPorts[i]))

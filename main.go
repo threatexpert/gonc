@@ -51,6 +51,7 @@ var (
 	proxyAddr         = flag.String("x", "", "\"[options: -tls -psk] ip:port\" for proxy_address")
 	auth              = flag.String("auth", "", "user:password for proxy")
 	sendfile          = flag.String("send", "", "path to file to send (optional)")
+	sendsize          = flag.Int64("sendsize", 0, "size of file to send (optional, default is full file size)")
 	writefile         = flag.String("write", "", "write to file")
 	tlsEnabled        = flag.Bool("tls", false, "Enable TLS connection")
 	tlsServerMode     = flag.Bool("tlsserver", false, "force as TLS server while connecting")
@@ -376,11 +377,10 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 
 // configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
 func configureDNS() {
-	if isAndroid() {
-		setDns("8.8.8.8:53")
-	}
 	if *useDNS != "" {
 		setDns(*useDNS)
+	} else if isAndroid() {
+		setDns("8.8.8.8:53")
 	}
 }
 
@@ -937,18 +937,22 @@ func preinitBuiltinAppConfig() {
 }
 
 // 用于在数据传输时显示进度
-func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats) {
+func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64) {
 	bufsize := blocksize
 	if bufsize < 32*1024 {
-		bufsize = 32 * 1024 //reader的缓存可以大一些，提高性能
+		bufsize = 32 * 1024 // reader 缓冲区更大，提高吞吐
 	}
+
 	reader := src
 	if bufferedReader {
 		reader = bufio.NewReaderSize(src, bufsize)
-	} //udp的不能要用缓冲区积累包，否则读取的时候粘包就麻烦了
-	buf := make([]byte, blocksize) //buf的大小按用户指定的bufsize来，如果dst是UDP可以限制每个写入发出去的UDP的大小
+	} // UDP不能用bufio积包，会粘包
+
+	buf := make([]byte, blocksize)
 	var n int
 	var err, err1 error
+	var totalWritten int64
+
 	for {
 		n, err1 = reader.Read(buf)
 		if err1 != nil && err1 != io.EOF {
@@ -957,6 +961,17 @@ func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReade
 		}
 		if n == 0 {
 			break
+		}
+
+		// 判断是否超过最大传输限制
+		if maxBytes > 0 {
+			remaining := maxBytes - totalWritten
+			if remaining <= 0 {
+				break // 达到限制
+			}
+			if int64(n) > remaining {
+				n = int(remaining)
+			}
 		}
 
 		_, err = dst.Write(buf[:n])
@@ -968,6 +983,8 @@ func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReade
 		if stats != nil {
 			stats.Update(int64(n))
 		}
+		totalWritten += int64(n)
+
 		if err1 == io.EOF {
 			break
 		}
@@ -1132,6 +1149,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 	var binaryInputMode = false
 	var cmd *exec.Cmd
 	var err error
+	var maxSendBytes int64
 
 	if *sendfile != "" {
 		var file io.ReadCloser
@@ -1147,6 +1165,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 		defer file.Close()
 		input = file
 		binaryInputMode = true
+		maxSendBytes = *sendsize
 	}
 
 	if *writefile != "" {
@@ -1273,12 +1292,12 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), term_oldstat)
-				copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out)
+				copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out, 0)
 			} else {
 				copyCharDeviceWithProgress(nconn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out)
+			copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes)
 		}
 
 		time.Sleep(1 * time.Second)
@@ -1289,7 +1308,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(output, nconn, bufsize, !nconn.IsUDP, stats_in)
+		copyWithProgress(output, nconn, bufsize, !nconn.IsUDP, stats_in, 0)
 		time.Sleep(1 * time.Second)
 	}()
 

@@ -451,6 +451,8 @@ type UDPCustomDialer struct {
 	logger            *log.Logger // 添加日志器字段
 	acceptCh          chan net.Conn
 	listenerCloseOnce sync.Once
+	recentlyClosed    map[string]time.Time
+	cleanupTicker     *time.Ticker
 }
 
 // NewUDPCustomDialer 创建一个新的 UDPCustomDialer。
@@ -460,16 +462,19 @@ func NewUDPCustomDialer(localUDPConn *net.UDPConn, maxPacketSize int, logger *lo
 	}
 
 	d := &UDPCustomDialer{
-		conn:          localUDPConn,
-		conns:         make(map[string][]*UDPCustomConn),
-		maxPacketSize: maxPacketSize,
-		closed:        make(chan struct{}),
-		logger:        logger,                 // 注入日志器
-		acceptCh:      make(chan net.Conn, 5), // 缓冲接受连接的通道
+		conn:           localUDPConn,
+		conns:          make(map[string][]*UDPCustomConn),
+		maxPacketSize:  maxPacketSize,
+		closed:         make(chan struct{}),
+		logger:         logger,                 // 注入日志器
+		acceptCh:       make(chan net.Conn, 5), // 缓冲接受连接的通道
+		recentlyClosed: make(map[string]time.Time),
+		cleanupTicker:  time.NewTicker(30 * time.Second),
 	}
 
 	d.wg.Add(1)
 	go d.readLoop()
+	go d.cleanupRecentlyClosedLoop()
 	d.logger.Printf("UDPCustomDialer initialized on %s", localUDPConn.LocalAddr().String())
 	return d, nil
 }
@@ -614,6 +619,14 @@ func (d *UDPCustomDialer) readLoop() {
 				}
 			}
 		} else {
+
+			if closedAt, ok := d.recentlyClosed[remoteAddrStr]; ok {
+				if time.Since(closedAt) < 10*time.Second {
+					d.logger.Printf("Ignoring packet from %s as connection was recently closed (%v ago).", remoteAddrStr, time.Since(closedAt))
+					continue
+				}
+			}
+
 			// **核心修改：当没有匹配的连接时，尝试被动建立一个连接**
 			d.logger.Printf("No custom connections found for received data from %s. Attempting to accept a new connection.", remoteAddrStr)
 
@@ -703,6 +716,7 @@ func (d *UDPCustomDialer) removeConn(remoteAddrStr string, connToRemove *UDPCust
 	defer d.mu.Unlock()
 
 	if conns, ok := d.conns[remoteAddrStr]; ok {
+		d.recentlyClosed[remoteAddrStr] = time.Now()
 		var updatedConns []*UDPCustomConn
 		for _, conn := range conns {
 			if conn != connToRemove {
@@ -749,6 +763,25 @@ func (d *UDPCustomDialer) Close() error {
 	d.wg.Wait()
 	d.logger.Printf("UDPCustomDialer closed successfully.")
 	return err
+}
+
+func (d *UDPCustomDialer) cleanupRecentlyClosedLoop() {
+	for {
+		select {
+		case <-d.cleanupTicker.C:
+			now := time.Now()
+			d.mu.Lock()
+			for addr, t := range d.recentlyClosed {
+				if now.Sub(t) > 10*time.Second {
+					delete(d.recentlyClosed, addr)
+				}
+			}
+			d.mu.Unlock()
+		case <-d.closed:
+			d.cleanupTicker.Stop()
+			return
+		}
+	}
 }
 
 // newTimeoutError (保持不变)
