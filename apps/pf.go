@@ -52,7 +52,7 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	fs.BoolVar(&config.KcpWithUDP, "kcp", false, "KCP over udp")
 
 	fs.StringVar(&config.PresharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM); also key for TCP/KCP encryption")
-	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip)")
+	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip or ip:port)")
 	fs.StringVar(&config.ProxyProt, "X", "", `Proxy protocol. Supported protocols are "5" (SOCKS v.5) and "connect"`)
 	fs.StringVar(&config.ProxyAddress, "x", "", "ip:port for proxy address")
 	fs.StringVar(&config.ProxyAuth, "auth", "", "user:password for proxy")
@@ -224,15 +224,22 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 			return
 		}
 	} else {
+		address = config.Localbind //假设是带端口号的
+		_, _, err = net.SplitHostPort(config.Localbind)
+		if err != nil {
+			// 如果没有端口号，使用默认端口0
+			address = net.JoinHostPort(config.Localbind, "0")
+		}
+
 		switch {
 		case strings.HasPrefix(config.Network, "tcp"):
-			localAddr, err = net.ResolveTCPAddr(config.Network, net.JoinHostPort(config.Localbind, "0"))
+			localAddr, err = net.ResolveTCPAddr(config.Network, address)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error ResolveTCPAddr: %v\n", err)
 				return
 			}
 		case strings.HasPrefix(config.Network, "udp"):
-			localAddr, err = net.ResolveUDPAddr(config.Network, net.JoinHostPort(config.Localbind, "0"))
+			localAddr, err = net.ResolveUDPAddr(config.Network, address)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error ResolveUDPAddr: %v\n", err)
 				return

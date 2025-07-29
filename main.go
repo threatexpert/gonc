@@ -101,6 +101,8 @@ var (
 	appMuxSocksMode   = flag.Bool("socks5server", false, "for socks5 tunnel")
 	disableCompress   = flag.Bool("no-compress", false, "disable compression for http download")
 	fileACL           = flag.String("acl", "", "ACL file for inbound/outbound connections")
+	plainTransport    = flag.Bool("plain", false, "use plain TCP/UDP without TLS/KCP/Encryption for P2P")
+	framedStdio       = flag.Bool("framed", false, "stdin/stdout is framed stream (2 bytes length prefix for each frame)")
 )
 
 func init() {
@@ -1206,6 +1208,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 	// 默认使用标准输入输出
 	var input io.ReadCloser = os.Stdin
 	var output io.WriteCloser = os.Stdout
+	var cmdErrorPipe io.ReadCloser
 	var binaryInputMode = false
 	var cmd *exec.Cmd
 	var err error
@@ -1354,6 +1357,12 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 				return
 			}
 
+			cmdErrorPipe, err = cmd.StderrPipe()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating stderr pipe: %v\n", err)
+				return
+			}
+
 			input = stdoutPipe
 			output = stdinPipe
 
@@ -1362,7 +1371,16 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 				fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
 				return
 			}
+			//fmt.Fprintf(os.Stderr, "PID:%d child created.\n", cmd.Process.Pid)
 		}
+	}
+
+	if *framedStdio {
+		fc := netx.NewFramedConn(input, output)
+		input = fc
+		output = fc
+		//framed了，表示进来的数据流本身是有边界的，拷贝时就blocksize就按缓冲区最大能力拷贝
+		blocksize = bufsize
 	}
 
 	var wg sync.WaitGroup
@@ -1405,6 +1423,13 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 		time.Sleep(1 * time.Second)
 	}()
 
+	if cmdErrorPipe != nil {
+		go func() {
+			io.Copy(os.Stderr, cmdErrorPipe)
+			//fmt.Fprintf(os.Stderr, "PID:%d ErrorPipe routine completed.\n", os.Getpid())
+		}()
+	}
+
 	go func() {
 		wg.Wait()
 		close(done)
@@ -1419,22 +1444,25 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 	}
 	select {
 	case <-abort:
-		//fmt.Fprintf(os.Stderr, "Input routine completed.\n")
+		//fmt.Fprintf(os.Stderr, "PID:%d Input routine completed.\n", os.Getpid())
 	case <-done:
-		//fmt.Fprintf(os.Stderr, "All routines completed.\n")
+		//fmt.Fprintf(os.Stderr, "PID:%d All routines completed.\n", os.Getpid())
 	case <-time.After(60 * time.Second):
-		//fmt.Fprintf(os.Stderr, "Timeout after one routine exited.\n")
+		//fmt.Fprintf(os.Stderr, "PID:%d Timeout after one routine exited.\n", os.Getpid())
 	}
 
+	//fmt.Fprintf(os.Stderr, "PID:%d closing nconn...\n", os.Getpid())
 	nconn.Close()
 	if term_oldstat != nil {
 		term.Restore(int(os.Stdin.Fd()), term_oldstat)
 	}
 	// 如果使用了命令，等待命令结束
 	if cmd != nil {
+		//fmt.Fprintf(os.Stderr, "PID:%d killing cmd process...\n", os.Getpid())
 		cmd.Process.Kill()
 		cmd.Wait()
 	}
+	//fmt.Fprintf(os.Stderr, "PID:%d connection done.\n", os.Getpid())
 }
 
 func handleSingleConnection(conn net.Conn) {
@@ -1551,20 +1579,25 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 		return nil, err
 	}
 	conn := connInfo.Conns[0]
-	config := *connConfig
-	config.Key = sessionKey
-	config.KeyType = "PSK"
-	config.IsClient = connInfo.IsClient
-
-	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-		config.KcpWithUDP = true
-		config.SecureLayer = "dtls"
+	config := secure.NewNegotiationConfig()
+	if *plainTransport {
+		config.IsClient = connInfo.IsClient
 	} else {
-		config.KcpWithUDP = false
-		config.SecureLayer = "tls13"
+		*config = *connConfig
+		config.Key = sessionKey
+		config.KeyType = "PSK"
+		config.IsClient = connInfo.IsClient
+
+		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+			config.KcpWithUDP = true
+			config.SecureLayer = "dtls"
+		} else {
+			config.KcpWithUDP = false
+			config.SecureLayer = "tls13"
+		}
 	}
 
-	nconn, err := secure.DoNegotiation(&config, conn, os.Stderr)
+	nconn, err := secure.DoNegotiation(config, conn, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

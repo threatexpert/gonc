@@ -6,14 +6,13 @@ import (
 	"net"
 	"sync"
 	"time"
-
-	"github.com/xtaci/kcp-go/v5"
 )
 
 const maxFrameSize = 65535
 
-type KCPStreamConn struct {
-	sess           *kcp.UDPSession
+type FramedConn struct {
+	sessR          io.ReadCloser
+	sessW          io.WriteCloser
 	writeMu        sync.Mutex
 	readMu         sync.Mutex
 	readBuf        []byte // 用于存储上一次Read调用未读完的帧数据，这是结构体自身拥有的缓冲区
@@ -33,13 +32,13 @@ var framePool = sync.Pool{
 	},
 }
 
-// NewKCPStreamConn 将一个 kcp 会话包装成一个带帧的全双工流
-func NewKCPStreamConn(sess *kcp.UDPSession) *KCPStreamConn {
-	return &KCPStreamConn{sess: sess}
+// NewFramedConn 将一个会话包装成一个带帧的全双工流
+func NewFramedConn(r io.ReadCloser, w io.WriteCloser) *FramedConn {
+	return &FramedConn{sessR: r, sessW: w}
 }
 
 // Write 将 p 的内容分块写入帧中，并重用缓冲区
-func (c *KCPStreamConn) Write(p []byte) (int, error) {
+func (c *FramedConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
@@ -62,7 +61,7 @@ func (c *KCPStreamConn) Write(p []byte) (int, error) {
 		binary.LittleEndian.PutUint16(frame[:2], uint16(n))
 		copy(frame[2:], chunk)
 
-		_, err := c.sess.Write(frame)
+		_, err := c.sessW.Write(frame)
 
 		// 将原始的指针放回池中，无额外分配
 		framePool.Put(bufPtr)
@@ -78,7 +77,7 @@ func (c *KCPStreamConn) Write(p []byte) (int, error) {
 
 // Read 读取带帧的流数据，内部进行缓冲
 // 修复了并发安全问题
-func (c *KCPStreamConn) Read(p []byte) (int, error) {
+func (c *FramedConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
@@ -97,7 +96,7 @@ func (c *KCPStreamConn) Read(p []byte) (int, error) {
 	// 3. 内部缓冲区已空，需要从底层连接读取一个新帧
 	// 读取帧长度
 	var lenBuf [2]byte
-	if _, err := io.ReadFull(c.sess, lenBuf[:]); err != nil {
+	if _, err := io.ReadFull(c.sessR, lenBuf[:]); err != nil {
 		return 0, err
 	}
 	size := binary.LittleEndian.Uint16(lenBuf[:])
@@ -113,7 +112,7 @@ func (c *KCPStreamConn) Read(p []byte) (int, error) {
 	defer framePool.Put(bufPtr)
 
 	frameData := (*bufPtr)[:size]
-	_, err := io.ReadFull(c.sess, frameData)
+	_, err := io.ReadFull(c.sessR, frameData)
 	if err != nil {
 		return 0, err
 	}
@@ -131,7 +130,7 @@ func (c *KCPStreamConn) Read(p []byte) (int, error) {
 }
 
 // CloseWrite 发送一个长度为0的帧来通知远端EOF
-func (c *KCPStreamConn) CloseWrite() error {
+func (c *FramedConn) CloseWrite() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
@@ -141,12 +140,12 @@ func (c *KCPStreamConn) CloseWrite() error {
 	c.writeClosed = true
 	c.writeCloseTime = time.Now()
 	// 发送一个2字节，值为0的帧
-	_, err := c.sess.Write([]byte{0x00, 0x00})
+	_, err := c.sessW.Write([]byte{0x00, 0x00})
 	return err
 }
 
 // Close 关闭双向连接
-func (c *KCPStreamConn) Close() error {
+func (c *FramedConn) Close() error {
 	c.closeOnce.Do(func() {
 		_ = c.CloseWrite()
 		const minWait = 1500 * time.Millisecond
@@ -154,14 +153,53 @@ func (c *KCPStreamConn) Close() error {
 		if waited < minWait {
 			time.Sleep(minWait - waited)
 		}
-		c.closeErr = c.sess.Close()
+		c.closeErr = c.sessW.Close()
 	})
 	return c.closeErr
 }
 
 // --- standard net.Conn methods ---
-func (c *KCPStreamConn) LocalAddr() net.Addr                { return c.sess.LocalAddr() }
-func (c *KCPStreamConn) RemoteAddr() net.Addr               { return c.sess.RemoteAddr() }
-func (c *KCPStreamConn) SetDeadline(t time.Time) error      { return c.sess.SetDeadline(t) }
-func (c *KCPStreamConn) SetReadDeadline(t time.Time) error  { return c.sess.SetReadDeadline(t) }
-func (c *KCPStreamConn) SetWriteDeadline(t time.Time) error { return c.sess.SetWriteDeadline(t) }
+func (c *FramedConn) LocalAddr() net.Addr {
+	if conn, ok := c.sessW.(net.Conn); ok {
+		return conn.LocalAddr()
+	}
+	return nil
+}
+
+func (c *FramedConn) RemoteAddr() net.Addr {
+	if conn, ok := c.sessW.(net.Conn); ok {
+		return conn.RemoteAddr()
+	}
+	return nil
+}
+
+func (c *FramedConn) SetDeadline(t time.Time) error {
+	var err error
+	if conn, ok := c.sessR.(net.Conn); ok {
+		err = conn.SetDeadline(t)
+		if err != nil {
+			return err
+		}
+	}
+	if conn, ok := c.sessW.(net.Conn); ok {
+		err = conn.SetDeadline(t)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *FramedConn) SetReadDeadline(t time.Time) error {
+	if conn, ok := c.sessR.(net.Conn); ok {
+		return conn.SetReadDeadline(t)
+	}
+	return nil
+}
+
+func (c *FramedConn) SetWriteDeadline(t time.Time) error {
+	if conn, ok := c.sessW.(net.Conn); ok {
+		return conn.SetWriteDeadline(t)
+	}
+	return nil
+}

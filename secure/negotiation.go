@@ -481,7 +481,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	mtu -= 2 //KCPStreamConn: len header
 	sess.SetMtu(mtu)
 
-	return netx.NewKCPStreamConn(sess)
+	return netx.NewFramedConn(sess, sess)
 }
 
 func configTCPKeepalive(conn net.Conn, keepAlive int) {
