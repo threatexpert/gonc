@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.3"
+	VERSION                                              = "v2.1.4"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -116,7 +116,7 @@ func init() {
 	flag.BoolVar(appMuxListenMode, "socks5local", false, "")
 	flag.StringVar(appMuxListenOn, "socks5local-port", "", "")
 	flag.BoolVar(appMuxListenMode, "browser", false, "alias for -httplocal")
-	flag.IntVar(&secure.KeepAlive, "keepalive", secure.KeepAlive, "none 0 will enable TCP keepalive feature")
+	flag.IntVar(&secure.KeepAlive, "keepalive", secure.KeepAlive, "none 0 will enable keepalive feature")
 	flag.IntVar(&secure.UdpOutputBlockSize, "udp-size", secure.UdpOutputBlockSize, "")
 	flag.IntVar(&secure.KcpWindowSize, "kcp-window-size", secure.KcpWindowSize, "")
 	flag.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")

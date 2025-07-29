@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/threatexpert/gonc/v2/easyp2p"
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
@@ -27,6 +28,7 @@ type AppPFConfig struct {
 	ProxyAuth    string            // -auth 代理认证信息，格式为 username:password
 	KcpWithUDP   bool
 	SendData     string // 建立连接后发送的数据，会拼接\n
+	P2PSessKey   string
 }
 
 // AppPFConfigByArgs 解析给定的 []string 参数，生成 AppPFConfig
@@ -50,6 +52,7 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	fs.BoolVar(&isUdp, "u", false, "UDP socket")
 	fs.BoolVar(&isUnix, "U", false, "Use Unix socket")
 	fs.BoolVar(&config.KcpWithUDP, "kcp", false, "KCP over udp")
+	fs.StringVar(&config.P2PSessKey, "p2p", "", "P2P session key (or @file).")
 
 	fs.StringVar(&config.PresharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM); also key for TCP/KCP encryption")
 	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip or ip:port)")
@@ -133,30 +136,49 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		}
 	}
 
-	// 获取所有非标志参数（即位置参数）
-	positionalArgs := fs.Args()
+	if config.P2PSessKey == "" {
+		// 获取所有非标志参数（即位置参数）
+		positionalArgs := fs.Args()
 
-	// 处理 host/port 或 unix 路径
-	if config.Network == "unix" {
-		if len(positionalArgs) != 1 {
-			return nil, fmt.Errorf("expect one unix socket path for -U mode, got %d", len(positionalArgs))
-		}
-		config.Port = positionalArgs[0] // 对于Unix，port字段存储路径
-	} else {
-		if len(positionalArgs) == 1 {
-			if !strings.Contains(positionalArgs[0], ":") {
-				return nil, fmt.Errorf("expect host:port, got %s", positionalArgs[0])
+		// 处理 host/port 或 unix 路径
+		if config.Network == "unix" {
+			if len(positionalArgs) != 1 {
+				return nil, fmt.Errorf("expect one unix socket path for -U mode, got %d", len(positionalArgs))
 			}
-			config.Host, config.Port, err = net.SplitHostPort(positionalArgs[0])
-			if err != nil {
-				return nil, fmt.Errorf("parse host:port failed: %v", err)
-			}
-		} else if len(positionalArgs) == 2 {
-			config.Host = positionalArgs[0]
-			config.Port = positionalArgs[1]
+			config.Port = positionalArgs[0] // 对于Unix，port字段存储路径
 		} else {
-			return nil, fmt.Errorf("expect host and port, got %d arg", len(positionalArgs))
+			if len(positionalArgs) == 1 {
+				if !strings.Contains(positionalArgs[0], ":") {
+					return nil, fmt.Errorf("expect host:port, got %s", positionalArgs[0])
+				}
+				config.Host, config.Port, err = net.SplitHostPort(positionalArgs[0])
+				if err != nil {
+					return nil, fmt.Errorf("parse host:port failed: %v", err)
+				}
+			} else if len(positionalArgs) == 2 {
+				config.Host = positionalArgs[0]
+				config.Port = positionalArgs[1]
+			} else {
+				return nil, fmt.Errorf("expect host and port, got %d arg", len(positionalArgs))
+			}
 		}
+	} else {
+		config.Network = "any"
+		if isUdp {
+			config.Network = "udp"
+		}
+		if is4 {
+			config.Network += "4"
+		} else if is6 {
+			config.Network += "6"
+		}
+		if strings.HasPrefix(config.P2PSessKey, "@") {
+			config.P2PSessKey, err = secure.ReadPSKFile(config.P2PSessKey)
+			if err != nil {
+				return nil, fmt.Errorf("error reading PSK file: %v", err)
+			}
+		}
+		config.PresharedKey = config.P2PSessKey
 	}
 
 	// 若启用 TLS 或 PSK，加载证书
@@ -210,50 +232,63 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	var err error
 	var targetConn net.Conn
 	ntconfig := secure.NewNegotiationConfig()
-	ntconfig.IsClient = true
 
-	if config.Localbind == "" {
-		dialer, err := NewProxyClient(&config.ProxyConfig)
+	if config.P2PSessKey != "" {
+		//p2p mode
+		connInfo, err := easyp2p.Easy_P2P(config.Network, config.P2PSessKey, os.Stderr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error CreateProxyClient: %v\n", err)
+			fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 			return
 		}
-		targetConn, err = dialer.DialTimeout(config.Network, address, time.Duration(timeout_sec)*time.Second)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error DialTimeout: %v\n", err)
-			return
-		}
+		targetConn = connInfo.Conns[0]
+		ntconfig.IsClient = connInfo.IsClient
 	} else {
-		address = config.Localbind //假设是带端口号的
-		_, _, err = net.SplitHostPort(config.Localbind)
-		if err != nil {
-			// 如果没有端口号，使用默认端口0
-			address = net.JoinHostPort(config.Localbind, "0")
-		}
+		//dial mode
+		ntconfig.IsClient = true
 
-		switch {
-		case strings.HasPrefix(config.Network, "tcp"):
-			localAddr, err = net.ResolveTCPAddr(config.Network, address)
+		if config.Localbind == "" {
+			dialer, err := NewProxyClient(&config.ProxyConfig)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error ResolveTCPAddr: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error CreateProxyClient: %v\n", err)
 				return
 			}
-		case strings.HasPrefix(config.Network, "udp"):
-			localAddr, err = net.ResolveUDPAddr(config.Network, address)
+			targetConn, err = dialer.DialTimeout(config.Network, address, time.Duration(timeout_sec)*time.Second)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error ResolveUDPAddr: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error DialTimeout: %v\n", err)
 				return
 			}
-		}
-		dialer := &net.Dialer{
-			LocalAddr: localAddr,
-		}
-		ctx2, cancel2 := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
-		defer cancel2()
-		targetConn, err = dialer.DialContext(ctx2, config.Network, net.JoinHostPort(config.Host, config.Port))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error Dial: %v\n", err)
-			return
+		} else {
+			address = config.Localbind //假设是带端口号的
+			_, _, err = net.SplitHostPort(config.Localbind)
+			if err != nil {
+				// 如果没有端口号，使用默认端口0
+				address = net.JoinHostPort(config.Localbind, "0")
+			}
+
+			switch {
+			case strings.HasPrefix(config.Network, "tcp"):
+				localAddr, err = net.ResolveTCPAddr(config.Network, address)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error ResolveTCPAddr: %v\n", err)
+					return
+				}
+			case strings.HasPrefix(config.Network, "udp"):
+				localAddr, err = net.ResolveUDPAddr(config.Network, address)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error ResolveUDPAddr: %v\n", err)
+					return
+				}
+			}
+			dialer := &net.Dialer{
+				LocalAddr: localAddr,
+			}
+			ctx2, cancel2 := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
+			defer cancel2()
+			targetConn, err = dialer.DialContext(ctx2, config.Network, net.JoinHostPort(config.Host, config.Port))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error Dial: %v\n", err)
+				return
+			}
 		}
 	}
 
@@ -270,7 +305,7 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 		ntconfig.TlsSNI = config.Host
 	}
 
-	if strings.HasPrefix(config.Network, "udp") {
+	if strings.HasPrefix(targetConn.RemoteAddr().Network(), "udp") {
 		ntconfig.KcpWithUDP = config.KcpWithUDP
 		if config.TlsEnabled {
 			ntconfig.SecureLayer = "dtls"
@@ -287,7 +322,12 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 		}
 	}
 
-	nconn, err := secure.DoNegotiation(ntconfig, targetConn, io.Discard)
+	logWriter := io.Discard
+	if config.P2PSessKey != "" {
+		logWriter = os.Stderr
+	}
+
+	nconn, err := secure.DoNegotiation(ntconfig, targetConn, logWriter)
 	if err == nil {
 		defer nconn.Close()
 

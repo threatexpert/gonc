@@ -206,6 +206,13 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 			}
 			if !isWrappered {
 				pktconn := netx.NewPacketConnWrapper(nconn.ConnLayers[0], nconn.ConnLayers[0].RemoteAddr())
+
+				if cfg.KeepAlive > 0 {
+					startUDPKeepAlive(ctx, pktconn, nconn.ConnLayers[0].RemoteAddr(),
+						[]byte(cfg.UdpKeepAlivePayload),
+						time.Duration(cfg.KeepAlive)*time.Second, make(chan time.Duration, 1))
+				}
+
 				buconn := netx.NewBoundUDPConn(pktconn, nconn.ConnLayers[0].RemoteAddr().String(), false)
 				buconn.SetIdleTimeout(time.Duration(cfg.UDPIdleTimeoutSecond) * time.Second)
 				nconn.ConnLayers = append([]net.Conn{buconn}, nconn.ConnLayers...)
