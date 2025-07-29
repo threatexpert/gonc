@@ -36,15 +36,20 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.2"
+	VERSION                                              = "v2.1.3"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
 
+	app_mux_args      string
 	app_mux_Config    *apps.AppMuxConfig
+	app_s5s_args      string
 	app_s5s_Config    *apps.AppS5SConfig
+	app_pf_args       string
 	app_pf_Config     *apps.AppPFConfig
 	arg_proxyc_Config *apps.ProxyClientConfig
+	app_sh_args       string
+	app_sh_Config     *apps.PtyShellConfig
 	accessControl     *acl.ACL
 	// 定义命令行参数
 	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
@@ -75,9 +80,9 @@ var (
 	remoteAddr        = flag.String("remote", "", "host:port")
 	progressEnabled   = flag.Bool("progress", false, "show transfer progress")
 	runCmd            = flag.String("exec", "", "runs a command for each connection")
-	mergeStderr       = flag.Bool("stderr", false, "when -exec, Merge stderr into stdout ")
+	remoteCall        = flag.String("call", "", "send a string with LF for each connection")
 	keepOpen          = flag.Bool("keep-open", false, "keep listening after client disconnects")
-	enablePty         = flag.Bool("pty", false, "<-exec> will run in a pseudo-terminal, and put the terminal into raw mode")
+	enablePty         = flag.Bool("pty", false, "put the terminal into raw mode")
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
 	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
@@ -115,6 +120,10 @@ func init() {
 	flag.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")
 	flag.StringVar(&apps.VarmuxEngine, "mux-engine", apps.VarmuxEngine, "yamux | smux")
 	apps.VarhttpDownloadNoCompress = disableCompress
+	flag.StringVar(&app_mux_args, ":mux", "-", "enable and config :mux for dynamic service")
+	flag.StringVar(&app_s5s_args, ":s5s", "-", "enable and config :s5s for dynamic service")
+	flag.StringVar(&app_pf_args, ":pf", "-", "enable and config :pf for dynamic service")
+	flag.StringVar(&app_sh_args, ":sh", "-", "enable and config :sh for dynamic service")
 }
 
 func main() {
@@ -218,8 +227,41 @@ func configureAppMode() {
 		*keepOpen = true
 	}
 
-	if *runCmd != "" {
-		preinitBuiltinAppConfig()
+	if *runCmd != "" && *runCmd != ":service" {
+		err := preinitBuiltinAppConfig(*runCmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if app_mux_args != "-" {
+			err := preinitBuiltinAppConfig(":mux " + app_mux_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
+		if app_s5s_args != "-" {
+			err := preinitBuiltinAppConfig(":s5s " + app_s5s_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
+		if app_pf_args != "-" {
+			err := preinitBuiltinAppConfig(":pf " + app_pf_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
+		if app_sh_args != "-" {
+			err := preinitBuiltinAppConfig(":sh " + app_sh_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
 	}
 
 	if *proxyAddr != "" {
@@ -839,6 +881,8 @@ func usage_full() {
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":mux", "Stream-multiplexing proxy")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":s5s", "SOCKS5 server")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":pf", "Port forwarding")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":sh", "pseudo-terminal shell")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":service", "dynamic service mode, clients can use -call to invoke the above configured and enabled services.")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "To get help for a built-in command, run:")
 	fmt.Fprintln(os.Stderr, "  gonc -e \":pf -h\"")
@@ -904,44 +948,52 @@ func conflictCheck() {
 	}
 }
 
-func preinitBuiltinAppConfig() {
-	args, err := parseCommandLine(*runCmd)
+func preinitBuiltinAppConfig(commandline string) error {
+	args, err := parseCommandLine(commandline)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing command: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error parsing command: %w", err)
 	}
 
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Empty command\n")
-		os.Exit(1)
+		return fmt.Errorf("empty command")
 	}
 
+	var usage func()
 	builtinApp := args[0]
-	if builtinApp == ":mux" {
+	switch builtinApp {
+	case ":mux":
 		app_mux_Config, err = apps.AppMuxConfigByArgs(args[1:])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
-			apps.App_mux_usage()
-			os.Exit(1)
+			usage = apps.App_mux_usage
+		} else {
+			app_mux_Config.AccessCtrl = accessControl
 		}
-		app_mux_Config.AccessCtrl = accessControl
-	} else if builtinApp == ":s5s" {
+	case ":s5s":
 		app_s5s_Config, err = apps.AppS5SConfigByArgs(args[1:])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
-			os.Exit(1)
+		if err == nil {
+			app_s5s_Config.AccessCtrl = accessControl
 		}
-		app_s5s_Config.AccessCtrl = accessControl
-	} else if builtinApp == ":pf" {
+	case ":pf":
 		app_pf_Config, err = apps.AppPFConfigByArgs(args[1:])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error init %s config: %v\n", builtinApp, err)
-			os.Exit(1)
+	case ":sh":
+		app_sh_Config, err = apps.PtyShellConfigByArgs(args[1:])
+	case ":service":
+	default:
+		if strings.HasPrefix(builtinApp, ":") {
+			return fmt.Errorf("unknown built-in command: %s", builtinApp)
 		}
-	} else if strings.HasPrefix(builtinApp, ":") {
-		fmt.Fprintf(os.Stderr, "Unknown built-in command: %s\n", builtinApp)
-		os.Exit(1)
+		return nil // not a built-in app, let caller handle it
 	}
+
+	if err != nil {
+		msg := fmt.Sprintf("error init %s config: %v", builtinApp, err)
+		if usage != nil {
+			usage()
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	return nil
 }
 
 // 用于在数据传输时显示进度
@@ -1198,10 +1250,35 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 		output = file
 	}
 
-	if *runCmd != "" {
+	serviceCommand := strings.TrimSpace(*runCmd)
+	if serviceCommand == ":service" {
+		nconn.SetDeadline(time.Now().Add(15 * time.Second))
+		line, err := apps.ReadString(nconn, '\n')
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error ReadString: %v\n", err)
+			return
+		}
+		nconn.SetDeadline(time.Time{})
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, ":") {
+			fmt.Fprintf(os.Stderr, "Invalid service command: %s\n", line)
+			return
+		}
+		serviceCommand = line
+	}
+
+	if *remoteCall != "" {
+		_, err = nconn.Write([]byte(*remoteCall + "\n"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error Sending: %v\n", err)
+			return
+		}
+	}
+
+	if serviceCommand != "" {
 		binaryInputMode = true
 		// 分割命令和参数（支持带空格的参数）
-		args, err := parseCommandLine(*runCmd)
+		args, err := parseCommandLine(serviceCommand)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing command: %v\n", err)
 			return
@@ -1214,18 +1291,30 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 
 		builtinApp := args[0]
 		if builtinApp == ":mux" {
+			if app_mux_Config == nil {
+				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
+				return
+			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go apps.App_mux_main_withconfig(pipeConn, app_mux_Config)
 		} else if builtinApp == ":s5s" {
+			if app_s5s_Config == nil {
+				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
+				return
+			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go apps.App_s5s_main_withconfig(pipeConn, app_s5s_Config)
 		} else if builtinApp == ":pf" {
+			if app_pf_Config == nil {
+				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
+				return
+			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
 			output = pipeConn.Out
@@ -1235,47 +1324,43 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 				blocksize = bufsize
 			}
 			go apps.App_pf_main_withconfig(pipeConn, app_pf_Config)
+		} else if builtinApp == ":sh" {
+			if app_sh_Config == nil {
+				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
+				return
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go apps.App_shell_main_withconfig(pipeConn, app_sh_Config)
+		} else if strings.HasPrefix(builtinApp, ":") {
+			fmt.Fprintf(os.Stderr, "Invalid service command: %s\n", builtinApp)
+			return
 		} else {
-
 			// 创建命令
 			cmd = exec.Command(args[0], args[1:]...)
 
-			if *enablePty {
-				ptmx, err := misc.PtyStart(cmd)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to start pty: %v", err)
-					return
-				}
-				input = ptmx
-				output = ptmx
-			} else {
-				// 创建管道
-				stdinPipe, err := cmd.StdinPipe()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
-					return
-				}
+			// 创建管道
+			stdinPipe, err := cmd.StdinPipe()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
+				return
+			}
 
-				stdoutPipe, err := cmd.StdoutPipe()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
-					return
-				}
+			stdoutPipe, err := cmd.StdoutPipe()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
+				return
+			}
 
-				if *mergeStderr {
-					cmd.Stderr = cmd.Stdout
-				} else {
-					cmd.Stderr = os.Stderr
-				}
+			input = stdoutPipe
+			output = stdinPipe
 
-				input = stdoutPipe
-				output = stdinPipe
-
-				// 启动命令
-				if err := cmd.Start(); err != nil {
-					fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
-					return
-				}
+			// 启动命令
+			if err := cmd.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
+				return
 			}
 		}
 	}
@@ -1342,9 +1427,6 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 	}
 
 	nconn.Close()
-	if *enablePty && output != nil {
-		output.Close()
-	}
 	if term_oldstat != nil {
 		term.Restore(int(os.Stdin.Fd()), term_oldstat)
 	}

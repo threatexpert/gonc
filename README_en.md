@@ -36,7 +36,7 @@ README in [English](./README_en.md) and [中文](./README.md)
 ### Reverse Shell (Pseudo-Terminal Support for UNIX-like Systems)
 - Listener (does not use `-keep-open`, accepts only one connection; no authentication with `-psk`):
     ```bash
-    gonc -tls -pty -exec /bin/bash -l 1234
+    gonc -tls -exec ":sh /bin/bash" -l 1234
     ```
 - Connect to obtain a shell (supports TAB, Ctrl+C, etc.):
     ```bash
@@ -44,7 +44,7 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```
 - Use P2P for reverse shell (`randomString` is used for authentication, ensuring secure communication with TLS 1.3):
     ```bash
-    gonc -pty -exec /bin/bash -p2p randomString
+    gonc -exec ":sh /bin/bash" -p2p randomString
     ```
     On the other side:
     ```bash

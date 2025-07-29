@@ -26,6 +26,7 @@ type AppPFConfig struct {
 	ProxyConfig  ProxyClientConfig // 代理配置，包含认证信息等
 	ProxyAuth    string            // -auth 代理认证信息，格式为 username:password
 	KcpWithUDP   bool
+	SendData     string // 建立连接后发送的数据，会拼接\n
 }
 
 // AppPFConfigByArgs 解析给定的 []string 参数，生成 AppPFConfig
@@ -55,6 +56,8 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	fs.StringVar(&config.ProxyProt, "X", "", `Proxy protocol. Supported protocols are "5" (SOCKS v.5) and "connect"`)
 	fs.StringVar(&config.ProxyAddress, "x", "", "ip:port for proxy address")
 	fs.StringVar(&config.ProxyAuth, "auth", "", "user:password for proxy")
+	remoteCall := ""
+	fs.StringVar(&remoteCall, "call", "", "like :s5s or :pf")
 
 	// 设置自定义的 Usage 函数，当用户传递无效参数或请求帮助时显示
 	// 这里我们使用 App_pf_usage 函数的内容
@@ -163,6 +166,10 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error generating EC certificate: %v", err)
 		}
+	}
+
+	if remoteCall != "" {
+		config.SendData = remoteCall + "\n"
 	}
 
 	return config, nil
@@ -276,6 +283,11 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 	nconn, err := secure.DoNegotiation(ntconfig, targetConn, io.Discard)
 	if err == nil {
 		defer nconn.Close()
+
+		if config.SendData != "" {
+			nconn.Write([]byte(config.SendData))
+		}
+
 		handleProxy(conn, nconn.TopLayer)
 	}
 	fmt.Fprintf(os.Stderr, "Disconnected from: %s\n", targetConn.RemoteAddr().String())

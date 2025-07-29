@@ -36,7 +36,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 ### 反弹 Shell（类UNIX支持pseudo-terminal shell ）
 - 监听端（不使用 `-keep-open`，仅接受一次连接；未使用 `-psk`，无身份认证）：
     ```bash
-    gonc -tls -pty -exec /bin/bash -l 1234
+    gonc -tls -exec ":sh /bin/bash" -l 1234
     ```
 - 另一端连接获取 Shell（支持 TAB、Ctrl+C 等操作）：
     ```bash
@@ -44,7 +44,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     ```
 - 使用 P2P 方式反弹 Shell（`randomString` 用于身份认证，基于 TLS 1.3 实现安全通信）：
     ```bash
-    gonc -pty -exec /bin/bash -p2p randomString
+    gonc -exec ":sh /bin/bash" -p2p randomString
     ```
     另一端：
     ```bash
