@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
@@ -210,6 +211,40 @@ func BuildNTConfigFromPCConfig(config *ProxyClientConfig) *secure.NegotiationCon
 
 func IsSecureNegotiationNeeded(config *ProxyClientConfig) bool {
 	return config.TlsEnabled || config.KcpWithUDP || config.PresharedKey != ""
+}
+
+func ProxyClientConfigByCommandline(proxyProt, auth, commandline string) (*ProxyClientConfig, error) {
+	args, err := misc.ParseCommandLine(commandline)
+	if err != nil {
+		return nil, fmt.Errorf("parse command line failed: %v", err)
+	}
+	if len(args) == 0 {
+		return nil, fmt.Errorf("empty proxy args")
+	}
+
+	config, err := ProxyClientConfigByArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	switch proxyProt {
+	case "", "5", "socks5":
+		config.Prot = "socks5"
+	case "connect", "http":
+		config.Prot = "http"
+	default:
+		return nil, fmt.Errorf("invalid proxy protocol: %s", proxyProt)
+	}
+
+	if auth != "" {
+		authParts := strings.SplitN(auth, ":", 2)
+		if len(authParts) != 2 {
+			return nil, fmt.Errorf("invalid auth format: expected user:pass")
+		}
+		config.User, config.Pass = authParts[0], authParts[1]
+	}
+
+	return config, nil
 }
 
 func ProxyClientConfigByArgs(args []string) (*ProxyClientConfig, error) {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 
 	"crypto/tls"
@@ -20,7 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/apps"
@@ -267,42 +265,12 @@ func configureAppMode() {
 	}
 
 	if *proxyAddr != "" {
-		args, err := parseCommandLine(*proxyAddr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing -x proxy_address: %v\n", err)
-			os.Exit(1)
-		}
-
-		if len(args) == 0 {
-			fmt.Fprintf(os.Stderr, "Empty proxy_address\n")
-			os.Exit(1)
-		}
-
-		arg_proxyc_Config, err = apps.ProxyClientConfigByArgs(args)
+		xconfig, err := apps.ProxyClientConfigByCommandline(*proxyProt, *auth, *proxyAddr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init proxy config: %v\n", err)
 			os.Exit(1)
 		}
-
-		switch *proxyProt {
-		case "", "5":
-			arg_proxyc_Config.Prot = "socks5"
-		case "connect":
-			arg_proxyc_Config.Prot = "http"
-		default:
-			fmt.Fprintf(os.Stderr, "Invalid proxy protocol: %s\n", *proxyProt)
-			os.Exit(1)
-		}
-
-		if *auth != "" {
-			authParts := strings.SplitN(*auth, ":", 2)
-			if len(authParts) != 2 {
-				fmt.Fprintf(os.Stderr, "invalid auth format: expected user:pass\n")
-				os.Exit(1)
-			}
-			arg_proxyc_Config.User, arg_proxyc_Config.Pass = authParts[0], authParts[1]
-		}
-
+		arg_proxyc_Config = xconfig
 	}
 }
 
@@ -388,10 +356,8 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 			P2PSessionKey = *autoP2P
 			network = "any"
 			if *udpProtocol {
-				*kcpEnabled = true
 				network = "udp"
 			}
-			*tlsEnabled = true
 			if *useIPv4 {
 				network += "4"
 			} else if *useIPv6 {
@@ -413,7 +379,19 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 			} else if secure.IsWeakPassword(P2PSessionKey) {
 				return "", "", "", "", fmt.Errorf("weak password detected")
 			}
-			*presharedKey = P2PSessionKey
+			if !*plainTransport {
+				//没-plain的情况，P2P默认启用kcp tls
+				if *udpProtocol {
+					*kcpEnabled = true
+				}
+				*tlsEnabled = true
+				*presharedKey = P2PSessionKey
+			}
+			if isTLSEnabled() {
+				if *presharedKey == "" {
+					*presharedKey = P2PSessionKey
+				}
+			}
 		} else {
 			return "", "", "", "", fmt.Errorf("not enough arguments")
 		}
@@ -951,7 +929,7 @@ func conflictCheck() {
 }
 
 func preinitBuiltinAppConfig(commandline string) error {
-	args, err := parseCommandLine(commandline)
+	args, err := misc.ParseCommandLine(commandline)
 	if err != nil {
 		return fmt.Errorf("error parsing command: %w", err)
 	}
@@ -1092,50 +1070,6 @@ func copyCharDeviceWithProgress(dst io.Writer, src io.Reader, stats *misc.Progre
 			break
 		}
 	}
-}
-
-func parseCommandLine(command string) ([]string, error) {
-	var args []string
-	var buffer bytes.Buffer
-	var inQuotes bool
-	var escape bool
-
-	for _, r := range command {
-		switch {
-		case escape:
-			buffer.WriteRune(r)
-			escape = false
-		case r == '\\':
-			escape = true
-		case r == '"':
-			inQuotes = !inQuotes
-		case !inQuotes && unicode.IsSpace(r):
-			if buffer.Len() > 0 {
-				args = append(args, buffer.String())
-				buffer.Reset()
-			}
-		default:
-			buffer.WriteRune(r)
-		}
-	}
-
-	if buffer.Len() > 0 {
-		args = append(args, buffer.String())
-	}
-
-	if inQuotes {
-		return nil, fmt.Errorf("unclosed quote in command line")
-	}
-
-	if args[0] == "." {
-		exePath, err := os.Executable()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get executable path")
-		}
-		args[0] = exePath
-	}
-
-	return args, nil
 }
 
 func preinitNegotiationConfig() *secure.NegotiationConfig {
@@ -1281,7 +1215,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 	if serviceCommand != "" {
 		binaryInputMode = true
 		// 分割命令和参数（支持带空格的参数）
-		args, err := parseCommandLine(serviceCommand)
+		args, err := misc.ParseCommandLine(serviceCommand)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing command: %v\n", err)
 			return
@@ -1579,11 +1513,10 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 		return nil, err
 	}
 	conn := connInfo.Conns[0]
-	config := secure.NewNegotiationConfig()
+	config := *connConfig
 	if *plainTransport {
 		config.IsClient = connInfo.IsClient
 	} else {
-		*config = *connConfig
 		config.Key = sessionKey
 		config.KeyType = "PSK"
 		config.IsClient = connInfo.IsClient
@@ -1597,7 +1530,7 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 		}
 	}
 
-	nconn, err := secure.DoNegotiation(config, conn, os.Stderr)
+	nconn, err := secure.DoNegotiation(&config, conn, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

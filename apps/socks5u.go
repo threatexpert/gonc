@@ -437,7 +437,23 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, tunnelStream net.Conn, tar
 	// 6. 启动 UDP 数据转发：客户端本地 UDP <-> 隧道流
 	// 这部分是关键：本地 SOCKS5 服务器接收客户端的 SOCKS5 UDP 包，然后通过隧道流转发到远端
 	// 同时，接收远端通过隧道流返回的 SOCKS5 UDP 包，再转发给客户端。
-	handleLocalUDPToTunnel(localUDPConn, tunnelStream, clientConn.RemoteAddr().(*net.TCPAddr).IP)
+
+	clientAddr := clientConn.RemoteAddr()
+	if clientAddr == nil {
+		return fmt.Errorf("get clientConn RemoteAddr error")
+	}
+
+	var clientIP net.IP
+	switch a := clientAddr.(type) {
+	case *net.TCPAddr:
+		clientIP = a.IP
+	case *net.UDPAddr:
+		clientIP = a.IP
+	default:
+		return fmt.Errorf("unknown clientConn RemoteAddr type: %s", clientAddr.Network())
+	}
+
+	handleLocalUDPToTunnel(localUDPConn, tunnelStream, clientIP)
 	clientConn.Close()
 	wg.Wait() // 等待 TCP 关闭 goroutine 结束
 	return nil

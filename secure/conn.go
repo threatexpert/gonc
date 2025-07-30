@@ -181,13 +181,15 @@ func (s *SecurePacketConn) Read(p []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 
+DoRead:
 	// 直接读取进 p
 	n, err := s.conn.Read(p)
 	if err != nil {
 		return 0, err
 	}
 	if n < ivSize {
-		return 0, errors.New("packet too short")
+		//drop
+		goto DoRead
 	}
 
 	iv := p[:ivSize]

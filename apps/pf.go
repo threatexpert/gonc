@@ -99,31 +99,11 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	}
 
 	if config.ProxyAddress != "" {
-		// 验证代理协议值
-		switch config.ProxyProt {
-		case "", "5":
-			config.ProxyConfig.Prot = "socks5"
-		case "connect":
-			config.ProxyConfig.Prot = "http"
-		default:
-			return nil, fmt.Errorf("invalid proxy protocol: %s", config.ProxyProt)
-		}
-
-		// 验证代理认证格式
-		if config.ProxyAuth != "" {
-			authParts := strings.SplitN(config.ProxyAuth, ":", 2)
-			if len(authParts) != 2 {
-				fmt.Fprintf(os.Stderr, "invalid auth format: expected user:pass\n")
-				os.Exit(1)
-			}
-			config.ProxyConfig.User, config.ProxyConfig.Pass = authParts[0], authParts[1]
-		}
-		config.ProxyConfig.Network = config.Network
-		config.ProxyConfig.ServerHost, config.ProxyConfig.ServerPort, err = net.SplitHostPort(config.ProxyAddress)
+		xconfig, err := ProxyClientConfigByCommandline(config.ProxyProt, config.ProxyAuth, config.ProxyAddress)
 		if err != nil {
-			return nil, fmt.Errorf("invalid format for -x, expected host:port")
+			return nil, fmt.Errorf("error init proxy config: %v", err)
 		}
-
+		config.ProxyConfig = *xconfig
 		if (isUdp && config.ProxyConfig.Prot == "http") || (isUnix && config.ProxyConfig.Prot != "") {
 			return nil, fmt.Errorf("proxy with -U/-u in a conflicting way")
 		}
@@ -178,7 +158,11 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 				return nil, fmt.Errorf("error reading PSK file: %v", err)
 			}
 		}
-		config.PresharedKey = config.P2PSessKey
+		if config.TlsEnabled {
+			if config.PresharedKey == "" {
+				config.PresharedKey = config.P2PSessKey
+			}
+		}
 	}
 
 	// 若启用 TLS 或 PSK，加载证书
