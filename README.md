@@ -116,6 +116,14 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     `gonc.exe -e ":pf -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
+### 给其他应用建立通道
+- 帮WireGuard打洞组VPN
+
+    两端的WireGuard节点都配置Endpoint = 127.0.0.1:51821，并且在两端都运行下面同样的参数：
+
+    `gonc -e ":pf -p2p randomString -kcp" -u -k -l 127.0.0.1 51821`
+
+
 ## P2P NAT 穿透能力
 
 ### gonc如何建立P2P？
