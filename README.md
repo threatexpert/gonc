@@ -151,6 +151,20 @@ README in [English](./README_en.md) 、 [中文](./README.md)
  - 按优先级顺序尝试直连：IPv6 TCP > IPv4 TCP > IPv4 UDP，尽可能实现真正的点对点通信
  - 没有设立中转服务器，不提供备用转发模式：要么连接失败，要么成功就是真的P2P
 
+### 内置的公用服务器（STUN和MQTT）：
+
+		"tcp://turn.cloudflare.com:80",
+		"udp://turn.cloudflare.com:53",
+		"udp://stun.l.google.com:19302",
+		"udp://stun.miwifi.com:3478",
+		"global.turn.twilio.com:3478",
+		"stun.nextcloud.com:443",
+
+ 		"tcp://broker.hivemq.com:1883",
+		"tcp://broker.emqx.io:1883",
+		"tcp://test.mosquitto.org:1883",
+
+
 ### gonc的NAT穿透成功率如何？
 
 #### 除了两端都是对称类型的情况，其他都有非常高的成功率
