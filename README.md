@@ -116,6 +116,24 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     `gonc.exe -e ":pf -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
+### 多服务监听模式
+- 参考SSH的22端口，既可提供shell也提供sftp和端口转发功能，gonc使用 -e ":service" 也可监听在一个服务端口，基于tls+psk安全认证提供shell、socks5(支持CONNECNT+BIND)和文件服务。（请务必使用gonc -psk .生成高熵PSK替换randomString）
+
+    `gonc -k -l -local :2222 -tls -psk randomString -e ":service" -:sh "/bin/bash" -:s5s "-c -b" -:mux "httpserver /"`
+
+    另一端使用获得shell
+
+    `gonc -tls -psk randomString -remote <server-ip>:2222 -call :sh -pty`
+
+    另一端把socks5 over tls转为本地标准socks5端口1080
+
+    `gonc -e ":pf -tls -psk randomString -call :s5s <server-ip>:2222" -k -P -l -local 127.0.0.1:1080`
+
+    另一端把文件服务为本地标准HTTP端口8000
+
+    `gonc -tls -psk randomString -remote <server-ip>:2222 -call :mux -httplocal-port 8000`
+
+
 ### 给其他应用建立通道
 - 帮WireGuard打洞组VPN
 
