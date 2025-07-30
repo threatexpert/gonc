@@ -2,6 +2,7 @@ package netx
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -130,18 +131,45 @@ func (c *FramedConn) Read(p []byte) (int, error) {
 }
 
 // CloseWrite 发送一个长度为0的帧来通知远端EOF
+// 它会尝试获取写锁，最多等待10秒。如果在超时时间内未能获取锁，则返回错误。
 func (c *FramedConn) CloseWrite() error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	// 定义总的超时时间和轮询的间隔
+	timeout := 10 * time.Second
+	pollInterval := 50 * time.Millisecond
 
-	if c.writeClosed {
-		return nil
+	// 创建一个定时器，用于控制总的超时
+	timer := time.NewTimer(timeout)
+	defer timer.Stop() // 确保函数退出时停止定时器，释放资源
+
+	for {
+		// 尝试非阻塞地获取锁
+		if c.writeMu.TryLock() {
+			// 成功获取锁！
+			// 立即使用 defer 来确保函数在任何情况下退出时都能释放锁
+			defer c.writeMu.Unlock()
+
+			// --- 临界区开始：这部分代码只有在获得锁之后才会执行 ---
+			if c.writeClosed {
+				return nil // 锁已获取，但发现连接已经被关闭了
+			}
+			c.writeClosed = true
+			c.writeCloseTime = time.Now()
+
+			// 发送一个2字节，值为0的帧
+			_, err := c.sessW.Write([]byte{0x00, 0x00})
+			return err // 任务完成，返回结果
+		}
+
+		// 如果没获取到锁，检查是否已经超时
+		select {
+		case <-timer.C:
+			// 定时器到期，说明已经等待了10秒
+			return errors.New("CloseWrite: timeout")
+		default:
+			// 定时器还未到期，等待一小段时间再进行下一次尝试
+			time.Sleep(pollInterval)
+		}
 	}
-	c.writeClosed = true
-	c.writeCloseTime = time.Now()
-	// 发送一个2字节，值为0的帧
-	_, err := c.sessW.Write([]byte{0x00, 0x00})
-	return err
 }
 
 // Close 关闭双向连接

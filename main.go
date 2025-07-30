@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.4"
+	VERSION                                              = "v2.1.5"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
