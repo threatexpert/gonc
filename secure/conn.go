@@ -139,19 +139,16 @@ func (s *SecureStreamConn) SetDeadline(t time.Time) error      { return s.conn.S
 func (s *SecureStreamConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
 func (s *SecureStreamConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
 
+// /
 type SecurePacketConn struct {
 	conn net.Conn
 	key  [32]byte
 }
 
 func NewSecurePacketConn(conn net.Conn, key [32]byte) *SecurePacketConn {
-	return &SecurePacketConn{
-		conn: conn,
-		key:  key,
-	}
+	return &SecurePacketConn{conn: conn, key: key}
 }
 
-// Write 每次发送格式：[IV | Ciphertext]
 func (s *SecurePacketConn) Write(p []byte) (int, error) {
 	var iv [ivSize]byte
 	if _, err := rand.Read(iv[:]); err != nil {
@@ -175,21 +172,18 @@ func (s *SecurePacketConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Read 解析格式：[IV | Ciphertext]
 func (s *SecurePacketConn) Read(p []byte) (int, error) {
 	if len(p) < ivSize {
 		return 0, io.ErrShortBuffer
 	}
 
 DoRead:
-	// 直接读取进 p
 	n, err := s.conn.Read(p)
 	if err != nil {
 		return 0, err
 	}
 	if n < ivSize {
-		//drop
-		goto DoRead
+		goto DoRead // 丢弃无效包
 	}
 
 	iv := p[:ivSize]
@@ -203,16 +197,82 @@ DoRead:
 	stream := cipher.NewCTR(block, iv)
 	stream.XORKeyStream(ciphertext, ciphertext)
 
-	// 将解密后的数据就地使用（p[ivSize:n] 已被就地解密）
 	copy(p, ciphertext)
-
 	return n - ivSize, nil
 }
 
-// 透传 Conn 接口
+// net.Conn 接口透传
 func (s *SecurePacketConn) Close() error                       { return s.conn.Close() }
 func (s *SecurePacketConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
 func (s *SecurePacketConn) RemoteAddr() net.Addr               { return s.conn.RemoteAddr() }
 func (s *SecurePacketConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }
 func (s *SecurePacketConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
 func (s *SecurePacketConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
+
+type SecureUDPConn struct {
+	conn *net.UDPConn
+	key  [32]byte
+}
+
+func NewSecureUDPConn(conn *net.UDPConn, key [32]byte) *SecureUDPConn {
+	return &SecureUDPConn{conn: conn, key: key}
+}
+
+func (s *SecureUDPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	var iv [ivSize]byte
+	if _, err := rand.Read(iv[:]); err != nil {
+		return 0, err
+	}
+
+	block, err := aes.NewCipher(s.key[:])
+	if err != nil {
+		return 0, err
+	}
+
+	stream := cipher.NewCTR(block, iv[:])
+	ciphertext := make([]byte, len(p))
+	stream.XORKeyStream(ciphertext, p)
+
+	packet := append(iv[:], ciphertext...)
+	n, err := s.conn.WriteTo(packet, addr)
+	if err != nil {
+		return 0, err
+	}
+	if n < ivSize {
+		return 0, io.ErrShortWrite
+	}
+	return n - ivSize, nil
+}
+
+func (s *SecureUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	buf := make([]byte, len(p)+ivSize)
+
+DoRead:
+	n, addr, err := s.conn.ReadFrom(buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	if n < ivSize {
+		goto DoRead
+	}
+
+	iv := buf[:ivSize]
+	ciphertext := buf[ivSize:n]
+
+	block, err := aes.NewCipher(s.key[:])
+	if err != nil {
+		return 0, nil, err
+	}
+
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(p[:len(ciphertext)], ciphertext)
+
+	return len(ciphertext), addr, nil
+}
+
+// net.PacketConn 接口透传
+func (s *SecureUDPConn) Close() error                       { return s.conn.Close() }
+func (s *SecureUDPConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
+func (s *SecureUDPConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }
+func (s *SecureUDPConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
+func (s *SecureUDPConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }

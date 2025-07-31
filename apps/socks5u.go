@@ -373,7 +373,7 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targe
 }
 
 // handleUDPAssociateViaTunnel 处理 UDP ASSOCIATE 命令并通过隧道转发
-func handleUDPAssociateViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int) error {
+func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, tunnelStream net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	// 1. 本地 SOCKS5 服务器为客户端创建一个 UDP 监听端口
 	//    客户端会将 UDP 数据包发送到这个本地端口
@@ -453,7 +453,13 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, tunnelStream net.Conn, tar
 		return fmt.Errorf("unknown clientConn RemoteAddr type: %s", clientAddr.Network())
 	}
 
-	handleLocalUDPToTunnel(localUDPConn, tunnelStream, clientIP)
+	if keyingMaterial == [32]byte{} {
+		handleLocalUDPToTunnel(localUDPConn, tunnelStream, clientIP)
+	} else {
+		localUDPConnSS := secure.NewSecureUDPConn(localUDPConn, keyingMaterial)
+		handleLocalUDPToTunnel(localUDPConnSS, tunnelStream, clientIP)
+	}
+
 	clientConn.Close()
 	wg.Wait() // 等待 TCP 关闭 goroutine 结束
 	return nil
@@ -462,7 +468,7 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, tunnelStream net.Conn, tar
 // handleLocalUDPToTunnel 是运行在本地客户端
 // 负责将本地 SOCKS5 客户端的 UDP 数据包封装并通过 tunnelStream 发送给远端
 // 并接收远端封装的 UDP 响应，解封装后发回给客户端。
-func handleLocalUDPToTunnel(localUDPConn *net.UDPConn, tunnelStream net.Conn, clientIP net.IP) {
+func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, clientIP net.IP) {
 	var clientActualUDPAddr *net.UDPAddr // 记录 SOCKS5 客户端的实际 UDP 源地址
 	var once sync.Once                   // 确保只捕获一次客户端 UDP 地址
 
@@ -488,7 +494,7 @@ func handleLocalUDPToTunnel(localUDPConn *net.UDPConn, tunnelStream net.Conn, cl
 		for {
 			// 设置读取超时，以便在 localUDPConn 关闭时能退出循环
 			localUDPConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, cliAddr, err := localUDPConn.ReadFromUDP(buf) // 读取 SOCKS5 客户端发来的 UDP 数据报
+			n, cliAddr, err := localUDPConn.ReadFrom(buf) // 读取 SOCKS5 客户端发来的 UDP 数据报
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
@@ -496,16 +502,17 @@ func handleLocalUDPToTunnel(localUDPConn *net.UDPConn, tunnelStream net.Conn, cl
 				log.Printf("Error reading from local UDP for client %s: %v", clientIP, err)
 				return // 非临时错误或连接关闭，退出 goroutine
 			}
+			cliUDPAddr := cliAddr.(*net.UDPAddr) // 确保类型转换正确
 
 			// 确保只处理来自 SOCKS5 客户端 IP 的 UDP 包，增强安全性
-			if clientIP != nil && !cliAddr.IP.Equal(clientIP) {
-				log.Printf("Received UDP packet from unexpected source: %s, expected: %s. Dropping.", cliAddr.IP, clientIP)
+			if clientIP != nil && !cliUDPAddr.IP.Equal(clientIP) {
+				log.Printf("Received UDP packet from unexpected source: %s, expected: %s. Dropping.", cliUDPAddr.IP, clientIP)
 				continue
 			}
 
 			// 首次收到客户端的 UDP 包时，保存其源地址
 			once.Do(func() {
-				clientActualUDPAddr = cliAddr
+				clientActualUDPAddr = cliUDPAddr
 				log.Printf("UDP: %s associated", clientActualUDPAddr)
 			})
 
@@ -593,7 +600,7 @@ func handleLocalUDPToTunnel(localUDPConn *net.UDPConn, tunnelStream net.Conn, cl
 				continue // 客户端还没发过包，不知道往哪里回传
 			}
 
-			_, err = localUDPConn.WriteToUDP(packetBuf[:packetLength], clientActualUDPAddr)
+			_, err = localUDPConn.WriteTo(packetBuf[:packetLength], clientActualUDPAddr)
 			if err != nil {
 				log.Printf("Error writing UDP response to client %s via local UDP: %v", clientActualUDPAddr, err)
 				// 这里通常不直接 return，因为可能只是单个包发送失败，不影响后续包
@@ -769,7 +776,7 @@ func handleSocks5uProxy(conn net.Conn, stream net.Conn) {
 			return
 		}
 	} else if req.Command == "UDP" {
-		err = handleUDPAssociateViaTunnel(conn, stream, req.Host, req.Port)
+		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 			return
@@ -1355,6 +1362,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 
 	serverAddress := net.JoinHostPort(c.Config.ServerHost, c.Config.ServerPort)
 	var ntconfig *secure.NegotiationConfig
+	var keyingMaterial [32]byte
 	if IsSecureNegotiationNeeded(c.Config) {
 		ntconfig = BuildNTConfigFromPCConfig(c.Config)
 	}
@@ -1370,6 +1378,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			return nil, fmt.Errorf("DoNegotiation to SOCKS5 proxy server failed: %w", err)
 		}
 		socks5Conn = nconn
+		keyingMaterial = nconn.KeyingMaterial
 	}
 
 	switch network {
@@ -1446,10 +1455,16 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		}
 
 		// 4. 客户端本地 dialUDP 到 SOCKS5 服务器的 UDP 绑定地址
-		localUDPConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort})
+		var localUDPConn net.Conn
+		localUDPConn, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort})
 		if err != nil {
 			serverTCPConn.Close()
 			return nil, fmt.Errorf("dial local UDP to SOCKS5 server UDP address error: %w", err)
+		}
+
+		if keyingMaterial == [32]byte{} {
+		} else {
+			localUDPConn = secure.NewSecurePacketConn(localUDPConn, keyingMaterial)
 		}
 
 		// 初始化 UDPConnWrapper
@@ -1648,7 +1663,7 @@ type UDPConnWrapper struct {
 	// 与 SOCKS5 服务器的 TCP 控制连接
 	serverTCPConn net.Conn
 	// 客户端本地 UDP 监听，已 Dial 到 SOCKS5 服务器的 UDP 地址
-	localUDPConn *net.UDPConn
+	localUDPConn net.Conn
 	// 用户 Dial 时指定的最终 UDP 目标地址 (用于构建 SOCKS5 UDP 报头)
 	strTargetUDPAddr  string
 	targetUDPAddr     net.Addr

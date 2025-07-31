@@ -57,13 +57,14 @@ func NewNegotiationConfig() *NegotiationConfig {
 }
 
 type NegotiatedConn struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	Config     *NegotiationConfig
-	TopLayer   net.Conn
-	ConnStack  []string
-	ConnLayers []net.Conn
-	IsUDP      bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	Config         *NegotiationConfig
+	KeyingMaterial [32]byte
+	TopLayer       net.Conn
+	ConnStack      []string
+	ConnLayers     []net.Conn
+	IsUDP          bool
 }
 
 func (nconn *NegotiatedConn) Close() error {
@@ -144,27 +145,26 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 	timeout_sec := 20
 	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
 	defer cancelTimeout()
-
+	var keyingMaterial [32]byte
 	switch {
 	case strings.HasPrefix(cfg.SecureLayer, "tls"):
-		conn_tls := doTLS(ctxTimeout, cfg, nconn.ConnLayers[0], logWriter)
+		conn_tls := doTLS(ctxTimeout, cfg, nconn.ConnLayers[0], &keyingMaterial, logWriter)
 		if conn_tls == nil {
 			return nil, fmt.Errorf("failed to establish TLS connection")
 		}
 		nconn.ConnLayers = append([]net.Conn{conn_tls}, nconn.ConnLayers...)
 		connStack = append(connStack, cfg.SecureLayer)
 	case cfg.SecureLayer == "dtls":
-		conn_dtls := doDTLS(ctxTimeout, cfg, nconn.ConnLayers[0], logWriter)
+		conn_dtls := doDTLS(ctxTimeout, cfg, nconn.ConnLayers[0], &keyingMaterial, logWriter)
 		if conn_dtls == nil {
 			return nil, fmt.Errorf("failed to establish DTLS connection")
 		}
 		nconn.ConnLayers = append([]net.Conn{conn_dtls}, nconn.ConnLayers...)
 		connStack = append(connStack, cfg.SecureLayer)
 	case cfg.SecureLayer == "ss" || cfg.SecureLayer == "dss":
-		var key32 [32]byte
 		switch cfg.KeyType {
 		case "ECDHE":
-			copy(key32[:], []byte(cfg.Key))
+			copy(keyingMaterial[:], []byte(cfg.Key))
 			fmt.Fprintf(logWriter, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.Label)
 		case "PSK":
 			k, err := DerivePSK(cfg.Key)
@@ -172,17 +172,17 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				fmt.Fprintf(logWriter, "%sFailed to derive key for secure stream: %v\n", cfg.Label, err)
 				return nil, err
 			}
-			copy(key32[:], k)
+			copy(keyingMaterial[:], k)
 			fmt.Fprintf(logWriter, "%sCommunication is encrypted(PSK) with AES.\n", cfg.Label)
 		default:
 			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.Label)
 			return nil, fmt.Errorf("missing key type for secure stream")
 		}
 		if cfg.SecureLayer == "dss" {
-			connss := NewSecurePacketConn(nconn.ConnLayers[0], key32)
+			connss := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 		} else {
-			connss := NewSecureStreamConn(nconn.ConnLayers[0], key32)
+			connss := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 		}
 		connStack = append(connStack, cfg.SecureLayer)
@@ -194,6 +194,14 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], 30*time.Second, logWriter)
 			if sess_kcp == nil {
 				return nil, fmt.Errorf("failed to establish KCP session")
+			}
+			if cfg.KcpEncryption {
+				k, err := DerivePSK(cfg.Key)
+				if err != nil {
+					fmt.Fprintf(logWriter, "%sFailed to derive key for keyingMaterial: %v\n", cfg.Label, err)
+					return nil, err
+				}
+				copy(keyingMaterial[:], k)
 			}
 			nconn.ConnLayers = append([]net.Conn{sess_kcp}, nconn.ConnLayers...)
 			connStack = append(connStack, "kcp")
@@ -224,10 +232,12 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 	nconn.cancel = cancel
 	nconn.TopLayer = nconn.ConnLayers[0]
 	nconn.ConnStack = connStack
+	nconn.KeyingMaterial = keyingMaterial
+	//fmt.Fprintf(logWriter, "%skeyingMaterial: %x\n", cfg.Label, keyingMaterial)
 	return nconn, nil
 }
 
-func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWriter io.Writer) net.Conn {
+func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeKeyingMaterial *[32]byte, logWriter io.Writer) net.Conn {
 	// 获取所有安全加密套件
 	safeCiphers := tls.CipherSuites()
 	// 获取所有不安全加密套件
@@ -292,13 +302,26 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWri
 	}
 	if err := conn_tls.HandshakeContext(ctx); err != nil {
 		fmt.Fprintf(logWriter, "failed: %v\n", err)
+		conn_tls.Close()
 		return nil
 	}
 	fmt.Fprintf(logWriter, "completed.\n")
+
+	state := conn_tls.ConnectionState()
+	label := "EXPERIMENTAL-SERVER-KEY"
+	keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
+	if err != nil {
+		fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
+		conn_tls.Close()
+		return nil
+	} else {
+		copy(storeKeyingMaterial[:], keyingMaterial)
+	}
+
 	return conn_tls
 }
 
-func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWriter io.Writer) net.Conn {
+func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeKeyingMaterial *[32]byte, logWriter io.Writer) net.Conn {
 	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
 	allCiphers := []dtls.CipherSuiteID{
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -367,6 +390,23 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, logWr
 	}
 	conn.SetDeadline(time.Time{}) // 取消握手超时
 	fmt.Fprintf(logWriter, "completed.\n")
+
+	state, ok := dtlsConn.ConnectionState()
+	if !ok {
+		fmt.Fprintf(logWriter, "failed to get DTLS connection state\n")
+		dtlsConn.Close()
+		return nil
+	} else {
+		label := "EXPERIMENTAL-SERVER-KEY"
+		keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
+		if err != nil {
+			fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
+			dtlsConn.Close()
+			return nil
+		} else {
+			copy(storeKeyingMaterial[:], keyingMaterial)
+		}
+	}
 	return dtlsConn
 }
 

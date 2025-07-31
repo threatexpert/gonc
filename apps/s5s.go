@@ -75,7 +75,7 @@ func App_s5s_usage_flagSet(fs *flag.FlagSet) {
 	fmt.Fprintln(os.Stderr, "  :s5s -auth user:password")
 }
 
-func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
+func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig) {
 	defer conn.Close()
 
 	s5config := Socks5ServerConfig{
@@ -97,7 +97,7 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 		return
 	}
 
-	// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
+	// 2. SOCKS5 请求 (TCP CONNECT 、BIND 或 UDP ASSOCIATE)
 	req, err := handleSocks5Request(conn)
 	if err != nil {
 		log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
@@ -126,7 +126,7 @@ func App_s5s_main_withconfig(conn net.Conn, config *AppS5SConfig) {
 			handleSocks5ClientOnStream(c, config.Localbind, config.AccessCtrl)
 		}(fakeTunnelS)
 
-		err = handleUDPAssociateViaTunnel(conn, fakeTunnelC, req.Host, req.Port)
+		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, fakeTunnelC, req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 		}

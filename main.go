@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.5"
+	VERSION                                              = "v2.1.6"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -1246,7 +1246,7 @@ func handleNegotiatedConnection(nconn *secure.NegotiatedConn, stats_in, stats_ou
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
-			go apps.App_s5s_main_withconfig(pipeConn, app_s5s_Config)
+			go apps.App_s5s_main_withconfig(pipeConn, nconn.KeyingMaterial, app_s5s_Config)
 		} else if builtinApp == ":pf" {
 			if app_pf_Config == nil {
 				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)

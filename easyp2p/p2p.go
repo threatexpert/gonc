@@ -1325,6 +1325,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		return nil, false, nil, fmt.Errorf("invalid remote port: %v", err)
 	}
 
+	//这是对方通过STUN服务器获取的NAT端口，记下来后面避开使用，可能会因为STUN服务器断开连接（FIN、RST）导致用该洞的其他P2P连接中断（RST）。
 	origRemotePortInt := remotePortInt
 
 	if !inSameLAN {
@@ -1537,6 +1538,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		}
 
 		//相同子网的，以及easy对easy的，就尝试一下直接连接
+		triedDirectDial := false
 		if inSameLAN || (p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy") {
 			select {
 			case <-ctx.Done():
@@ -1551,6 +1553,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				return
 			}
 			fmt.Fprintf(logWriter, "failed.\n")
+			triedDirectDial = true
 			if !inSameLAN {
 				if isClient {
 					//easy - easy 失败，可能对方的洞口没开是不可以先碰的
@@ -1575,6 +1578,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				fmt.Fprintf(logWriter, "  ↑ Trying %d Random Destination Ports concurrently...\n", len(randDstPorts))
 				for _, port := range randDstPorts {
 					if port == origRemotePortInt {
+						//避开原来与STUN通讯的端口
 						continue
 					}
 					select {
@@ -1594,6 +1598,7 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 				fmt.Fprintf(logWriter, "  ↑ Trying %d Random Source Ports concurrently...\n", PunchingRandomPortCount)
 				for _, port := range randSrcPorts {
 					if port == origLocalPort {
+						//避开原来与STUN通讯的端口
 						continue
 					}
 					newLocalAddr := &net.TCPAddr{
@@ -1606,8 +1611,25 @@ func Auto_P2P_TCP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 					case <-ctx.Done():
 						return
 					case workerChan <- struct{}{}: // Acquire worker slot
-						wg.Add(1)
-						go tryConnect(remoteAddr, newLocalAddr, false, timeoutPerconn, isClient, "RSP")
+						if !triedDirectDial {
+							//第一个连接EASY目标可以稍等一下，万一对方没NAT没防火墙，是可以直接成功了，就不用并发打洞
+							triedDirectDial = true
+							wg.Add(1)
+							done := make(chan struct{})
+							go func() {
+								defer close(done)
+								tryConnect(remoteAddr, newLocalAddr, false, timeoutPerconn, isClient, "dial")
+							}()
+							select {
+							case <-done:
+								// tryConnect 提前完成了，不等待了
+							case <-time.After(1500 * time.Millisecond):
+								// 超时了，还没结束，那我们继续
+							}
+						} else {
+							wg.Add(1)
+							go tryConnect(remoteAddr, newLocalAddr, false, timeoutPerconn, isClient, "RSP")
+						}
 					}
 				}
 			}
