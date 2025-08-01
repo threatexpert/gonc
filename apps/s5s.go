@@ -20,6 +20,7 @@ type AppS5SConfig struct {
 	EnableUDP     bool
 	EnableBind    bool
 	Localbind     string
+	ServerIP      string
 	AccessCtrl    *acl.ACL
 }
 
@@ -36,6 +37,7 @@ func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 	fs.BoolVar(&config.EnableBind, "b", false, "Allow SOCKS5 BIND command")
 	fs.BoolVar(&config.EnableUDP, "u", false, "Allow SOCKS5 UDP ASSOCIATE command")
 	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip)")
+	fs.StringVar(&config.ServerIP, "server-ip", "", "BIND/UDP ASSOCIATE uses this as server IP (format: ip)")
 
 	// 设置自定义的 Usage 函数
 	fs.Usage = func() {
@@ -112,7 +114,7 @@ func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *App
 			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 		}
 	} else if req.Command == "BIND" && config.EnableBind {
-		err = handleTCPListen(conn, req.Host, req.Port)
+		err = handleTCPListen(conn, config.ServerIP, req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
 		}
@@ -126,7 +128,7 @@ func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *App
 			handleSocks5ClientOnStream(c, config.Localbind, config.AccessCtrl)
 		}(fakeTunnelS)
 
-		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, fakeTunnelC, req.Host, req.Port)
+		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, fakeTunnelC, config.ServerIP, req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 		}

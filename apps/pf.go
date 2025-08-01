@@ -219,11 +219,21 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 
 	if config.P2PSessKey != "" {
 		//p2p mode
-		connInfo, err := easyp2p.Easy_P2P(config.Network, config.P2PSessKey, os.Stderr)
+		sharedPacketConn, err := CreateSocks5UDPClient(&config.ProxyConfig)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "Prepare socks5 UDP client failed: %v\n", err)
+			return
+		}
+
+		connInfo, err := easyp2p.Easy_P2P(config.Network, config.P2PSessKey, sharedPacketConn, os.Stderr)
+		if err != nil {
+			if sharedPacketConn != nil {
+				sharedPacketConn.Close()
+			}
 			fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 			return
 		}
+
 		targetConn = connInfo.Conns[0]
 		ntconfig.IsClient = connInfo.IsClient
 	} else {

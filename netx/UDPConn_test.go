@@ -26,7 +26,7 @@ func TestUDP1toN(t *testing.T) {
 
 	logToStderr := log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
 	// 2. 使用这个共享的 UDPConn 初始化你的 UDPCustomDialer
-	dialer, err := NewUDPCustomDialer(sharedUDPConn, 1500, logToStderr)
+	dialer, err := NewUDPCustomDialer(sharedUDPConn, false, 1500, logToStderr)
 	if err != nil {
 		log.Fatalf("Failed to create custom dialer: %v", err)
 	}

@@ -352,7 +352,7 @@ type exchangePayload struct {
 	PubKey string `json:"pk"`
 }
 
-func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, logWriter io.Writer) ([]*P2PAddressInfo, error) {
+func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, shPktCon net.PacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
 
 	myInfoForExchange := exchangePayload{
 		Addresses: []PunchingAddressInfo{},
@@ -360,9 +360,9 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 
 	fmt.Fprintf(logWriter, "    Getting local public IP info via %d STUN servers...", len(STUNServers))
 
-	allResults, err := GetNetworksPublicIPs(networks, "", 5*time.Second)
+	allResults, err := GetNetworksPublicIPs(networks, "", 5*time.Second, shPktCon)
 	if err != nil {
-		fmt.Fprintln(logWriter, "Failed")
+		fmt.Fprintf(logWriter, "Failed(%v)\n", err)
 	} else {
 		analyzed := analyzeSTUNResults(allResults)
 		for _, item := range analyzed {
@@ -520,7 +520,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 }
 
 func Do_autoP2P(network string, sessionUid string, stunServers, brokerServers []string, timeout time.Duration, needSharedKey bool, logWriter io.Writer) (*P2PAddressInfo, error) {
-	p2pInfos, err := Do_autoP2PEx([]string{network}, sessionUid, timeout, needSharedKey, logWriter)
+	p2pInfos, err := Do_autoP2PEx([]string{network}, sessionUid, timeout, needSharedKey, nil, logWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -707,15 +707,15 @@ type P2PConnInfo struct {
 	IsClient  bool
 }
 
-func Easy_P2P(network, sessionUid string, logWriter io.Writer) (*P2PConnInfo, error) {
-	connInfo, err := Easy_P2P_MP(network, sessionUid, false, logWriter)
+func Easy_P2P(network, sessionUid string, shPktCon net.PacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
+	connInfo, err := Easy_P2P_MP(network, sessionUid, false, shPktCon, logWriter)
 	if err != nil {
 		return nil, err
 	}
 	return connInfo, nil
 }
 
-func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, logWriter io.Writer) (*P2PConnInfo, error) {
+func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, shPktCon net.PacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	var networksToTryStun []string
 	switch network {
@@ -738,7 +738,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, logWriter io
 	fmt.Fprintf(logWriter, "=== Checking NAT reachability ===\n")
 
 	// --- 2. Get address information for all required networks in one go ---
-	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, 25*time.Second, true, logWriter)
+	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, 25*time.Second, true, shPktCon, logWriter)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
 		return nil, fmt.Errorf("failed to exchange address info: %w", err)
@@ -771,7 +771,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, logWriter io
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, logWriter)
+			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, shPktCon, logWriter)
 			if err2 == nil {
 				mconn = append(mconn, conn)
 				if role == 0 {
@@ -835,7 +835,7 @@ func generateRandomPorts(count int) []int {
 	return ports
 }
 
-func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, logWriter io.Writer) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, shPktCon net.PacketConn, logWriter io.Writer) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 10
@@ -912,11 +912,23 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	recvChan := make(chan bool)
 	errChan := make(chan error)
 
-	uconn, err := net.ListenUDP(network, localAddr)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+	var uconn net.PacketConn
+	var isSharedUDPConn bool
+	uconn = shPktCon
+	if shPktCon == nil {
+		uconn, err = net.ListenUDP(network, localAddr)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+		}
+	} else {
+		//有GlobalSharedPacketConn的情况，是走socks5代理的，ttl还原正常值，也不采用生日悖论打洞
+		isSharedUDPConn = true
+		ttl = 64
+		randomSrcPort = false
+		randomDstPort = false
 	}
-	buconn := netx.NewBoundUDPConn(uconn, "", false)
+
+	buconn := netx.NewBoundUDPConn(uconn, "", isSharedUDPConn)
 
 	netx.SetUDPTTL(uconn, ttl)
 
@@ -972,17 +984,19 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 
 		// 定义公共的PING发送函数
 		sendPing := func(i int) bool {
-			if _, err := uconn.WriteToUDP(punchPayload, remoteUDPAddr); err != nil {
+			if _, err := uconn.WriteTo(punchPayload, remoteUDPAddr); err != nil {
 				if errors.Is(err, os.ErrPermission) {
-					//ErrPermission可能是对方先发过来包被macos防火墙拦住了，现在这个udp socket已经无法向对端地址发包了。
-					uconn, err = buconn.Rebuild() //关闭socket，重新创建，并立刻主动发包打通防火墙
-					if err != nil {
-						err = os.ErrPermission
-					} else {
-						_, err = uconn.WriteToUDP(punchPayload, remoteUDPAddr)
-						if err == nil {
-							//重建socket且发送成功了
-							goto SentPingOK
+					if _, ok := uconn.(*net.UDPConn); ok {
+						//ErrPermission可能是对方先发过来包被macos防火墙拦住了，现在这个udp socket已经无法向对端地址发包了。
+						uconn, err = buconn.Rebuild() //关闭socket，重新创建，并立刻主动发包打通防火墙
+						if err != nil {
+							err = os.ErrPermission
+						} else {
+							_, err = uconn.WriteTo(punchPayload, remoteUDPAddr)
+							if err == nil {
+								//重建socket且发送成功了
+								goto SentPingOK
+							}
 						}
 					}
 				}
@@ -1009,7 +1023,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 					for i := 0; i < PunchingRandomPortCount; i++ {
 						addrStr := net.JoinHostPort(remoteNatIP, strconv.Itoa(randDstPorts[i]))
 						peerAddr, _ := net.ResolveUDPAddr(network, addrStr)
-						uconn.WriteToUDP(punchPayload, peerAddr)
+						uconn.WriteTo(punchPayload, peerAddr)
 					}
 					fmt.Fprintf(logWriter, "completed.\n")
 				}
@@ -1162,12 +1176,16 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 
 	// 等待结果
 	var errFin error
-	var uconnBrandnew *net.UDPConn
+	var uconnBrandnew net.Conn
 	select {
 	case addrPair := <-gotHoleCh:
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
 		buconn.Close()
-		uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote)
+		if isSharedUDPConn {
+			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, addrPair.Remote.String())
+		} else {
+			uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote)
+		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
 		} else {
@@ -1179,7 +1197,11 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		laddr := uconn.LocalAddr()
 		raddr := buconn.RemoteAddr()
 		buconn.Close()
-		uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr)
+		if isSharedUDPConn {
+			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, raddr.String())
+		} else {
+			uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr)
+		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
 		} else {
@@ -1200,7 +1222,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	return uconnBrandnew, isClient, sharedKey, nil
 }
 
-func CreateUDPConnFromAddr(laddr, raddr net.Addr) (*net.UDPConn, error) {
+func CreateUDPConnFromAddr(laddr, raddr net.Addr) (net.Conn, error) {
 	// 类型断言：必须是 *net.UDPAddr
 	la, ok1 := laddr.(*net.UDPAddr)
 	ra, ok2 := raddr.(*net.UDPAddr)

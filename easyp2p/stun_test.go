@@ -12,7 +12,7 @@ import (
 
 func TestStunOne(t *testing.T) {
 	timeout := 3 * time.Second
-	results, err := GetPublicIPs("udp4", ":20000", timeout, false)
+	results, err := GetPublicIPs("udp4", ":20000", timeout, false, nil)
 	if err != nil {
 		return
 	}
@@ -34,7 +34,7 @@ func TestStunOne(t *testing.T) {
 func TestStunN(t *testing.T) {
 	timeout := 30 * time.Second
 	networkList := strings.Split("tcp6,tcp4,udp4", ",")
-	allResults, err := GetNetworksPublicIPs(networkList, "", timeout)
+	allResults, err := GetNetworksPublicIPs(networkList, "", timeout, nil)
 	if err != nil {
 		fmt.Println("failed: ", err)
 		return
@@ -178,7 +178,7 @@ func TestAnalyzeSTUNResults(t *testing.T) {
 func TestAnalyzeRealSTUNResults(t *testing.T) {
 	timeout := 3 * time.Second
 	networkList := strings.Split("tcp6,tcp4,udp4", ",")
-	allResults, err := GetNetworksPublicIPs(networkList, "", timeout)
+	allResults, err := GetNetworksPublicIPs(networkList, "", timeout, nil)
 	if err != nil {
 		fmt.Println("failed: ", err)
 		return

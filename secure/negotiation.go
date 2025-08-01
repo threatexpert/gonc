@@ -481,7 +481,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake using...", config.Label, config.KeyType)
 		}
 	}
-	sess, err = kcp.NewConn3(0, conn.RemoteAddr(), blockCrypt, 10, 3, buconn)
+	sess, err = kcp.NewConn4(0, conn.RemoteAddr(), blockCrypt, 10, 3, true, buconn)
 	if err != nil {
 		fmt.Fprintf(logWriter, "NewConn failed: %v\n", err)
 		return nil

@@ -347,11 +347,6 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 				return "", "", "", "", fmt.Errorf("invalid remote address %q: %v", *remoteAddr, err)
 			}
 		} else if *autoP2P != "" {
-			if *proxyAddr != "" || arg_proxyc_Config != nil {
-				fmt.Fprintf(os.Stderr, "INFO: proxy is ignored with p2p\n")
-				*proxyAddr = ""
-				arg_proxyc_Config = nil
-			}
 			*listenMode = false
 			P2PSessionKey = *autoP2P
 			network = "any"
@@ -391,6 +386,16 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 				if *presharedKey == "" {
 					*presharedKey = P2PSessionKey
 				}
+			}
+
+			if arg_proxyc_Config != nil {
+				if arg_proxyc_Config.Prot != "socks5" {
+					return "", "", "", "", fmt.Errorf("only allow socks5 proxy with p2p")
+				}
+				if strings.HasPrefix(network, "tcp") {
+					return "", "", "", "", fmt.Errorf("only allow socks5 proxy with p2p udp mode")
+				}
+				network = strings.Replace(network, "any", "udp", 1)
 			}
 		} else {
 			return "", "", "", "", fmt.Errorf("not enough arguments")
@@ -490,6 +495,7 @@ func startUDPListener(network, host, port string) {
 		fmt.Fprintf(os.Stderr, "Error listening on UDP address: %v\n", err)
 		os.Exit(1)
 	}
+	defer uconn.Close()
 	fmt.Fprintf(os.Stderr, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 	logDiscard := log.New(io.Discard, "", log.LstdFlags)
@@ -498,6 +504,7 @@ func startUDPListener(network, host, port string) {
 		fmt.Fprintf(os.Stderr, "Error NewUDPCustomListener: %v\n", err)
 		os.Exit(1)
 	}
+	defer usessListener.Close()
 
 	if *keepOpen {
 		stats_in := misc.NewProgressStats()
@@ -725,7 +732,7 @@ func runDialMode(network, host, port string) {
 		if *proxyAddr == "" {
 			fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteFullAddr)
 		} else {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s\n", net.JoinHostPort(arg_proxyc_Config.ServerHost, arg_proxyc_Config.ServerPort), remoteFullAddr)
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String(), remoteFullAddr)
 		}
 	} else {
 		if *proxyAddr == "" {
@@ -1508,10 +1515,20 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	connInfo, err := easyp2p.Easy_P2P(network, sessionKey, os.Stderr)
+
+	sharedPacketConn, err := apps.CreateSocks5UDPClient(arg_proxyc_Config)
 	if err != nil {
+		return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
+	}
+
+	connInfo, err := easyp2p.Easy_P2P(network, sessionKey, sharedPacketConn, os.Stderr)
+	if err != nil {
+		if sharedPacketConn != nil {
+			sharedPacketConn.Close()
+		}
 		return nil, err
 	}
+
 	conn := connInfo.Conns[0]
 	config := *connConfig
 	if *plainTransport {
@@ -1532,6 +1549,7 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 
 	nconn, err := secure.DoNegotiation(&config, conn, os.Stderr)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	if nconn.IsUDP {

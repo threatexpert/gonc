@@ -337,3 +337,28 @@ func Proxy_usage_flagSet(fs *flag.FlagSet) {
 	fmt.Fprintln(os.Stderr, "\nExamples:")
 	fmt.Fprintln(os.Stderr, "  -x \"-tls -psk randomString <host:port>\"")
 }
+
+func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {
+	if config == nil {
+		return nil, nil
+	}
+	if config.Prot == "" || config.ServerHost == "" {
+		return nil, nil
+	}
+	if config.Prot != "socks5" {
+		return nil, fmt.Errorf("only socks5 proxy is supported for UDP")
+	}
+	proxyClient, err := NewProxyClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("error create proxy client: %v", err)
+	}
+	conn, err := proxyClient.DialTimeout("udp", ":0", 20*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect proxy server: %v", err)
+	}
+	packetConn, ok := conn.(net.PacketConn)
+	if !ok {
+		return nil, fmt.Errorf("failed to convert socks5 connection to PacketConn")
+	}
+	return packetConn, nil
+}

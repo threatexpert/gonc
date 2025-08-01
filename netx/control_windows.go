@@ -22,7 +22,11 @@ func ControlUDP(network, address string, c syscall.RawConn) (err error) {
 
 var ControlTCP = ControlUDP
 
-func SetUDPTTL(conn *net.UDPConn, ttl int) error {
+func SetUDPTTL(pconn net.PacketConn, ttl int) error {
+	conn, ok := pconn.(*net.UDPConn)
+	if !ok {
+		return fmt.Errorf("expected *net.UDPConn, got %T", pconn)
+	}
 	rawConn, err := conn.SyscallConn()
 	if err != nil {
 		return fmt.Errorf("get rawconn error: %v", err)

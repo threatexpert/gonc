@@ -290,7 +290,7 @@ type STUNResult struct {
 // GetPublicIPs attempts to discover public IP addresses using STUN servers.
 // It collects as many unique NAT IP addresses (by IP address only, ignoring port)
 // as possible within the specified timeout, and returns all results (unique successful ones and errors).
-func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) ([]*STUNResult, error) {
+func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, shPktCon net.PacketConn) ([]*STUNResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel() // Ensure cancel is called to release context resources
 
@@ -308,17 +308,22 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool) (
 		if err != nil {
 			return nil, err
 		}
-		sharedUDPConn, err := net.ListenUDP("udp", localAddr)
-		if err != nil {
-			return nil, err
+		basedUDPConn := shPktCon
+		if basedUDPConn == nil {
+			sharedUDPConn, err := net.ListenUDP("udp", localAddr)
+			if err != nil {
+				return nil, err
+			}
+			defer sharedUDPConn.Close()
+			basedUDPConn = sharedUDPConn
 		}
-		defer sharedUDPConn.Close()
 
 		logDiscard := log.New(io.Discard, "", log.LstdFlags|log.Lshortfile)
-		UDPDialer, err = netx.NewUDPCustomDialer(sharedUDPConn, 4096, logDiscard)
+		UDPDialer, err = netx.NewUDPCustomDialer(basedUDPConn, false, 4096, logDiscard)
 		if err != nil {
 			return nil, err
 		}
+		defer UDPDialer.Close()
 	}
 
 	resolveAddr := func(proto string) (string, net.Addr, error) {
@@ -546,7 +551,7 @@ func GetFreePort() (int, error) {
 	return 0, fmt.Errorf("no free TCP/UDP ports available")
 }
 
-func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Duration) ([]*STUNResult, error) {
+func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Duration, shPktCon net.PacketConn) ([]*STUNResult, error) {
 	var wg sync.WaitGroup
 	resultsChan := make(chan []*STUNResult, len(networkList))
 	errorsChan := make(chan error, len(networkList))
@@ -562,7 +567,7 @@ func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Durati
 		wg.Add(1)
 		go func(network string) {
 			defer wg.Done()
-			results, err := GetPublicIPs(network, bind, timeout, false)
+			results, err := GetPublicIPs(network, bind, timeout, false, shPktCon)
 			if err != nil {
 				errorsChan <- fmt.Errorf("network %s: %v", network, err)
 				return

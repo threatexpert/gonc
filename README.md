@@ -141,6 +141,10 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     `gonc -e ":pf -p2p randomString -kcp" -u -k -l 127.0.0.1 51821`
 
+    如果有一端需要走socks5代理，代理的参数要在:pf里的-x
+
+    `gonc -e ":pf -x \"-psk randomString -tls <socks5server-ip>:1080\" -p2p randomString -kcp" -u -k -l 127.0.0.1 51821`
+
 
 ## P2P NAT 穿透能力
 
@@ -150,6 +154,21 @@ README in [English](./README_en.md) 、 [中文](./README.md)
  - 通过基于 SessionKey 派生的哈希作为 MQTT 共享话题，借助公用 MQTT 服务安全交换地址信息
  - 按优先级顺序尝试直连：IPv6 TCP > IPv4 TCP > IPv4 UDP，尽可能实现真正的点对点通信
  - 没有设立中转服务器，不提供备用转发模式：要么连接失败，要么成功就是真的P2P
+
+### 如何部署中转服务器适应实在无法P2P的条件？
+
+ - 需要自己有一个公网IP的服务器，运行gonc本身的socks5代理服务器便可让其成为中转服务器。
+
+    下面命令启动了支持UDP转发功能的socks5代理，-psk和-tls开启了加密和认证
+
+    `gonc -e ":s5s -u" -psk randomString -tls -k -l 1080`
+
+ - P2P遇到困难的时候，只需要有一端的gonc使用-x参数再进行P2P就可以。
+
+    `gonc -p2p randomString -x "-psk randomString -tls <socks5server-ip>:1080"`
+
+例如原本两端都是对称型NAT，无法P2P，现在一端使用了socks5代理（UDP模式），就相当于转为容易型的NAT了，于是就能很容易和其他建立连接，数据加密仍然是端到端的。
+
 
 ### 内置的公用服务器（STUN和MQTT）：
 

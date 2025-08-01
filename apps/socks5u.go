@@ -373,7 +373,7 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targe
 }
 
 // handleUDPAssociateViaTunnel 处理 UDP ASSOCIATE 命令并通过隧道转发
-func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, tunnelStream net.Conn, targetHost string, targetPort int) error {
+func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, tunnelStream net.Conn, serverIP, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	// 1. 本地 SOCKS5 服务器为客户端创建一个 UDP 监听端口
 	//    客户端会将 UDP 数据包发送到这个本地端口
@@ -391,7 +391,10 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 	}
 	defer localUDPConn.Close() // 确保本地 UDP 监听器关闭
 
-	bindIP := localUDPConn.LocalAddr().(*net.UDPAddr).IP.String()
+	log.Printf("UDP-Associate-C: Using UDP socket: %s", localUDPConn.LocalAddr())
+
+	//不指定具体serverIP时将告诉客户端0.0.0.0，因为服务器看不到自己真正的公网IP，localUDPConn.LocalAddr()可能会服务器的内网IP
+	bindIP := serverIP
 	bindPort := localUDPConn.LocalAddr().(*net.UDPAddr).Port
 
 	// 2. 回复 SOCKS5 客户端成功响应，告知其本地 UDP 转发的地址和端口
@@ -654,7 +657,7 @@ func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort i
 	return nil
 }
 
-func handleTCPListen(clientConn net.Conn, targetHost string, targetPort int) error {
+func handleTCPListen(clientConn net.Conn, serverIP string, targetHost string, targetPort int) error {
 	lc := net.ListenConfig{Control: netx.ControlTCP}
 	if targetHost == "" {
 		local, ok := clientConn.LocalAddr().(*net.TCPAddr)
@@ -676,7 +679,7 @@ func handleTCPListen(clientConn net.Conn, targetHost string, targetPort int) err
 		return fmt.Errorf("bind to %v failed: local address is %s://%s", bindAddr, localAddr.Network(), localAddr.String())
 	}
 
-	err = sendSocks5Response(clientConn, REP_SUCCEEDED, local.IP.String(), local.Port)
+	err = sendSocks5Response(clientConn, REP_SUCCEEDED, serverIP, local.Port)
 	if err != nil {
 		return fmt.Errorf("send response error: %w", err)
 	}
@@ -776,7 +779,7 @@ func handleSocks5uProxy(conn net.Conn, stream net.Conn) {
 			return
 		}
 	} else if req.Command == "UDP" {
-		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, req.Host, req.Port)
+		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, "", req.Host, req.Port)
 		if err != nil {
 			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 			return
@@ -950,7 +953,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 		log.Printf("Failed to write OK response for UDP Associate to mux stream: %v", err)
 		return
 	}
-	log.Printf("UDP-Associate: Using local UDP socket: %s", remoteLocalUDPConn.LocalAddr())
+	log.Printf("UDP-Associate-S: Using UDP socket: %s", remoteLocalUDPConn.LocalAddr())
 
 	var wg sync.WaitGroup // 用于等待两个并发的 UDP 转发 goroutine 结束
 	wg.Add(2)
@@ -1467,12 +1470,15 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			localUDPConn = secure.NewSecurePacketConn(localUDPConn, keyingMaterial)
 		}
 
-		// 初始化 UDPConnWrapper
-		wrapper := &UDPConnWrapper{
-			client:           c,
-			serverTCPConn:    serverTCPConn,
-			localUDPConn:     localUDPConn, // 这里的 localUDPConn 已经 Dial 到 SOCKS5 服务器的 UDP 地址了
-			strTargetUDPAddr: address,      // 保存 Dial 时的最终目标地址
+		s5uPacketConn := &Socks5UDPPacketConn{
+			client:        c,
+			serverTCPConn: serverTCPConn,
+			localUDPConn:  localUDPConn, // 这里的 localUDPConn 已经 Dial 到 SOCKS5 服务器的 UDP 地址了
+		}
+		wrapper, err := netx.NewConnFromPacketConn(s5uPacketConn, address)
+		if err != nil {
+			serverTCPConn.Close()
+			return nil, fmt.Errorf("NewConnFromPacketConn(Socks5UDPPacketConn): %w", err)
 		}
 
 		serverTCPConn.SetDeadline(time.Time{})
@@ -1656,220 +1662,197 @@ func socks5ReplyCodeToString(code byte) string {
 	}
 }
 
-// UDPConnWrapper 包装器，实现 net.Conn 接口，用于通过 SOCKS5 UDP 关联转发数据
-type UDPConnWrapper struct {
+// Socks5UDPPacketConn 包装器，实现 net.PacketConn 接口
+type Socks5UDPPacketConn struct {
 	// 客户端底层的 SOCKS5 客户端实例
 	client *Socks5Client
 	// 与 SOCKS5 服务器的 TCP 控制连接
 	serverTCPConn net.Conn
-	// 客户端本地 UDP 监听，已 Dial 到 SOCKS5 服务器的 UDP 地址
+	// 客户端本地 UDP 连接，它是一个已 Dial 到 SOCKS5 服务器 UDP 端口的 net.Conn
+	// 它的底层类型是 *net.UDPConn
 	localUDPConn net.Conn
-	// 用户 Dial 时指定的最终 UDP 目标地址 (用于构建 SOCKS5 UDP 报头)
-	strTargetUDPAddr  string
-	targetUDPAddr     net.Addr
-	onceRecv1stPacket sync.Once
 
-	// 标记 UDPConnWrapper 是否已关闭
-	closed         sync.Once
-	lastPacketAddr string
+	// 标记是否已关闭
+	closed sync.Once
 }
 
-// Read 从 UDPConnWrapper 中读取数据
-func (u *UDPConnWrapper) Read(b []byte) (n int, err error) {
-	// 1. 从 localUDPConn 读取完整的 SOCKS5 UDP 响应报文
-	// 由于 localUDPConn 已 Dial 到 SOCKS5 服务器的 UDP 地址，
-	// 其 Read 方法只会返回来自该地址的包。
-	respBuf := make([]byte, 65535) // Buffer to receive full SOCKS5 UDP packet
-	nResp, err := u.localUDPConn.Read(respBuf)
+// ReadFrom 从 SOCKS5 代理读取一个UDP包，实现 net.PacketConn 接口。
+// 它调用 localUDPConn.Read() 获取SOCKS5响应，然后解析出真正的源地址。
+func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	if pc.localUDPConn == nil {
+		return 0, nil, net.ErrClosed
+	}
+	// 1. 从已连接的 localUDPConn 读取完整的 SOCKS5 UDP 响应报文。
+	//    这会从 SOCKS5 服务器的 UDP 端口接收数据。
+	respBuf := make([]byte, 65535)
+	nResp, err := pc.localUDPConn.Read(respBuf) // 使用 Read() 是正确的
 	if err != nil {
-		//直接返回err，不影响调用者判断err是否Timeout
-		return 0, err
+		return 0, nil, err
 	}
 
-	// 2. 解析 SOCKS5 UDP 响应报头
-	if nResp < 10 { // Min SOCKS5 UDP header for IPv4
-		return 0, fmt.Errorf("malformed SOCKS5 UDP response (too short): %d bytes", nResp)
+	// 2. 解析 SOCKS5 UDP 响应报头以找出真正的源地址
+	if nResp < 10 { // IPv4 的最小报头长度
+		return 0, nil, fmt.Errorf("malformed SOCKS5 UDP response (too short): %d bytes", nResp)
 	}
 
-	// resp_rsv := respBuf[0:2]
 	resp_frag := respBuf[2]
-	resp_atyp := respBuf[3]
 	if resp_frag != 0x00 {
-		log.Printf("Warning: SOCKS5 UDP response fragmented. Not supported.")
+		log.Printf("Warning: SOCKS5 UDP response fragmented. Fragmentation is not supported.")
 	}
 
-	responseOffset := 4
+	resp_atyp := respBuf[3]
+	headerOffset := 4
 	var sourceIP net.IP
 	var sourcePort int
 
 	switch resp_atyp {
 	case ATYP_IPV4:
-		if nResp < responseOffset+4+2 {
-			return 0, fmt.Errorf("malformed IPv4 SOCKS5 UDP response")
+		if nResp < headerOffset+4+2 {
+			return 0, nil, fmt.Errorf("malformed IPv4 SOCKS5 UDP response")
 		}
-		sourceIP = net.IPv4(respBuf[responseOffset], respBuf[responseOffset+1], respBuf[responseOffset+2], respBuf[responseOffset+3])
-		responseOffset += 4
+		sourceIP = net.IP(respBuf[headerOffset : headerOffset+4])
+		headerOffset += 4
 	case ATYP_IPV6:
-		if nResp < responseOffset+16+2 {
-			return 0, fmt.Errorf("malformed IPv6 SOCKS5 UDP response")
+		if nResp < headerOffset+16+2 {
+			return 0, nil, fmt.Errorf("malformed IPv6 SOCKS5 UDP response")
 		}
-		sourceIP = respBuf[responseOffset : responseOffset+16]
-		responseOffset += 16
+		sourceIP = net.IP(respBuf[headerOffset : headerOffset+16])
+		headerOffset += 16
 	case ATYP_DOMAINNAME:
-		if nResp < responseOffset+1 {
-			return 0, fmt.Errorf("malformed domain SOCKS5 UDP response (no length)")
+		if nResp < headerOffset+1 {
+			return 0, nil, fmt.Errorf("malformed domain SOCKS5 UDP response (no length)")
 		}
-		domainLen := int(respBuf[responseOffset])
-		responseOffset += 1
-		if nResp < responseOffset+domainLen+2 {
-			return 0, fmt.Errorf("malformed domain SOCKS5 UDP response (short data)")
+		domainLen := int(respBuf[headerOffset])
+		headerOffset += 1
+		if nResp < headerOffset+domainLen+2 {
+			return 0, nil, fmt.Errorf("malformed domain SOCKS5 UDP response (short data)")
 		}
-		sourceIP = net.ParseIP(string(respBuf[responseOffset : responseOffset+domainLen]))
-		responseOffset += domainLen
+		domain := string(respBuf[headerOffset : headerOffset+domainLen])
+		ips, err := net.LookupIP(domain)
+		if err != nil || len(ips) == 0 {
+			return 0, nil, fmt.Errorf("failed to resolve source domain from SOCKS5 response: %s", domain)
+		}
+		sourceIP = ips[0]
+		headerOffset += domainLen
 	default:
-		return 0, fmt.Errorf("unsupported ATYP in SOCKS5 UDP response: %d", resp_atyp)
+		return 0, nil, fmt.Errorf("unsupported ATYP in SOCKS5 UDP response: %d", resp_atyp)
 	}
-	sourcePort = int(respBuf[responseOffset])<<8 | int(respBuf[responseOffset+1])
-	responseOffset += 2
+	sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
+	dataOffset := headerOffset + 2
 
-	// 3. 将原始数据（剥离 SOCKS5 头部后的数据）复制到传入的 b 缓冲区
-	dataLen := nResp - responseOffset
-	if dataLen < 0 { // Should not happen with correct parsing
-		return 0, fmt.Errorf("invalid SOCKS5 UDP response data length after parsing header")
+	// 构造真正的源地址
+	sourceAddr := &net.UDPAddr{IP: sourceIP, Port: sourcePort}
+
+	// 3. 将载荷数据复制到用户提供的缓冲区 b
+	dataLen := nResp - dataOffset
+	if dataLen < 0 {
+		return 0, nil, fmt.Errorf("invalid SOCKS5 UDP response data length")
 	}
 	if dataLen > len(b) {
-		// 如果数据包大于用户提供的缓冲区，则截断
-		n = copy(b, respBuf[responseOffset:responseOffset+len(b)])
+		n = copy(b, respBuf[dataOffset:dataOffset+len(b)])
 		log.Printf("Warning: UDP response truncated. Packet size: %d, Buffer size: %d", dataLen, len(b))
 	} else {
-		n = copy(b, respBuf[responseOffset:nResp])
+		n = copy(b, respBuf[dataOffset:nResp])
 	}
 
-	u.lastPacketAddr = net.JoinHostPort(sourceIP.String(), strconv.Itoa(sourcePort))
-	if u.targetUDPAddr == nil {
-		if resp_atyp != ATYP_DOMAINNAME {
-			u.targetUDPAddr, _ = net.ResolveUDPAddr("udp", u.lastPacketAddr)
-		}
-	}
-	u.onceRecv1stPacket.Do(func() {
-		if u.targetUDPAddr != nil {
-			log.Printf("UDP: %s<-%s (first inbound packet of session)", u.localUDPConn.LocalAddr().String(), u.targetUDPAddr.String())
-		}
-	})
-	return n, nil
+	return n, sourceAddr, nil
 }
 
-func (u *UDPConnWrapper) GetLastPacketRemoteAddr() string {
-	return u.lastPacketAddr
-}
-
-// Write 将数据写入 UDPConnWrapper (内部会封装成 SOCKS5 UDP 数据报)
-func (u *UDPConnWrapper) Write(b []byte) (n int, err error) {
-	if u.localUDPConn == nil {
-		return 0, fmt.Errorf("UDPConnWrapper is closed or not initialized")
-	}
-	targetAddr := ""
-	if u.targetUDPAddr == nil {
-		targetAddr = u.strTargetUDPAddr
-	} else {
-		targetAddr = u.targetUDPAddr.String()
-	}
-	host, portStr, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		return 0, fmt.Errorf("invalid target address: %w", err)
+// WriteTo 将一个UDP包通过SOCKS5代理发送到指定的目标地址addr，实现 net.PacketConn 接口。
+// 它将用户数据封装在SOCKS5头部中，然后调用 localUDPConn.Write() 发送到SOCKS5服务器。
+func (pc *Socks5UDPPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+	if pc.localUDPConn == nil {
+		return 0, net.ErrClosed
 	}
 
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return 0, fmt.Errorf("invalid target port: %w", err)
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		var err error
+		udpAddr, err = net.ResolveUDPAddr(addr.Network(), addr.String())
+		if err != nil {
+			return 0, fmt.Errorf("invalid or non-UDP target address: %w", err)
+		}
 	}
+
+	host := udpAddr.IP.String()
+	port := udpAddr.Port
 
 	addrBytes, atyp, err := parseHostPortToSocksAddr(host)
 	if err != nil {
-		return 0, fmt.Errorf("parse target host/port error: %w", err)
+		return 0, fmt.Errorf("failed to parse target host for SOCKS5 header: %w", err)
 	}
 
-	if atyp != ATYP_DOMAINNAME && u.targetUDPAddr == nil {
-		u.targetUDPAddr, err = net.ResolveUDPAddr("udp", u.strTargetUDPAddr)
-		if err != nil {
-			return 0, fmt.Errorf("parse target host/port error: %w", err)
-		}
-	}
-
-	// 构建 SOCKS5 UDP 数据报头
-	socks5UdpHeader := []byte{
+	// 构建 SOCKS5 UDP 请求报头
+	header := []byte{
 		SOCKS5_UDP_RSV >> 8, SOCKS5_UDP_RSV & 0xFF, // RSV
-		0x00, // FRAG (Always 0 as we don't support fragmentation)
+		0x00, // FRAG
 		atyp, // ATYP
 	}
-	socks5UdpHeader = append(socks5UdpHeader, addrBytes...)
-	socks5UdpHeader = append(socks5UdpHeader, byte(port>>8), byte(port&0xFF))
+	header = append(header, addrBytes...)
+	header = append(header, byte(port>>8), byte(port&0xFF))
 
-	// 完整发送到 SOCKS5 服务器 UDP 端口的数据包
-	fullUdpPacket := append(socks5UdpHeader, b...)
+	// 将SOCKS5头部和用户数据拼接
+	fullPacket := append(header, b...)
 
-	// 通过已连接到 SOCKS5 服务器 UDP 地址的 localUDPConn 发送
-	// localUDPConn 的 Write 方法会自动发送到 dialUDP 时绑定的远程地址
-	_, err = u.localUDPConn.Write(fullUdpPacket) // 使用 Write 方法
+	// 将完整的SOCKS5包写入已连接的UDP Conn，发往SOCKS5服务器。
+	// 使用 Write() 是正确的。
+	_, err = pc.localUDPConn.Write(fullPacket)
 	if err != nil {
-		return 0, fmt.Errorf("send SOCKS5 UDP packet to server error: %w", err)
+		return 0, err
 	}
-	return len(b), nil // 返回写入的原始数据包长度
+
+	// 返回写入的原始用户数据长度
+	return len(b), nil
 }
 
-// Close 关闭 UDPConnWrapper，包括 TCP 控制连接和本地 UDP socket
-func (u *UDPConnWrapper) Close() error {
+// Close 关闭连接
+func (pc *Socks5UDPPacketConn) Close() error {
 	var err error
-	u.closed.Do(func() {
-		if u.serverTCPConn != nil {
-			err = u.serverTCPConn.Close() // 关闭 TCP 控制连接
+	pc.closed.Do(func() {
+		if pc.serverTCPConn != nil {
+			err = pc.serverTCPConn.Close()
 		}
-		if u.localUDPConn != nil {
-			err = u.localUDPConn.Close() // 关闭本地 UDP socket
+		remoteaddr := ""
+		if pc.localUDPConn != nil {
+			remoteaddr = pc.localUDPConn.LocalAddr().String()
+			// 如果 serverTCPConn.Close() 出错，这里的错误可能会覆盖它。
+			// 在实际应用中可能需要更复杂的错误处理。
+			closeErr := pc.localUDPConn.Close()
+			if err == nil {
+				err = closeErr
+			}
 		}
-		// 不需要 u.wg.Wait()，因为不再有独立的 goroutine 需要等待
-		log.Println("UDPConnWrapper closed.")
+		log.Println("Socks5UDPPacketConn closed(", remoteaddr, ").")
 	})
 	return err
 }
 
-// LocalAddr 返回本地 UDP socket 的地址
-func (u *UDPConnWrapper) LocalAddr() net.Addr {
-	if u.localUDPConn != nil {
-		return u.localUDPConn.LocalAddr()
+// LocalAddr 返回本地地址
+func (pc *Socks5UDPPacketConn) LocalAddr() net.Addr {
+	if pc.localUDPConn != nil {
+		return pc.localUDPConn.LocalAddr()
 	}
 	return nil
 }
 
-// RemoteAddr 返回 Dial 时指定的 UDP 目标地址
-func (u *UDPConnWrapper) RemoteAddr() net.Addr {
-	if u.targetUDPAddr != nil {
-		return u.targetUDPAddr
-	} else {
-		addr, err := net.ResolveUDPAddr("udp", u.strTargetUDPAddr)
-		if err == nil {
-			return addr
-		}
-		return &net.UDPAddr{}
+// SetDeadline, SetReadDeadline, SetWriteDeadline 直接代理到下层连接
+func (pc *Socks5UDPPacketConn) SetDeadline(t time.Time) error {
+	if pc.localUDPConn != nil {
+		return pc.localUDPConn.SetDeadline(t)
 	}
+	return net.ErrClosed
 }
 
-// SetDeadline, SetReadDeadline, SetWriteDeadline 实现 net.Conn 接口
-func (u *UDPConnWrapper) SetDeadline(t time.Time) error {
-	if u.localUDPConn != nil {
-		return u.localUDPConn.SetDeadline(t)
+func (pc *Socks5UDPPacketConn) SetReadDeadline(t time.Time) error {
+	if pc.localUDPConn != nil {
+		return pc.localUDPConn.SetReadDeadline(t)
 	}
-	return nil
+	return net.ErrClosed
 }
-func (u *UDPConnWrapper) SetReadDeadline(t time.Time) error {
-	if u.localUDPConn != nil {
-		return u.localUDPConn.SetReadDeadline(t)
+
+func (pc *Socks5UDPPacketConn) SetWriteDeadline(t time.Time) error {
+	if pc.localUDPConn != nil {
+		return pc.localUDPConn.SetWriteDeadline(t)
 	}
-	return nil
-}
-func (u *UDPConnWrapper) SetWriteDeadline(t time.Time) error {
-	if u.localUDPConn != nil {
-		return u.localUDPConn.SetWriteDeadline(t)
-	}
-	return nil
+	return net.ErrClosed
 }
