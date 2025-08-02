@@ -16,7 +16,7 @@ import (
 type BoundUDPConn struct {
 	conn           net.PacketConn
 	connmu         sync.Mutex
-	remoteAddr     *net.UDPAddr
+	remoteAddr     net.Addr
 	keepOpen       bool
 	closeChan      chan struct{}
 	closeOnce      sync.Once // 保护closeChan
@@ -30,17 +30,24 @@ type BoundUDPConn struct {
 
 // NewBoundUDPConn 创建连接，remoteAddr为nil时允许任意源地址
 func NewBoundUDPConn(conn net.PacketConn, raddr string, keepOpen bool) *BoundUDPConn {
-	var udpaddr *net.UDPAddr
-	var err error
+	var remoteAddr net.Addr
 	if raddr != "" {
-		udpaddr, err = net.ResolveUDPAddr("udp", raddr)
-		if err != nil {
-			return nil
+		host, _, err := net.SplitHostPort(raddr)
+		if err == nil {
+			ip := net.ParseIP(host)
+			if ip != nil {
+				remoteAddr, _ = net.ResolveUDPAddr("udp", raddr)
+			} else {
+				remoteAddr = &NameUDPAddr{
+					Net:     "name",
+					Address: raddr,
+				}
+			}
 		}
 	}
 	return &BoundUDPConn{
 		conn:       conn,
-		remoteAddr: udpaddr,
+		remoteAddr: remoteAddr,
 		keepOpen:   keepOpen,
 		closeChan:  make(chan struct{}),
 	}
@@ -49,23 +56,6 @@ func NewBoundUDPConn(conn net.PacketConn, raddr string, keepOpen bool) *BoundUDP
 // SetIdleTimeout 设置最大空闲时间，如果超过这个时间没收到数据，则Read返回错误
 func (b *BoundUDPConn) SetIdleTimeout(timeout time.Duration) {
 	b.idleTimeout = timeout
-}
-
-// WaitAndLockRemote 阻塞接收首个包并锁定源地址
-func (b *BoundUDPConn) WaitAndLockRemote() error {
-	b.conn.SetReadDeadline(time.Time{})
-	buf := make([]byte, 65507)
-	n, addr, err := b.conn.ReadFrom(buf)
-	if err != nil {
-		return err
-	}
-	udpAddr, ok := addr.(*net.UDPAddr)
-	if !ok {
-		return fmt.Errorf("received address is not a *net.UDPAddr, it's a %T", addr)
-	}
-	b.remoteAddr = udpAddr
-	b.firstPacket = buf[:n]
-	return nil
 }
 
 // SetRemoteAddr 动态设置目标地址
@@ -95,6 +85,28 @@ func (b *BoundUDPConn) Rebuild() (*net.UDPConn, error) {
 	return c, e
 }
 
+func isSameUDPAddress(addr1, addr2 net.Addr) bool {
+	daddr1, ok1 := addr1.(*net.UDPAddr)
+	daddr2, ok2 := addr2.(*net.UDPAddr)
+	if ok1 && ok2 {
+		if !(daddr2.IP.Equal(daddr1.IP) && daddr2.Port == daddr1.Port) {
+			return false
+		}
+	} else if addr1.String() != addr2.String() {
+		return false
+	}
+	return true
+}
+
+func isSamePort(a, b string) bool {
+	_, portA, errA := net.SplitHostPort(a)
+	_, portB, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return false // 无法解析就视为不一致
+	}
+	return portA == portB
+}
+
 func (b *BoundUDPConn) Read(p []byte) (int, error) {
 	select {
 	case <-b.closeChan:
@@ -122,11 +134,19 @@ func (b *BoundUDPConn) Read(p []byte) (int, error) {
 
 		switch {
 		case err == nil:
+			addrValid := false
 			udpAddr, ok := addr.(*net.UDPAddr)
 			if !ok {
-				return 0, fmt.Errorf("received address is not a *net.UDPAddr, it's a %T", addr)
+				nameAddr, ok := addr.(*NameUDPAddr)
+				if !ok {
+					return 0, fmt.Errorf("received address is not a *net.UDPAddr or *NameUDPAddr, it's a %T", addr)
+				} else {
+					//域名的地址，这里就只判断端口，因为可能域名被解析为IP了
+					addrValid = b.remoteAddr == nil || isSamePort(nameAddr.String(), b.remoteAddr.String())
+				}
+			} else {
+				addrValid = b.remoteAddr == nil || isSameUDPAddress(udpAddr, b.remoteAddr)
 			}
-			addrValid := b.remoteAddr == nil || (udpAddr.IP.Equal(b.remoteAddr.IP) && udpAddr.Port == b.remoteAddr.Port)
 			if addrValid {
 				b.lastPacketAddr = addr.String()
 				b.lastActiveTime = time.Now() // 更新最后活动时间
@@ -174,10 +194,10 @@ func (b *BoundUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, fmt.Errorf("remote address not set")
 	}
 
-	daddr, ok := addr.(*net.UDPAddr)
-	if !ok || !(b.remoteAddr.IP.Equal(daddr.IP) && b.remoteAddr.Port == daddr.Port) {
+	if !isSameUDPAddress(addr, b.remoteAddr) {
 		return 0, fmt.Errorf("cannot write to %s, only bound to %s", addr.String(), b.remoteAddr.String())
 	}
+
 	return b.conn.WriteTo(p, b.remoteAddr)
 }
 
@@ -438,6 +458,19 @@ func (c *UDPCustomConn) SetWriteDeadline(t time.Time) error {
 	defer c.deadlineMu.Unlock()
 	c.writeDeadline = t
 	return nil
+}
+
+type NameUDPAddr struct {
+	Net     string // "name"
+	Address string
+}
+
+func (a *NameUDPAddr) Network() string {
+	return a.Net
+}
+
+func (a *NameUDPAddr) String() string {
+	return a.Address
 }
 
 // UDPCustomDialer 结构体定义 (省略大部分方法实现，只保留需要注入logger的部分)
@@ -882,34 +915,60 @@ func (l *UDPCustomListener) Addr() net.Addr {
 // 它会将所有 Write 操作都发送到固定的远端地址。
 type ConnFromPacketConn struct {
 	net.PacketConn
-	remoteAddr net.Addr
+	SupportNameUDPAddr bool
+	updateNameUDPAddr  bool
+	remoteAddr         net.Addr
 }
 
 // NewConnFromPacketConn 创建一个 net.Conn，其通信被绑定到一个固定的远端地址。
-func NewConnFromPacketConn(pc net.PacketConn, raddr string) (*ConnFromPacketConn, error) {
-	var remoteAddr *net.UDPAddr
-	var err error
+func NewConnFromPacketConn(pc net.PacketConn, supportNameUDPAddr bool, raddr string) (*ConnFromPacketConn, error) {
+	var remoteAddr net.Addr
 	if raddr != "" {
-		remoteAddr, err = net.ResolveUDPAddr("udp", raddr)
+		host, _, err := net.SplitHostPort(raddr)
 		if err != nil {
 			return nil, err
 		}
+		ip := net.ParseIP(host)
+		if ip != nil {
+			remoteAddr, err = net.ResolveUDPAddr("udp", raddr)
+			if err != nil {
+				return nil, err
+			}
+		} else if supportNameUDPAddr {
+			remoteAddr = &NameUDPAddr{
+				Net:     "name",
+				Address: raddr,
+			}
+		} else {
+			return nil, fmt.Errorf("invalid remote address: %s", raddr)
+		}
 	}
 	return &ConnFromPacketConn{
-		PacketConn: pc,
-		remoteAddr: remoteAddr,
+		PacketConn:         pc,
+		SupportNameUDPAddr: supportNameUDPAddr,
+		remoteAddr:         remoteAddr,
 	}, nil
 }
 
 // Read 从连接中读取数据。它会忽略数据包的来源地址。
 func (c *ConnFromPacketConn) Read(b []byte) (int, error) {
 	// 调用底层的 ReadFrom，但忽略返回的 addr
-	n, _, err := c.PacketConn.ReadFrom(b)
+	n, a, err := c.PacketConn.ReadFrom(b)
+	if err == nil {
+		if c.SupportNameUDPAddr && !c.updateNameUDPAddr {
+			//第一个回复包，把NameUDPAddr的地址更新一下
+			c.remoteAddr = a
+			c.updateNameUDPAddr = true
+		}
+	}
 	return n, err
 }
 
 // Write 将数据写入到固定的远端地址。
 func (c *ConnFromPacketConn) Write(b []byte) (int, error) {
+	if c.remoteAddr == nil {
+		return 0, fmt.Errorf("remote address not set")
+	}
 	return c.PacketConn.WriteTo(b, c.remoteAddr)
 }
 

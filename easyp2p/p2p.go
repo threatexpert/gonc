@@ -364,6 +364,7 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 	if err != nil {
 		fmt.Fprintf(logWriter, "Failed(%v)\n", err)
 	} else {
+		fmt.Fprintf(logWriter, "(%d answers)", succeededSTUNResults(allResults))
 		analyzed := analyzeSTUNResults(allResults)
 		for _, item := range analyzed {
 			myInfoForExchange.Addresses = append(myInfoForExchange.Addresses, PunchingAddressInfo{
@@ -1182,7 +1183,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
 		buconn.Close()
 		if isSharedUDPConn {
-			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, addrPair.Remote.String())
+			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, false, addrPair.Remote.String())
 		} else {
 			uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote)
 		}
@@ -1198,7 +1199,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		raddr := buconn.RemoteAddr()
 		buconn.Close()
 		if isSharedUDPConn {
-			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, raddr.String())
+			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, false, raddr.String())
 		} else {
 			uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr)
 		}

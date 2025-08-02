@@ -354,8 +354,18 @@ func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, address string) 
 			return nil, false, fmt.Errorf("no IP address found for host '%s' on network '%s'", host, ipNetwork)
 		}
 
-		// 使用查询到的第一个 IP 地址，因为 resolver 已经完成了筛选
-		resolvedIP = ips[0]
+		for _, ip := range ips {
+			//DialUDP到IP地址不会实际产生网络行为，但是可以判断这个IP对于本机是否“cannot assign requested address”
+			tmpConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: 53})
+			if err == nil {
+				resolvedIP = ip
+				tmpConn.Close()
+				break
+			}
+		}
+		if resolvedIP == nil {
+			return nil, false, fmt.Errorf("no valid IP address found for host '%s' on network '%s'", host, ipNetwork)
+		}
 	}
 
 	// 阶段三：对最终解析出的 IP 地址进行 ACL 规则检查

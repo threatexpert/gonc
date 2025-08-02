@@ -100,6 +100,7 @@ google.com
 
 		// --- 出站测试 (Outbound Tests) ---
 		// 按域名拒绝
+		{"turn.cloudflare.com:80", "tcp", "outbound", false},         //
 		{"icanhazip.com:80", "tcp6", "outbound", false},              //
 		{"2001-2222-1234--8888.nip.io:80", "tcp6", "outbound", true}, //
 		{"172.16.1.1.sslip.io:80", "tcp4", "outbound", true},         //

@@ -608,6 +608,17 @@ type NatIPLocalKey struct {
 	NATIP   string // Only NAT IP part
 }
 
+func succeededSTUNResults(allResults []*STUNResult) int {
+	succeed := 0
+	for _, r := range allResults {
+		if r.Err != nil {
+			continue // Only analyze successful results
+		}
+		succeed += 1
+	}
+	return succeed
+}
+
 // analyzeSTUNResults analyzes the collected STUN results to determine NAT types
 // based on the user's specific logic (primarily port consistency).
 func analyzeSTUNResults(allResults []*STUNResult) []*AnalyzedStunResult {

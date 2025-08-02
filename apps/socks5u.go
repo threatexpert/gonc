@@ -1475,7 +1475,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			serverTCPConn: serverTCPConn,
 			localUDPConn:  localUDPConn, // 这里的 localUDPConn 已经 Dial 到 SOCKS5 服务器的 UDP 地址了
 		}
-		wrapper, err := netx.NewConnFromPacketConn(s5uPacketConn, address)
+		wrapper, err := netx.NewConnFromPacketConn(s5uPacketConn, true, address)
 		if err != nil {
 			serverTCPConn.Close()
 			return nil, fmt.Errorf("NewConnFromPacketConn(Socks5UDPPacketConn): %w", err)
@@ -1702,7 +1702,7 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 
 	resp_atyp := respBuf[3]
 	headerOffset := 4
-	var sourceIP net.IP
+	var sourceAddr net.Addr
 	var sourcePort int
 
 	switch resp_atyp {
@@ -1710,14 +1710,22 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 		if nResp < headerOffset+4+2 {
 			return 0, nil, fmt.Errorf("malformed IPv4 SOCKS5 UDP response")
 		}
-		sourceIP = net.IP(respBuf[headerOffset : headerOffset+4])
+		ip := net.IP(respBuf[headerOffset : headerOffset+4])
 		headerOffset += 4
+		sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
+		sourceAddr = &net.UDPAddr{IP: ip, Port: sourcePort}
+		headerOffset += 2
+
 	case ATYP_IPV6:
 		if nResp < headerOffset+16+2 {
 			return 0, nil, fmt.Errorf("malformed IPv6 SOCKS5 UDP response")
 		}
-		sourceIP = net.IP(respBuf[headerOffset : headerOffset+16])
+		ip := net.IP(respBuf[headerOffset : headerOffset+16])
 		headerOffset += 16
+		sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
+		sourceAddr = &net.UDPAddr{IP: ip, Port: sourcePort}
+		headerOffset += 2
+
 	case ATYP_DOMAINNAME:
 		if nResp < headerOffset+1 {
 			return 0, nil, fmt.Errorf("malformed domain SOCKS5 UDP response (no length)")
@@ -1728,22 +1736,20 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 			return 0, nil, fmt.Errorf("malformed domain SOCKS5 UDP response (short data)")
 		}
 		domain := string(respBuf[headerOffset : headerOffset+domainLen])
-		ips, err := net.LookupIP(domain)
-		if err != nil || len(ips) == 0 {
-			return 0, nil, fmt.Errorf("failed to resolve source domain from SOCKS5 response: %s", domain)
-		}
-		sourceIP = ips[0]
 		headerOffset += domainLen
+		sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
+		headerOffset += 2
+		sourceAddr = &netx.NameUDPAddr{
+			Net:     "name",
+			Address: fmt.Sprintf("%s:%d", domain, sourcePort),
+		}
+
 	default:
 		return 0, nil, fmt.Errorf("unsupported ATYP in SOCKS5 UDP response: %d", resp_atyp)
 	}
-	sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
-	dataOffset := headerOffset + 2
 
-	// 构造真正的源地址
-	sourceAddr := &net.UDPAddr{IP: sourceIP, Port: sourcePort}
-
-	// 3. 将载荷数据复制到用户提供的缓冲区 b
+	// 复制数据部分
+	dataOffset := headerOffset
 	dataLen := nResp - dataOffset
 	if dataLen < 0 {
 		return 0, nil, fmt.Errorf("invalid SOCKS5 UDP response data length")
@@ -1765,17 +1771,31 @@ func (pc *Socks5UDPPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err erro
 		return 0, net.ErrClosed
 	}
 
-	udpAddr, ok := addr.(*net.UDPAddr)
-	if !ok {
-		var err error
-		udpAddr, err = net.ResolveUDPAddr(addr.Network(), addr.String())
+	var (
+		host    string
+		port    int
+		portStr string
+	)
+
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		host = a.IP.String()
+		port = a.Port
+	case *netx.NameUDPAddr: // 自己的类型
+		host, portStr, err = net.SplitHostPort(a.Address)
+		if err != nil {
+			return 0, fmt.Errorf("invalid UDP target address: %w", err)
+		}
+		port, _ = strconv.Atoi(portStr)
+	default:
+		// fallback: try resolve (可能丢失域名)
+		udpAddr, err := net.ResolveUDPAddr(addr.Network(), addr.String())
 		if err != nil {
 			return 0, fmt.Errorf("invalid or non-UDP target address: %w", err)
 		}
+		host = udpAddr.IP.String()
+		port = udpAddr.Port
 	}
-
-	host := udpAddr.IP.String()
-	port := udpAddr.Port
 
 	addrBytes, atyp, err := parseHostPortToSocksAddr(host)
 	if err != nil {
@@ -1812,9 +1832,9 @@ func (pc *Socks5UDPPacketConn) Close() error {
 		if pc.serverTCPConn != nil {
 			err = pc.serverTCPConn.Close()
 		}
-		remoteaddr := ""
+		//remoteaddr := ""
 		if pc.localUDPConn != nil {
-			remoteaddr = pc.localUDPConn.LocalAddr().String()
+			//remoteaddr = pc.localUDPConn.LocalAddr().String()
 			// 如果 serverTCPConn.Close() 出错，这里的错误可能会覆盖它。
 			// 在实际应用中可能需要更复杂的错误处理。
 			closeErr := pc.localUDPConn.Close()
@@ -1822,7 +1842,7 @@ func (pc *Socks5UDPPacketConn) Close() error {
 				err = closeErr
 			}
 		}
-		log.Println("Socks5UDPPacketConn closed(", remoteaddr, ").")
+		//log.Println("Socks5UDPPacketConn closed(", remoteaddr, ").")
 	})
 	return err
 }
