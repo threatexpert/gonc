@@ -124,6 +124,37 @@ README in [English](./README_en.md) and [中文](./README.md)
  - Attempts direct connection in the following priority order: IPv6 TCP > IPv4 TCP > IPv4 UDP, aiming for true peer-to-peer communication
  - No relay servers are used, and no fallback mechanisms are provided — either the connection fails, or it's a real P2P success
 
+### How to Deploy a Relay Server for Cases Where P2P Is Not Feasible
+ - A SOCKS5 server with UDP ASSOCIATE support running on a public IP is sufficient as a relay. You can also run gonc's built-in SOCKS5 proxy on your own VPS to act as a relay server.
+
+    The following command starts a SOCKS5 proxy that only supports UDP forwarding. The -psk and -tls options enable encryption and PSK-based authentication. Note: Don’t just open port 1080 in your firewall—UDP forwarding uses random ports for each session.
+
+    `gonc -e ":s5s -u -c=0" -psk <password> -tls -k -l 1080`
+
+ - When P2P fails, you only need one side of gonc to retry the P2P process using the -x option to route through the SOCKS5 relay:
+
+    `gonc -p2p <randomString> -x "-psk <password> -tls <socks5server-ip>:1080" `
+
+    Alternatively, you can use a standard SOCKS5 proxy server that supports UDP forwarding:
+
+    `gonc -p2p <randomString> -x "<socks5server-ip>:1080" -auth "user:password"`
+
+For example, if both peers are behind symmetric NATs and P2P fails, having just one side use a SOCKS5 UDP relay effectively changes its NAT behavior to “easy,” making it much easier to establish a connection. The data remains end-to-end encrypted.
+
+
+### Used public servers（STUN & MQTT）：
+
+		"tcp://turn.cloudflare.com:80",
+		"udp://turn.cloudflare.com:53",
+		"udp://stun.l.google.com:19302",
+		"udp://stun.miwifi.com:3478",
+		"global.turn.twilio.com:3478",
+		"stun.nextcloud.com:443",
+
+ 		"tcp://broker.hivemq.com:1883",
+		"tcp://broker.emqx.io:1883",
+		"tcp://test.mosquitto.org:1883",
+
 ### How effective is gonc at NAT traversal?
 
 #### Except in symmetric NAT scenarios on both ends, gonc achieves a very high success rate
