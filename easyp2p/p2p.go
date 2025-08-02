@@ -1183,7 +1183,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
 		buconn.Close()
 		if isSharedUDPConn {
-			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, false, addrPair.Remote.String())
+			uconnBrandnew, err = newConnFromPacketConn(uconn, addrPair.Remote.String())
 		} else {
 			uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote)
 		}
@@ -1199,7 +1199,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		raddr := buconn.RemoteAddr()
 		buconn.Close()
 		if isSharedUDPConn {
-			uconnBrandnew, err = netx.NewConnFromPacketConn(uconn, false, raddr.String())
+			uconnBrandnew, err = newConnFromPacketConn(uconn, raddr.String())
 		} else {
 			uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr)
 		}
@@ -1221,6 +1221,18 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
 	}
 	return uconnBrandnew, isClient, sharedKey, nil
+}
+
+func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPacketConn, error) {
+	//uconn如果已经是ConnFromPacketConn，修改配置后复用，不再嵌套
+	if conn, ok := uconn.(*netx.ConnFromPacketConn); ok {
+		err := conn.Config(false, raddr)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+	return netx.NewConnFromPacketConn(uconn, false, raddr)
 }
 
 func CreateUDPConnFromAddr(laddr, raddr net.Addr) (net.Conn, error) {

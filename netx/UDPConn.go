@@ -922,17 +922,28 @@ type ConnFromPacketConn struct {
 
 // NewConnFromPacketConn 创建一个 net.Conn，其通信被绑定到一个固定的远端地址。
 func NewConnFromPacketConn(pc net.PacketConn, supportNameUDPAddr bool, raddr string) (*ConnFromPacketConn, error) {
+	conn := &ConnFromPacketConn{
+		PacketConn: pc,
+	}
+	err := conn.Config(supportNameUDPAddr, raddr)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (c *ConnFromPacketConn) Config(supportNameUDPAddr bool, raddr string) error {
 	var remoteAddr net.Addr
 	if raddr != "" {
 		host, _, err := net.SplitHostPort(raddr)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ip := net.ParseIP(host)
 		if ip != nil {
 			remoteAddr, err = net.ResolveUDPAddr("udp", raddr)
 			if err != nil {
-				return nil, err
+				return err
 			}
 		} else if supportNameUDPAddr {
 			remoteAddr = &NameUDPAddr{
@@ -940,14 +951,13 @@ func NewConnFromPacketConn(pc net.PacketConn, supportNameUDPAddr bool, raddr str
 				Address: raddr,
 			}
 		} else {
-			return nil, fmt.Errorf("invalid remote address: %s", raddr)
+			return fmt.Errorf("invalid remote address: %s", raddr)
 		}
 	}
-	return &ConnFromPacketConn{
-		PacketConn:         pc,
-		SupportNameUDPAddr: supportNameUDPAddr,
-		remoteAddr:         remoteAddr,
-	}, nil
+	c.updateNameUDPAddr = false
+	c.SupportNameUDPAddr = supportNameUDPAddr
+	c.remoteAddr = remoteAddr
+	return nil
 }
 
 // Read 从连接中读取数据。它会忽略数据包的来源地址。

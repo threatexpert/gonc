@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.7"
+	VERSION                                              = "v2.1.8"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -727,18 +727,26 @@ func runDialMode(network, host, port string) {
 	}
 
 	// 连接成功后打印信息
-	remoteFullAddr := net.JoinHostPort(host, port)
+	remoteTargetAddr := net.JoinHostPort(host, port)
 	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-		if *proxyAddr == "" {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteFullAddr)
-		} else {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String(), remoteFullAddr)
+		if *proxyAddr != "" {
+			proxyRemoteAddr := ""
+			if pktConn, ok := conn.(*netx.ConnFromPacketConn); ok {
+				if s5conn, ok := pktConn.PacketConn.(*apps.Socks5UDPPacketConn); ok {
+					proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
+				}
+			}
+			if proxyRemoteAddr != "" {
+				fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
+			} else {
+				fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteTargetAddr)
+			}
 		}
 	} else {
 		if *proxyAddr == "" {
 			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
 		} else {
-			fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteFullAddr)
+			fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteTargetAddr)
 		}
 	}
 
@@ -1553,7 +1561,17 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 		return nil, err
 	}
 	if nconn.IsUDP {
-		fmt.Fprintf(os.Stderr, "UDP ready for: %s|%s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
+		proxyRemoteAddr := ""
+		if pktConn, ok := conn.(*netx.ConnFromPacketConn); ok {
+			if s5conn, ok := pktConn.PacketConn.(*apps.Socks5UDPPacketConn); ok {
+				proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
+			}
+		}
+		if proxyRemoteAddr != "" {
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, conn.RemoteAddr().String())
+		} else {
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
+		}
 	} else {
 		fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
 	}

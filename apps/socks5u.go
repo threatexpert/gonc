@@ -1440,8 +1440,8 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			return nil, fmt.Errorf("read SOCKS5 UDP ASSOCIATE response error: %w", err)
 		}
 
-		// 判断如果服务端给的地址是全0, 则用serverTCPConn.RemoteAddr()的地址
-		if bindAddr.IP.IsUnspecified() { // 检查是否是 0.0.0.0 或 ::
+		// 判断如果服务端给的地址是全0, 以及是否给了内网地址，客户端则用serverTCPConn.RemoteAddr()的地址
+		if bindAddr.IP.IsUnspecified() || bindAddr.IP.IsPrivate() { // 检查是否是 0.0.0.0 或 ::
 			// 获取 TCP 连接的对端地址，即 SOCKS5 服务器的 IP
 			if tcpRemoteAddr, ok := serverTCPConn.RemoteAddr().(*net.TCPAddr); ok {
 				actualSocks5ServerUDPAddr = tcpRemoteAddr.IP
@@ -1674,6 +1674,10 @@ type Socks5UDPPacketConn struct {
 
 	// 标记是否已关闭
 	closed sync.Once
+}
+
+func (pc *Socks5UDPPacketConn) GetUDPAssociateAddr() net.Addr {
+	return pc.localUDPConn.RemoteAddr()
 }
 
 // ReadFrom 从 SOCKS5 代理读取一个UDP包，实现 net.PacketConn 接口。

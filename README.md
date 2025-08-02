@@ -159,13 +159,13 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
  - 需要自己有一个公网IP的服务器，运行gonc本身的socks5代理服务器便可让其成为中转服务器。
 
-    下面命令启动了支持UDP转发功能的socks5代理，-psk和-tls开启了加密和认证
+    下面命令启动了仅支持UDP转发功能的socks5代理，-psk和-tls开启了加密和PSK口令认证。注意防火墙不能只开放1080，因为每次提供转发的UDP端口是随机。
 
-    `gonc -e ":s5s -u" -psk randomString -tls -k -l 1080`
+    `gonc -e ":s5s -u -c=0" -psk 口令 -tls -k -l 1080`
 
  - P2P遇到困难的时候，只需要有一端的gonc使用-x参数再进行P2P就可以。
 
-    `gonc -p2p randomString -x "-psk randomString -tls <socks5server-ip>:1080"`
+    `gonc -p2p randomString -x "-psk 口令 -tls <socks5server-ip>:1080"`
 
 例如原本两端都是对称型NAT，无法P2P，现在一端使用了socks5代理（UDP模式），就相当于转为容易型的NAT了，于是就能很容易和其他建立连接，数据加密仍然是端到端的。
 
