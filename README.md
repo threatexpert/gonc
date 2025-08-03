@@ -137,13 +137,13 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 ### 给其他应用建立通道
 - 帮WireGuard打洞组VPN
 
-    两端的WireGuard节点都配置Endpoint = 127.0.0.1:51821，并且在两端都运行下面同样的参数：
+    在被动等待连接的PC-S运行下面的参数（直接拿节点公钥来当randomString，接口的监听端口51820）：
 
-    `gonc -e ":pf -p2p randomString -kcp" -u -k -l 127.0.0.1 51821`
+    `gonc -p2p PS-S的公钥 -mqtt-wait -u -k -e ":pf -u 127.0.0.1:51820"`
 
-    如果有一端需要走socks5代理，代理的参数要在:pf里的-x
+    其他发起主动连接的PC-C，设置WireGuard节点PS-S公钥的Endpoint = 127.0.0.1:51821，接口的监听端口51820，gonc运行下面的参数，-k可以让gonc在网络异常后自动重新建立连接。
 
-    `gonc -e ":pf -x \"-psk randomString -tls <socks5server-ip>:1080\" -p2p randomString -kcp" -u -k -l 127.0.0.1 51821`
+    `gonc -p2p PS-S的公钥 -mqtt-hello -u -k -e ":pf -u -local 127.0.0.1:51821 127.0.0.1:51820"`
 
 
 ## P2P NAT 穿透能力

@@ -116,6 +116,18 @@ README in [English](./README_en.md) and [中文](./README.md)
 
     `gonc.exe -e ":pf -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
+### Establishing a Tunnel for Other Applications
+ - Assist WireGuard in NAT Traversal to Form a VPN
+
+    On the passive (listening) side, PC-S, run the following command (using the WireGuard peer’s public key as the randomString, and assuming WireGuard is listening on port 51820):
+
+    `gonc -p2p <PublicKey-of-PS-S> -mqtt-wait -u -k -e ":pf -u 127.0.0.1:51820"`
+
+    On the active (initiating) side, PC-C, set the WireGuard peer (PS-S)'s Endpoint to 127.0.0.1:51821, with its own WireGuard interface listening on 51820. Then run the following command. The -k flag allows gonc to automatically reconnect if the network drops:
+
+    `gonc -p2p <PublicKey-of-PS-S> -mqtt-hello -u -k -e ":pf -u -local 127.0.0.1:51821 127.0.0.1:51820"`
+
+
 ## P2P NAT Traversal Capabilities
 ### How does gonc establish a P2P connection?
 

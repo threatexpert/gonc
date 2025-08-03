@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.1.8"
+	VERSION                                              = "v2.2.0"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -83,12 +83,12 @@ var (
 	enablePty         = flag.Bool("pty", false, "put the terminal into raw mode")
 	term_oldstat      *term.State
 	useSTUN           = flag.Bool("stun", false, "use STUN to discover public IP")
-	stunSrv           = flag.String("stunsrv", "tcp://turn.cloudflare.com:80,udp://turn.cloudflare.com:53,udp://stun.l.google.com:19302,udp://stun.miwifi.com:3478,global.turn.twilio.com:3478,stun.nextcloud.com:443", "stun servers")
-	MQTTServers       = flag.String("mqttsrv", "tcp://broker.hivemq.com:1883,tcp://broker.emqx.io:1883,tcp://test.mosquitto.org:1883", "MQTT servers")
+	stunSrv           = flag.String("stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
+	MQTTServers       = flag.String("mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
 	autoP2P           = flag.String("p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
 	useMutilPath      = flag.Bool("mp", false, "enable multipath(NOT IMPL)")
-	MQTTWait          = flag.String("mqtt-wait", "", "wait for MQTT hello message before initiating P2P connection")
-	MQTTPush          = flag.String("mqtt-push", "", "send MQTT hello message before initiating P2P connection")
+	useMQTTWait       = flag.Bool("mqtt-wait", false, "wait for MQTT hello message before initiating P2P connection")
+	useMQTTHello      = flag.Bool("mqtt-hello", false, "send MQTT hello message before initiating P2P connection")
 	useIPv4           = flag.Bool("4", false, "Forces to use IPv4 addresses only")
 	useIPv6           = flag.Bool("6", false, "Forces to use IPv4 addresses only")
 	useDNS            = flag.String("dns", "", "set DNS Server")
@@ -194,9 +194,7 @@ func configureAppMode() {
 	if *runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(*runAppFileServ, "\\", "/")
 		*runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
-		if *MQTTWait == "" {
-			*MQTTWait = "hello"
-		}
+		*useMQTTWait = true
 		*progressEnabled = true
 		*keepOpen = true
 	} else if *runAppFileGet != "" {
@@ -205,14 +203,12 @@ func configureAppMode() {
 		if *appMuxListenOn != "" {
 			apps.VarmuxLastListenAddress = *appMuxListenOn
 		}
-		if *MQTTPush == "" {
-			*MQTTPush = "hello"
-		}
+		*useMQTTHello = true
 		*keepOpen = true
 	} else if *appMuxSocksMode {
 		*runCmd = ":mux socks5"
-		if *MQTTWait == "" {
-			*MQTTWait = "hello"
+		if !*useMQTTWait {
+			*useMQTTWait = true
 		}
 		*progressEnabled = true
 		*keepOpen = true
@@ -221,9 +217,7 @@ func configureAppMode() {
 			*appMuxListenOn = "0"
 		}
 		*runCmd = fmt.Sprintf(":mux -l %s", *appMuxListenOn)
-		if *MQTTPush == "" {
-			*MQTTPush = "hello"
-		}
+		*useMQTTHello = true
 		*keepOpen = true
 	}
 
@@ -438,7 +432,7 @@ func runP2PMode(network, P2PSessionKey string) {
 				time.Sleep(10 * time.Second)
 				continue
 			}
-			if *MQTTWait != "" {
+			if *useMQTTWait {
 				go handleNegotiatedConnection(nconn, stats_in, stats_out)
 			} else {
 				handleNegotiatedConnection(nconn, stats_in, stats_out)
@@ -1453,73 +1447,29 @@ func ShowPublicIP(network, bind string) error {
 	return err
 }
 
-func Mqtt_ensure_ready(sessionKey string) error {
-	var msg string
+func Mqtt_ensure_ready(sessionKey string) (string, error) {
 	var err error
+	var salt string
 
-	if *MQTTWait != "" {
-		msg, err = easyp2p.MqttWait(sessionKey, 10*time.Minute, os.Stderr)
+	if *useMQTTWait {
+		salt, err = easyp2p.MqttWait(sessionKey, 30*time.Minute, os.Stderr)
 		if err != nil {
-			return fmt.Errorf("mqtt-wait: %v", err)
-		}
-		if msg != *MQTTWait {
-			return fmt.Errorf("mqtt-wait: not the expected message")
+			return "", fmt.Errorf("mqtt-wait: %v", err)
 		}
 	}
 
-	if *MQTTPush != "" {
-		err = easyp2p.MqttPush(*MQTTPush, sessionKey, os.Stderr)
+	if *useMQTTHello {
+		salt, err = easyp2p.MQTTHello(sessionKey, 15*time.Second, os.Stderr)
 		if err != nil {
-			return fmt.Errorf("mqtt-push: %v", err)
+			return "", fmt.Errorf("mqtt-hello: %v", err)
 		}
-
-		// Ensure stopMqttPushChan is properly initialized
-		select {
-		case <-stopMqttPushChan:
-			// If already closed, recreate the channel
-			stopMqttPushChan = make(chan struct{})
-		default:
-		}
-
-		// Start periodic push
-		go func() {
-			ticker := time.NewTicker(7 * time.Second)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					err := easyp2p.MqttPush(*MQTTPush, sessionKey, io.Discard)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "mqtt-push periodic error: %v\n", err)
-					}
-				case <-stopMqttPushChan:
-					return
-				}
-			}
-		}()
 	}
-	return nil
-}
-
-var stopMqttPushChan = make(chan struct{})
-
-func Mqtt_stop_pushing() {
-	if *MQTTPush == "" {
-		return
-	}
-	select {
-	case <-stopMqttPushChan:
-		// Already closed, do nothing
-	default:
-		close(stopMqttPushChan)
-	}
+	return salt, nil
 }
 
 func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
-	defer Mqtt_stop_pushing()
-
-	err := Mqtt_ensure_ready(sessionKey)
+	//使用其他客户端push过来的salt，构建一个仅和对端单独共享的topic，避免P2P交换地址时有多个端点在一起错乱发生
+	topicSalt, err := Mqtt_ensure_ready(sessionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1529,7 +1479,8 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 		return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
 	}
 
-	connInfo, err := easyp2p.Easy_P2P(network, sessionKey, sharedPacketConn, os.Stderr)
+	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
+	connInfo, err := easyp2p.Easy_P2P(network, sessionKey+topicSalt, sharedPacketConn, os.Stderr)
 	if err != nil {
 		if sharedPacketConn != nil {
 			sharedPacketConn.Close()
