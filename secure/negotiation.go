@@ -19,21 +19,23 @@ import (
 )
 
 type NegotiationConfig struct {
-	Label                string
-	IsClient             bool
-	SecureLayer          string //tls tls13 dtls ss
-	Certs                []tls.Certificate
-	TlsSNI               string
-	KcpWithUDP           bool
-	KcpEncryption        bool //是否开启kcp加密
-	Key                  string
-	KeyType              string // ECDHE or PSK
-	UdpOutputBlockSize   int
-	KcpWindowSize        int
-	KeepAlive            int
-	UdpKeepAlivePayload  string
-	KCPIdleTimeoutSecond int
-	UDPIdleTimeoutSecond int
+	Label                     string
+	IsClient                  bool
+	SecureLayer               string //tls tls13 dtls ss
+	Certs                     []tls.Certificate
+	TlsSNI                    string
+	InsecureSkipVerify        bool
+	KcpWithUDP                bool
+	KcpEncryption             bool //是否开启kcp加密
+	Key                       string
+	KeyType                   string // ECDHE or PSK
+	ErrorOnFailKeyingMaterial bool   //如果keyingMaterial异常，协商要报错
+	UdpOutputBlockSize        int
+	KcpWindowSize             int
+	KeepAlive                 int
+	UdpKeepAlivePayload       string
+	KCPIdleTimeoutSecond      int
+	UDPIdleTimeoutSecond      int
 }
 
 var (
@@ -43,10 +45,12 @@ var (
 	UdpKeepAlivePayload  string = "ping\n"
 	KCPIdleTimeoutSecond int    = 41
 	UDPIdleTimeoutSecond int    = 60 * 5
+	TLSVerifyCert        bool   = false
 )
 
 func NewNegotiationConfig() *NegotiationConfig {
 	return &NegotiationConfig{
+		InsecureSkipVerify:   !TLSVerifyCert,
 		UdpOutputBlockSize:   UdpOutputBlockSize,
 		KcpWindowSize:        KcpWindowSize,
 		KeepAlive:            KeepAlive,
@@ -254,7 +258,7 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeK
 	// 创建 TLS 配置
 	tlsConfig := &tls.Config{
 		CipherSuites:             allCiphers,
-		InsecureSkipVerify:       true,             // 忽略证书验证（可选）
+		InsecureSkipVerify:       config.InsecureSkipVerify,
 		MinVersion:               tls.VersionTLS10, // 至少 TLSv1
 		MaxVersion:               tls.VersionTLS13, // 最大支持 TLSv1.3
 		PreferServerCipherSuites: true,             // 优先使用服务器的密码套件
@@ -307,17 +311,20 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeK
 	}
 	fmt.Fprintf(logWriter, "completed.\n")
 
-	state := conn_tls.ConnectionState()
-	label := "EXPERIMENTAL-SERVER-KEY"
-	keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
-	if err != nil {
-		fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
-		conn_tls.Close()
-		return nil
-	} else {
-		copy(storeKeyingMaterial[:], keyingMaterial)
+	if storeKeyingMaterial != nil {
+		state := conn_tls.ConnectionState()
+		label := "EXPERIMENTAL-SERVER-KEY"
+		keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
+		if err != nil {
+			if config.ErrorOnFailKeyingMaterial {
+				fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
+				conn_tls.Close()
+				return nil
+			}
+		} else {
+			copy(storeKeyingMaterial[:], keyingMaterial)
+		}
 	}
-
 	return conn_tls
 }
 
@@ -331,7 +338,7 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 	// DTLS 配置
 	dtlsConfig := &dtls.Config{
 		CipherSuites:         allCiphers,
-		InsecureSkipVerify:   true, // 和 tls.Config 一样，跳过证书校验
+		InsecureSkipVerify:   config.InsecureSkipVerify,
 		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
 		FlightInterval:       2 * time.Second,
 	}
@@ -391,20 +398,26 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 	conn.SetDeadline(time.Time{}) // 取消握手超时
 	fmt.Fprintf(logWriter, "completed.\n")
 
-	state, ok := dtlsConn.ConnectionState()
-	if !ok {
-		fmt.Fprintf(logWriter, "failed to get DTLS connection state\n")
-		dtlsConn.Close()
-		return nil
-	} else {
-		label := "EXPERIMENTAL-SERVER-KEY"
-		keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
-		if err != nil {
-			fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
-			dtlsConn.Close()
-			return nil
+	if storeKeyingMaterial != nil {
+		state, ok := dtlsConn.ConnectionState()
+		if !ok {
+			if config.ErrorOnFailKeyingMaterial {
+				fmt.Fprintf(logWriter, "failed to get DTLS connection state\n")
+				dtlsConn.Close()
+				return nil
+			}
 		} else {
-			copy(storeKeyingMaterial[:], keyingMaterial)
+			label := "EXPERIMENTAL-SERVER-KEY"
+			keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
+			if err != nil {
+				if config.ErrorOnFailKeyingMaterial {
+					fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
+					dtlsConn.Close()
+					return nil
+				}
+			} else {
+				copy(storeKeyingMaterial[:], keyingMaterial)
+			}
 		}
 	}
 	return dtlsConn

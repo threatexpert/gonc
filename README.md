@@ -33,6 +33,16 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     gonc -p2p randomString
     ```
 
+    注意如果另一端耽误了运行时机，先运行的大概半分钟内无法发现对端来交互信息则会退出。因此还支持基于MQTT消息订阅的等待机制，使用-mqtt-wait和-mqtt-hello来同步双方开始P2P的时机。例如，下面用了-mqtt-wait可以持续等待，
+
+    ```bash
+    gonc -p2p randomString -mqtt-wait
+    ```
+    另一端使用：
+    ```bash
+    gonc -p2p randomString -mqtt-hello
+    ```
+
 ### 反弹 Shell（类UNIX支持pseudo-terminal shell ）
 - 监听端（不使用 `-keep-open`，仅接受一次连接；未使用 `-psk`，无身份认证）：
     ```bash
@@ -151,7 +161,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 ### gonc如何建立P2P？
 
  - 并发使用多个公用 STUN 服务，探测本地的 TCP / UDP NAT 映射，并智能识别 NAT 类型
- - 通过基于 SessionKey 派生的哈希作为 MQTT 共享话题，借助公用 MQTT 服务安全交换地址信息
+ - 通过基于口令(SessionKey)派生的哈希作为 MQTT 共享话题，借助公用 MQTT 服务安全交换地址信息
  - 按优先级顺序尝试直连：IPv6 TCP > IPv4 TCP > IPv4 UDP，尽可能实现真正的点对点通信
  - 没有设立中转服务器，不提供备用转发模式：要么连接失败，要么成功就是真的P2P
 
@@ -202,7 +212,7 @@ gonc将NAT类型分为3种：
  3. 对称型：NAT端口每个都不一样，算是最困难的类型
 
 针对这些类型，gonc采用了如下一些NAT穿透策略：
- - 使用多个STUN服务器检测NAT地址并研判NAT类型，以及发现多IP出口的网络环境
+ - 使用多个STUN服务器(涵盖国内外和TCP/UDP协议)检测NAT地址并研判NAT类型，以及发现多IP出口的网络环境
  - 双方都有ipv6地址时优先使用ipv6地址建立直连
  - 有一端是容易型的才建立TCP P2P，因为与STUN服务器的TCP一旦断开容易影响这个洞，而确定是容易型后可以直接约定新的端口号，并避开使用与STUN服务器连接的源端口
  - TCP两端都处于监听状态，复用端口，并相互dial对方建立直连

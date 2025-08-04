@@ -1367,7 +1367,13 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 	var ntconfig *secure.NegotiationConfig
 	var keyingMaterial [32]byte
 	if IsSecureNegotiationNeeded(c.Config) {
+		// 和服务器这个tcp连接是需要安全协商的
 		ntconfig = BuildNTConfigFromPCConfig(c.Config)
+		if strings.HasPrefix(network, "udp") {
+			// 那么 UDP 连接需要密钥材料交换
+			// 以便后续的 UDP 数据包可以使用相同的密钥材料进行加密。
+			ntconfig.ErrorOnFailKeyingMaterial = true
+		}
 	}
 
 	socks5Conn, err := net.DialTimeout(c.Config.Network, serverAddress, timeout)

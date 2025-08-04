@@ -33,6 +33,16 @@ README in [English](./README_en.md) and [中文](./README.md)
     gonc -p2p randomString
     ```
 
+    Note that if the other end delays the running time, it will exit if it cannot find the other end to interact with information within about half a minute. Therefore, it also supports a waiting mechanism based on MQTT message subscription, using -mqtt-wait and -mqtt-hello to synchronize the timing of the two parties to start P2P. For example, the following uses -mqtt-wait to wait continuously，
+
+    ```bash
+    gonc -p2p randomString -mqtt-wait
+    ```
+    On the other side, 
+    ```bash
+    gonc -p2p randomString -mqtt-hello
+    ```
+
 ### Reverse Shell (Pseudo-Terminal Support for UNIX-like Systems)
 - Listener (does not use `-keep-open`, accepts only one connection; no authentication with `-psk`):
     ```bash

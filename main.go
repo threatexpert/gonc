@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.2.0"
+	VERSION                                              = "v2.2.1"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -118,6 +118,8 @@ func init() {
 	flag.IntVar(&secure.UdpOutputBlockSize, "udp-size", secure.UdpOutputBlockSize, "")
 	flag.IntVar(&secure.KcpWindowSize, "kcp-window-size", secure.KcpWindowSize, "")
 	flag.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")
+	flag.BoolVar(&secure.TLSVerifyCert, "verify", false, "verify TLS certificate (client mode only)")
+
 	flag.StringVar(&apps.VarmuxEngine, "mux-engine", apps.VarmuxEngine, "yamux | smux")
 	apps.VarhttpDownloadNoCompress = disableCompress
 	flag.StringVar(&app_mux_args, ":mux", "-", "enable and config :mux for dynamic service")
