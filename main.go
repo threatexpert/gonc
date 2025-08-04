@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION                                              = "v2.2.1"
+	VERSION                                              = "v2.2.2"
 	connConfig                 *secure.NegotiationConfig = nil
 	sessionReady                                         = false
 	goroutineConnectionCounter int32                     = 0
@@ -108,7 +108,6 @@ func init() {
 	flag.BoolVar(progressEnabled, "P", false, "alias for -progress")
 	flag.BoolVar(keepOpen, "k", false, "alias for -keep-open")
 	flag.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
-	flag.StringVar(&easyp2p.TopicExchangeWait, "mqtt-wait-topic", easyp2p.TopicExchangeWait, "")
 	flag.IntVar(&easyp2p.PunchingShortTTL, "punch-short-ttl", easyp2p.PunchingShortTTL, "")
 	flag.IntVar(&easyp2p.PunchingRandomPortCount, "punch-random-count", easyp2p.PunchingRandomPortCount, "")
 	flag.BoolVar(appMuxListenMode, "socks5local", false, "")

@@ -33,7 +33,6 @@ import (
 
 var (
 	TopicExchange              = "nat-exchange/"
-	TopicExchangeWait          = "nat-exchange-wait/"
 	MQTTBrokerServers []string = []string{
 		"tcp://broker.hivemq.com:1883",
 		"tcp://broker.emqx.io:1883",
@@ -247,10 +246,14 @@ func MQTT_SecureExchange[T any](exmode int, sendData any, topicSalt, sessionUid 
 	return remotePayload, srvIndex, err
 }
 
+func topicFromSaltAndSessionUid(topicSalt, sessionUid string) string {
+	return TopicExchange + deriveKeyForTopic(topicSalt, sessionUid)
+}
+
 func MQTT_Exchange(exmode int, sendData, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, err error) {
 	brokerServers := MQTTBrokerServers
 	var qos byte = 1
-	topic := TopicExchange + deriveKeyForTopic(topicSalt, sessionUid)
+	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 
 	myClientIDPrefix := deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid)
 	uidNano := fmt.Sprint(time.Now().UnixNano())
@@ -1760,7 +1763,8 @@ func logwts(logWriter io.Writer, msg string, args ...interface{}) {
 
 func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (string, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
-	topic := TopicExchangeWait + uid
+	topicSalt := "nat-exchange-wait/" + uid
+	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	logwts(logWriter, "Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
 
 	expectMsgPrefix := "SYN@"
@@ -1771,7 +1775,7 @@ func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (st
 		return true, nil
 	}
 
-	recvData, _, err := MQTT_SecureExchange(EXMODE_waitOnly, "", topic, sessionUid, timeout, filterSYN)
+	recvData, _, err := MQTT_SecureExchange(EXMODE_waitOnly, "", topicSalt, sessionUid, timeout, filterSYN)
 	if err != nil {
 		return "", err
 	}
@@ -1785,7 +1789,7 @@ func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (st
 
 	logwts(logWriter, "Waiting for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
 	expectMsgPrefix = recvData
-	recvData2, _, err := MQTT_SecureExchange(EXMODE_reply, msgACK, topic, sessionUid, 15*time.Second, filterSYN)
+	recvData2, _, err := MQTT_SecureExchange(EXMODE_reply, msgACK, topicSalt, sessionUid, 15*time.Second, filterSYN)
 	if err != nil {
 		return "", err
 	}
@@ -1798,8 +1802,8 @@ func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (st
 
 func MQTTHello(sessionUid string, timeout time.Duration, logWriter io.Writer) (string, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
-	topic := TopicExchangeWait + uid
-
+	topicSalt := "nat-exchange-wait/" + uid
+	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	logwts(logWriter, "MQTT: Pushing Hello to topic %s across %d servers\n", topic, len(MQTTBrokerServers))
 
 	tid, err := secure.GenerateSecureRandomString(10)
@@ -1816,7 +1820,7 @@ func MQTTHello(sessionUid string, timeout time.Duration, logWriter io.Writer) (s
 		return true, nil
 	}
 
-	recvData, _, err := MQTT_SecureExchange(EXMODE_mutual, msgSYN, topic, sessionUid, timeout, filterACK)
+	recvData, _, err := MQTT_SecureExchange(EXMODE_mutual, msgSYN, topicSalt, sessionUid, timeout, filterACK)
 	if err != nil {
 		return "", err
 	}
