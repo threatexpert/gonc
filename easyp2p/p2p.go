@@ -1041,17 +1041,22 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	var uconn net.PacketConn
 	var isSharedUDPConn, isRelayUsed bool
 	if relayConn != nil && p2pInfo.LocalNATType == "relay" {
+		//本端用了relay的conn对象
 		uconn = relayConn
-		//走socks5代理的，ttl还原正常值，也不采用生日悖论打洞
 		isSharedUDPConn = true
-		ttl = 64
-		randomSrcPort = false
-		randomDstPort = false
 	} else {
 		uconn, err = net.ListenUDP(network, localAddr)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
 		}
+	}
+
+	if p2pInfo.LocalNATType == "relay" || p2pInfo.RemoteNATType == "relay" {
+		//任意一端有relay，ttl还原正常值，也不采用生日悖论打洞
+		isRelayUsed = true
+		ttl = 64
+		randomSrcPort = false
+		randomDstPort = false
 	}
 
 	buconn := netx.NewBoundUDPConn(uconn, "", isSharedUDPConn)
@@ -1076,10 +1081,6 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
 	}
 	fmt.Fprintf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
-
-	if p2pInfo.LocalNATType == "relay" || p2pInfo.RemoteNATType == "relay" {
-		isRelayUsed = true
-	}
 
 	ctxStopPunching, stopPunching := context.WithCancel(context.Background())
 	ctxRound, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
