@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math/big"
+	mrand "math/rand"
 	"strings"
 	"time"
 	"unicode"
@@ -42,7 +43,7 @@ func generateRandomString(length int) (string, error) {
 	return string(result), nil
 }
 
-func secureSeed() int64 {
+func MakeSeed() int64 {
 	var seed int64
 	err := binary.Read(rand.Reader, binary.BigEndian, &seed)
 	if err != nil {
@@ -50,6 +51,15 @@ func secureSeed() int64 {
 		return time.Now().UnixNano()
 	}
 	return seed
+}
+
+func GenerateSeededRandomString(length int, seed int64) string {
+	r := mrand.New(mrand.NewSource(seed))
+	result := make([]byte, length)
+	for i := range result {
+		result[i] = charset[r.Intn(len(charset))]
+	}
+	return string(result)
 }
 
 // IsWeakPassword 判断一个密码是否太弱

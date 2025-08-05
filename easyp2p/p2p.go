@@ -43,6 +43,11 @@ var (
 	DebugServerRole         string
 	PunchingShortTTL        int = 5
 	PunchingRandomPortCount int = 600
+
+	TopicDesc_WAIT            = "WT"
+	TopicDesc_HELLO           = "HL"
+	TopicDesc_ExchangeAddress = "EA"
+	TopicDesc_RoundSync       = "RS"
 )
 
 type P2PAddressInfo struct {
@@ -202,7 +207,7 @@ var (
 	EXMODE_reply    int = 2
 )
 
-func MQTT_SecureExchange[T any](exmode int, sendData any, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
+func MQTT_SecureExchange[T any](exmode int, sendData any, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
 	var zero T
 	myKey := deriveKey("mqtt-exchange-gonc-v2.2.0", sessionUid)
 	infoBytes, _ := json.Marshal(sendData)
@@ -238,7 +243,7 @@ func MQTT_SecureExchange[T any](exmode int, sendData any, topicSalt, sessionUid 
 		return true, nil
 	}
 
-	remoteInfoRaw, srvIndex, err := MQTT_Exchange(exmode, string(encPayloadBytes), topicSalt, sessionUid, timeout, msgHandler)
+	remoteInfoRaw, srvIndex, err := MQTT_Exchange(exmode, string(encPayloadBytes), topicCID, topicSalt, sessionUid, timeout, msgHandler)
 	if err != nil {
 		return zero, srvIndex, err
 	}
@@ -250,13 +255,22 @@ func topicFromSaltAndSessionUid(topicSalt, sessionUid string) string {
 	return TopicExchange + deriveKeyForTopic(topicSalt, sessionUid)
 }
 
-func MQTT_Exchange(exmode int, sendData, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, err error) {
+// no longer than 23 characters
+func MQTT_GenerateClientID(topicDesc, sessionUid string, seed int64) string {
+	if seed == 0 {
+		seed = secure.MakeSeed()
+	}
+
+	clientID_L8 := deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid)[:8]
+	uidNano_L8 := secure.GenerateSeededRandomString(8, seed)
+
+	return fmt.Sprintf("%s-%s-%s", topicDesc[:2], clientID_L8, uidNano_L8)
+}
+
+func MQTT_Exchange(exmode int, sendData, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, err error) {
 	brokerServers := MQTTBrokerServers
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
-
-	myClientIDPrefix := deriveKeyForTopic("mqtt-topic-gonc-cid", sessionUid)
-	uidNano := fmt.Sprint(time.Now().UnixNano())
 
 	type recvPayload struct {
 		data  string
@@ -293,7 +307,7 @@ func MQTT_Exchange(exmode int, sendData, topicSalt, sessionUid string, timeout t
 
 			opts := mqtt.NewClientOptions().
 				AddBroker(brokerAddr).
-				SetClientID(fmt.Sprintf("%s-%d-%s", myClientIDPrefix, index, uidNano)).
+				SetClientID(topicCID).
 				SetConnectTimeout(5 * time.Second).
 				SetAutoReconnect(true).
 				SetConnectRetry(true).
@@ -478,9 +492,9 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 	}
 
 	fmt.Fprintf(logWriter, "    Exchanging address info with peer ...")
-
+	topicCID := MQTT_GenerateClientID(TopicDesc_ExchangeAddress, sessionUid, 0)
 	remotePayload, srvIndex, err := MQTT_SecureExchange[exchangeAddressPayload](
-		EXMODE_mutual, myInfoForExchange, "gonc-exchange-address", sessionUid, timeout, nil)
+		EXMODE_mutual, myInfoForExchange, topicCID, "gonc-exchange-address", sessionUid, timeout, nil)
 	if err != nil {
 		fmt.Fprintf(logWriter, "Failed\n")
 		return nil, err
@@ -1331,8 +1345,9 @@ func Mqtt_P2P_Round_Sync(sessionUid string, isClient bool, round int, timeout ti
 	}
 
 	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ... ", round)
+	topicCID := MQTT_GenerateClientID(TopicDesc_RoundSync, sessionUid, 0)
 	msgRecv, _, err := MQTT_SecureExchange[string](
-		EXMODE_mutual, msgSend, "gonc-exchange-sync", sessionUid, timeout, nil)
+		EXMODE_mutual, msgSend, topicCID, "gonc-exchange-sync", sessionUid, timeout, nil)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
 	}
@@ -1765,6 +1780,7 @@ func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (st
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
+	topicCID := MQTT_GenerateClientID(TopicDesc_WAIT, sessionUid, 0)
 	logwts(logWriter, "Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
 
 	expectMsgPrefix := "SYN@"
@@ -1775,7 +1791,7 @@ func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (st
 		return true, nil
 	}
 
-	recvData, _, err := MQTT_SecureExchange(EXMODE_waitOnly, "", topicSalt, sessionUid, timeout, filterSYN)
+	recvData, _, err := MQTT_SecureExchange(EXMODE_waitOnly, "", topicCID, topicSalt, sessionUid, timeout, filterSYN)
 	if err != nil {
 		return "", err
 	}
@@ -1789,7 +1805,7 @@ func MqttWait(sessionUid string, timeout time.Duration, logWriter io.Writer) (st
 
 	logwts(logWriter, "Waiting for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
 	expectMsgPrefix = recvData
-	recvData2, _, err := MQTT_SecureExchange(EXMODE_reply, msgACK, topicSalt, sessionUid, 15*time.Second, filterSYN)
+	recvData2, _, err := MQTT_SecureExchange(EXMODE_reply, msgACK, topicCID, topicSalt, sessionUid, 15*time.Second, filterSYN)
 	if err != nil {
 		return "", err
 	}
@@ -1804,6 +1820,7 @@ func MQTTHello(sessionUid string, timeout time.Duration, logWriter io.Writer) (s
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
+	topicCID := MQTT_GenerateClientID(TopicDesc_HELLO, sessionUid, 0)
 	logwts(logWriter, "MQTT: Pushing Hello to topic %s across %d servers\n", topic, len(MQTTBrokerServers))
 
 	tid, err := secure.GenerateSecureRandomString(10)
@@ -1820,7 +1837,7 @@ func MQTTHello(sessionUid string, timeout time.Duration, logWriter io.Writer) (s
 		return true, nil
 	}
 
-	recvData, _, err := MQTT_SecureExchange(EXMODE_mutual, msgSYN, topicSalt, sessionUid, timeout, filterACK)
+	recvData, _, err := MQTT_SecureExchange(EXMODE_mutual, msgSYN, topicCID, topicSalt, sessionUid, timeout, filterACK)
 	if err != nil {
 		return "", err
 	}

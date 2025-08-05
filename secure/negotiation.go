@@ -450,6 +450,8 @@ func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
 	return blockCrypt, nil
 }
 
+// 1、建立message模式的KCP，传进来的conn背后通常是个UDPConn，这里不希望封装后变成会粘包的net.Conn。
+// 2、因为Close KCP会话对方无感知的问题，这里会再封装一层netx.FramedConn，每次发送的数据都增加2字节的长度头，所以结束时对方还可以收到个长度为0的EOF帧
 func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
 	var sess *kcp.UDPSession
 	var err error
