@@ -564,6 +564,12 @@ func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Durati
 	}
 
 	for _, network := range networkList {
+		if shPktCon != nil {
+			if !strings.HasPrefix(network, "udp") {
+				continue
+			}
+			// PacketConn 只支持 UDP
+		}
 		wg.Add(1)
 		go func(network string) {
 			defer wg.Done()

@@ -173,7 +173,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     `gonc -e ":s5s -u -c=0" -psk 口令 -tls -k -l 1080`
 
- - P2P遇到困难的时候，只需要有一端的gonc使用-x参数再进行P2P就可以。
+ - P2P遇到困难的时候，只需要有一端的gonc使用-x参数再进行P2P就可以。你也可以把-x换为-x2，这样就是先P2P，失败了再尝试用中转
 
     `gonc -p2p randomString -x "-psk 口令 -tls <socks5server-ip>:1080"`
 

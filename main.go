@@ -46,12 +46,14 @@ var (
 	app_pf_args       string
 	app_pf_Config     *apps.AppPFConfig
 	arg_proxyc_Config *apps.ProxyClientConfig
+	fallbackRelayMode bool
 	app_sh_args       string
 	app_sh_Config     *apps.PtyShellConfig
 	accessControl     *acl.ACL
 	// 定义命令行参数
 	proxyProt         = flag.String("X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
 	proxyAddr         = flag.String("x", "", "\"[options: -tls -psk] ip:port\" for proxy_address")
+	proxyAddr2        = flag.String("x2", "", "Proxy address (same format as -x). Only used if P2P connection fails.")
 	auth              = flag.String("auth", "", "user:password for proxy")
 	sendfile          = flag.String("send", "", "path to file to send (optional)")
 	sendsize          = flag.Int64("sendsize", 0, "size of file to send (optional, default is full file size)")
@@ -259,8 +261,13 @@ func configureAppMode() {
 		}
 	}
 
-	if *proxyAddr != "" {
-		xconfig, err := apps.ProxyClientConfigByCommandline(*proxyProt, *auth, *proxyAddr)
+	xcommandline := *proxyAddr
+	if *proxyAddr2 != "" {
+		xcommandline = *proxyAddr2
+		fallbackRelayMode = true
+	}
+	if xcommandline != "" {
+		xconfig, err := apps.ProxyClientConfigByCommandline(*proxyProt, *auth, xcommandline)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init proxy config: %v\n", err)
 			os.Exit(1)
@@ -390,7 +397,6 @@ func determineNetworkAndAddress(args []string) (network, host, port, P2PSessionK
 				if strings.HasPrefix(network, "tcp") {
 					return "", "", "", "", fmt.Errorf("only allow socks5 proxy with p2p udp mode")
 				}
-				network = strings.Replace(network, "any", "udp", 1)
 			}
 		} else {
 			return "", "", "", "", fmt.Errorf("not enough arguments")
@@ -452,7 +458,7 @@ func runP2PMode(network, P2PSessionKey string) {
 
 // runListenMode 在监听模式下启动服务器
 func runListenMode(network, host, port string) {
-	if *proxyAddr == "" {
+	if arg_proxyc_Config == nil {
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
 			if err != nil {
@@ -724,21 +730,21 @@ func runDialMode(network, host, port string) {
 	// 连接成功后打印信息
 	remoteTargetAddr := net.JoinHostPort(host, port)
 	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
-		if *proxyAddr != "" {
-			proxyRemoteAddr := ""
+		proxyRemoteAddr := ""
+		if arg_proxyc_Config != nil {
 			if pktConn, ok := conn.(*netx.ConnFromPacketConn); ok {
 				if s5conn, ok := pktConn.PacketConn.(*apps.Socks5UDPPacketConn); ok {
 					proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
 				}
 			}
-			if proxyRemoteAddr != "" {
-				fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
-			} else {
-				fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteTargetAddr)
-			}
+		}
+		if proxyRemoteAddr != "" {
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
+		} else {
+			fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteTargetAddr)
 		}
 	} else {
-		if *proxyAddr == "" {
+		if arg_proxyc_Config == nil {
 			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
 		} else {
 			fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteTargetAddr)
@@ -1475,16 +1481,24 @@ func do_P2P(network, sessionKey string) (*secure.NegotiatedConn, error) {
 		return nil, err
 	}
 
-	sharedPacketConn, err := apps.CreateSocks5UDPClient(arg_proxyc_Config)
+	var relayConn *easyp2p.RelayPacketConn
+	socks5UDPClient, err := apps.CreateSocks5UDPClient(arg_proxyc_Config)
 	if err != nil {
 		return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
+	} else if socks5UDPClient != nil {
+		relayConn = &easyp2p.RelayPacketConn{
+			PacketConn: socks5UDPClient,
+		}
+		if fallbackRelayMode {
+			relayConn.FallbackMode = true
+		}
 	}
 
 	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-	connInfo, err := easyp2p.Easy_P2P(network, sessionKey+topicSalt, sharedPacketConn, os.Stderr)
+	connInfo, err := easyp2p.Easy_P2P(network, sessionKey+topicSalt, relayConn, os.Stderr)
 	if err != nil {
-		if sharedPacketConn != nil {
-			sharedPacketConn.Close()
+		if relayConn != nil {
+			relayConn.Close()
 		}
 		return nil, err
 	}

@@ -16,19 +16,20 @@ import (
 )
 
 type AppPFConfig struct {
-	TlsEnabled   bool             // -tls (bool)
-	Cert         *tls.Certificate // 如果tlsEnabled是true，这个就需要用到
-	Network      string           // 默认是tcp，然而如果有参数-4 -6 -u -U，则可能是tcp4 tcp6 udp4 udp6 unix
-	Host, Port   string           // 是最后 two args
-	Localbind    string
-	PresharedKey string            // -psk <psk-string>
-	ProxyProt    string            // -X 代理协议，可能是 connect或5，或空
-	ProxyAddress string            // -x 代理服务器地址 host:port
-	ProxyConfig  ProxyClientConfig // 代理配置，包含认证信息等
-	ProxyAuth    string            // -auth 代理认证信息，格式为 username:password
-	KcpWithUDP   bool
-	SendData     string // 建立连接后发送的数据，会拼接\n
-	P2PSessKey   string
+	TlsEnabled    bool             // -tls (bool)
+	Cert          *tls.Certificate // 如果tlsEnabled是true，这个就需要用到
+	Network       string           // 默认是tcp，然而如果有参数-4 -6 -u -U，则可能是tcp4 tcp6 udp4 udp6 unix
+	Host, Port    string           // 是最后 two args
+	Localbind     string
+	PresharedKey  string            // -psk <psk-string>
+	ProxyProt     string            // -X 代理协议，可能是 connect或5，或空
+	ProxyAddress  string            // -x 代理服务器地址 host:port
+	ProxyAddress2 string            // fallback for p2p
+	ProxyConfig   ProxyClientConfig // 代理配置，包含认证信息等
+	ProxyAuth     string            // -auth 代理认证信息，格式为 username:password
+	KcpWithUDP    bool
+	SendData      string // 建立连接后发送的数据，会拼接\n
+	P2PSessKey    string
 }
 
 // AppPFConfigByArgs 解析给定的 []string 参数，生成 AppPFConfig
@@ -58,6 +59,8 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip or ip:port)")
 	fs.StringVar(&config.ProxyProt, "X", "", `Proxy protocol. Supported protocols are "5" (SOCKS v.5) and "connect"`)
 	fs.StringVar(&config.ProxyAddress, "x", "", "ip:port for proxy address")
+	fs.StringVar(&config.ProxyAddress2, "x2", "", "Proxy address (same format as -x). Only used if P2P connection fails.")
+
 	fs.StringVar(&config.ProxyAuth, "auth", "", "user:password for proxy")
 	remoteCall := ""
 	fs.StringVar(&remoteCall, "call", "", "like :s5s or :pf")
@@ -98,8 +101,13 @@ func AppPFConfigByArgs(args []string) (*AppPFConfig, error) {
 		config.Network += "6"
 	}
 
-	if config.ProxyAddress != "" {
-		xconfig, err := ProxyClientConfigByCommandline(config.ProxyProt, config.ProxyAuth, config.ProxyAddress)
+	xcommandline := config.ProxyAddress
+	if config.ProxyAddress2 != "" {
+		xcommandline = config.ProxyAddress2
+	}
+
+	if xcommandline != "" {
+		xconfig, err := ProxyClientConfigByCommandline(config.ProxyProt, config.ProxyAuth, xcommandline)
 		if err != nil {
 			return nil, fmt.Errorf("error init proxy config: %v", err)
 		}
@@ -219,16 +227,24 @@ func App_pf_main_withconfig(conn net.Conn, config *AppPFConfig) {
 
 	if config.P2PSessKey != "" {
 		//p2p mode
-		sharedPacketConn, err := CreateSocks5UDPClient(&config.ProxyConfig)
+		var relayConn *easyp2p.RelayPacketConn
+		socks5UDPClient, err := CreateSocks5UDPClient(&config.ProxyConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Prepare socks5 UDP client failed: %v\n", err)
 			return
+		} else if socks5UDPClient != nil {
+			relayConn = &easyp2p.RelayPacketConn{
+				PacketConn: socks5UDPClient,
+			}
+			if config.ProxyAddress2 != "" {
+				relayConn.FallbackMode = true
+			}
 		}
 
-		connInfo, err := easyp2p.Easy_P2P(config.Network, config.P2PSessKey, sharedPacketConn, os.Stderr)
+		connInfo, err := easyp2p.Easy_P2P(config.Network, config.P2PSessKey, relayConn, os.Stderr)
 		if err != nil {
-			if sharedPacketConn != nil {
-				sharedPacketConn.Close()
+			if relayConn != nil {
+				relayConn.Close()
 			}
 			fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
 			return

@@ -451,24 +451,64 @@ type exchangeAddressPayload struct {
 	PubKey string `json:"pk"`
 }
 
-func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, shPktCon net.PacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
+type RelayPacketConn struct {
+	net.PacketConn
+	FallbackMode bool
+}
+
+func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
 
 	myInfoForExchange := exchangeAddressPayload{
 		Addresses: []PunchingAddressInfo{},
 	}
+	var allResults, directResults, relayResults []*STUNResult
+	var err error
 
 	fmt.Fprintf(logWriter, "    Getting local public IP info via %d STUN servers...", len(STUNServers))
 
-	allResults, err := GetNetworksPublicIPs(networks, "", 5*time.Second, shPktCon)
-	if err != nil {
-		fmt.Fprintf(logWriter, "Failed(%v)\n", err)
+	if relayConn == nil || !relayConn.FallbackMode {
+		// 单轮 STUN 探测（无 relay 或直接使用 relay）
+		if relayConn == nil {
+			directResults, err = GetNetworksPublicIPs(networks, "", 5*time.Second, nil)
+		} else {
+			relayResults, err = GetNetworksPublicIPs(networks, "", 5*time.Second, relayConn)
+		}
+		allResults = append(directResults, relayResults...)
+		if err != nil {
+			fmt.Fprintf(logWriter, "Failed(%v)\n", err)
+		} else {
+			fmt.Fprintf(logWriter, "(%d answers)", succeededSTUNResults(allResults))
+		}
 	} else {
-		fmt.Fprintf(logWriter, "(%d answers)", succeededSTUNResults(allResults))
-		analyzed := analyzeSTUNResults(allResults)
+		// Fallback 模式，尝试两轮：先直连STUN获取地址信息，再走 relay获取地址信息
+		// 第一轮（直连）
+		directResults, _ = GetNetworksPublicIPs(networks, "", 5*time.Second, nil)
+		// 第二轮（使用中继）
+		relayResults, err = GetNetworksPublicIPs(networks, "", 5*time.Second, relayConn)
+		// 合并
+		allResults = append(directResults, relayResults...)
+		if len(allResults) == 0 && err != nil {
+			fmt.Fprintf(logWriter, "Failed(%v)\n", err)
+		} else {
+			fmt.Fprintf(logWriter, "(%d answers)", succeededSTUNResults(allResults))
+		}
+	}
+
+	if len(allResults) > 0 {
+		analyzed := analyzeSTUNResults(directResults)
 		for _, item := range analyzed {
 			myInfoForExchange.Addresses = append(myInfoForExchange.Addresses, PunchingAddressInfo{
 				Network: item.Network,
 				NatType: item.NATType,
+				Lan:     item.LAN,
+				Nat:     item.NAT,
+			})
+		}
+		analyzed = analyzeSTUNResults(relayResults)
+		for _, item := range analyzed {
+			myInfoForExchange.Addresses = append(myInfoForExchange.Addresses, PunchingAddressInfo{
+				Network: item.Network,
+				NatType: "relay",
 				Lan:     item.LAN,
 				Nat:     item.NAT,
 			})
@@ -734,6 +774,9 @@ func SelectRole(p2pInfo *P2PAddressInfo) bool {
 	//symm  -  easy		C - S
 	//symm  -  hard		S - C
 
+	//relay和哪个NAT类型都不需要讲究谁先主动打，反正relay有公网ip，且假设不应该有防火墙
+	//其他包括relay的	go Compare
+
 	//return true means C, false means S
 
 	if p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "hard" {
@@ -790,15 +833,15 @@ type P2PConnInfo struct {
 	IsClient  bool
 }
 
-func Easy_P2P(network, sessionUid string, shPktCon net.PacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
-	connInfo, err := Easy_P2P_MP(network, sessionUid, false, shPktCon, logWriter)
+func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
+	connInfo, err := Easy_P2P_MP(network, sessionUid, false, relayConn, logWriter)
 	if err != nil {
 		return nil, err
 	}
 	return connInfo, nil
 }
 
-func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, shPktCon net.PacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
+func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	var networksToTryStun []string
 	switch network {
@@ -821,7 +864,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, shPktCon net
 	fmt.Fprintf(logWriter, "=== Checking NAT reachability ===\n")
 
 	// --- 2. Get address information for all required networks in one go ---
-	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, 25*time.Second, true, shPktCon, logWriter)
+	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, 25*time.Second, true, relayConn, logWriter)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
 		return nil, fmt.Errorf("failed to exchange address info: %w", err)
@@ -854,7 +897,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, shPktCon net
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, shPktCon, logWriter)
+			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, relayConn, logWriter)
 			if err2 == nil {
 				mconn = append(mconn, conn)
 				if role == 0 {
@@ -918,7 +961,7 @@ func generateRandomPorts(count int) []int {
 	return ports
 }
 
-func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, shPktCon net.PacketConn, logWriter io.Writer) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, relayConn *RelayPacketConn, logWriter io.Writer) (net.Conn, bool, []byte, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 10
@@ -996,19 +1039,19 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	errChan := make(chan error)
 
 	var uconn net.PacketConn
-	var isSharedUDPConn bool
-	uconn = shPktCon
-	if shPktCon == nil {
-		uconn, err = net.ListenUDP(network, localAddr)
-		if err != nil {
-			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
-		}
-	} else {
-		//有GlobalSharedPacketConn的情况，是走socks5代理的，ttl还原正常值，也不采用生日悖论打洞
+	var isSharedUDPConn, isRelayUsed bool
+	if relayConn != nil && p2pInfo.LocalNATType == "relay" {
+		uconn = relayConn
+		//走socks5代理的，ttl还原正常值，也不采用生日悖论打洞
 		isSharedUDPConn = true
 		ttl = 64
 		randomSrcPort = false
 		randomDstPort = false
+	} else {
+		uconn, err = net.ListenUDP(network, localAddr)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+		}
 	}
 
 	buconn := netx.NewBoundUDPConn(uconn, "", isSharedUDPConn)
@@ -1033,6 +1076,10 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
 	}
 	fmt.Fprintf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
+
+	if p2pInfo.LocalNATType == "relay" || p2pInfo.RemoteNATType == "relay" {
+		isRelayUsed = true
+	}
 
 	ctxStopPunching, stopPunching := context.WithCancel(context.Background())
 	ctxRound, cancel := context.WithTimeout(context.Background(), time.Duration(count)*time.Second)
@@ -1262,7 +1309,11 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	var uconnBrandnew net.Conn
 	select {
 	case addrPair := <-gotHoleCh:
-		fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
+		if isRelayUsed {
+			fmt.Fprintf(logWriter, "UDP relay connection established (RSP)!\n")
+		} else {
+			fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
+		}
 		buconn.Close()
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, addrPair.Remote.String())
@@ -1276,7 +1327,11 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 			uconnBrandnew.Write(punchPayload)
 		}
 	case <-recvChan:
-		fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
+		if isRelayUsed {
+			fmt.Fprintf(logWriter, "UDP relay connection established!\n")
+		} else {
+			fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
+		}
 		laddr := uconn.LocalAddr()
 		raddr := buconn.RemoteAddr()
 		buconn.Close()
@@ -1307,13 +1362,16 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 
 func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPacketConn, error) {
 	//uconn如果已经是ConnFromPacketConn，修改配置后复用，不再嵌套
-	if conn, ok := uconn.(*netx.ConnFromPacketConn); ok {
-		err := conn.Config(false, raddr)
-		if err != nil {
-			return nil, err
+	if rpconn, ok := uconn.(*RelayPacketConn); ok {
+		if conn, ok := rpconn.PacketConn.(*netx.ConnFromPacketConn); ok {
+			err := conn.Config(false, raddr)
+			if err != nil {
+				return nil, err
+			}
+			return conn, nil
 		}
-		return conn, nil
 	}
+
 	return netx.NewConnFromPacketConn(uconn, false, raddr)
 }
 
@@ -1869,10 +1927,12 @@ func getNetworkPriority(network string) int {
 func getNATTypePriority(natType string) int {
 	switch natType {
 	case "easy":
-		return 3
+		return 4
 	case "hard":
-		return 2
+		return 3
 	case "symm":
+		return 2
+	case "relay":
 		return 1
 	default:
 		return 0 // Unknown NAT types have lowest priority
