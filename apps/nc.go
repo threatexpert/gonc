@@ -154,8 +154,6 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.BoolVar(&config.keepOpen, "keep-open", false, "keep listening after client disconnects")
 	fs.BoolVar(&config.enablePty, "pty", false, "put the terminal into raw mode")
 	fs.BoolVar(&config.useSTUN, "stun", false, "use STUN to discover public IP")
-	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
-	fs.StringVar(&config.MQTTServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
 	fs.StringVar(&config.autoP2P, "p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
 	fs.BoolVar(&config.useMutilPath, "mp", false, "enable multipath(NOT IMPL)")
 	fs.BoolVar(&config.useMQTTWait, "mqtt-wait", false, "wait for MQTT hello message before initiating P2P connection")
@@ -186,6 +184,8 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.StringVar(&config.app_nc_args, ":nc", "-", "enable and config :nc for dynamic service")
 
 	//<----- Global flags
+	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
+	fs.StringVar(&config.MQTTServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
 	disableCompress := fs.Bool("no-compress", false, "disable compression for http download")
 	VarhttpDownloadNoCompress = disableCompress
 	fs.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
@@ -254,26 +254,26 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	return config, nil
 }
 
-func App_Netcat_main(console *misc.ConsoleIO, args []string) {
+func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	config, err := AppNetcatConfigByArgs("gonc", args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing :nc args: %v\n", err)
-		return
+		return 1
 	}
 	config.consoleMode = true
 
-	App_Netcat_main_withconfig(console, config)
+	return App_Netcat_main_withconfig(console, config)
 }
 
-func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) {
+func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 	defer console.Close()
 	if config.P2PSessionKey != "" {
-		runP2PMode(console, config)
+		return runP2PMode(console, config)
 	} else {
 		if config.listenMode {
-			runListenMode(console, config, config.network, config.host, config.port)
+			return runListenMode(console, config, config.network, config.host, config.port)
 		} else {
-			runDialMode(console, config, config.network, config.host, config.port)
+			return runDialMode(console, config, config.network, config.host, config.port)
 		}
 	}
 }
@@ -511,7 +511,7 @@ func configureDNS(ncconfig *AppNetcatConfig) {
 }
 
 // runP2PMode 处理建立和维护P2P连接的逻辑
-func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) {
+func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 	stats_in := misc.NewProgressStats()
 	stats_out := misc.NewProgressStats()
 	if ncconfig.progressEnabled {
@@ -528,7 +528,7 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) {
 		for {
 			nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
+				fmt.Fprintf(ncconfig.LogWriter, "P2P failed: %v\n", err)
 				time.Sleep(10 * time.Second)
 				continue
 			}
@@ -542,61 +542,62 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) {
 	} else {
 		nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "P2P failed: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(ncconfig.LogWriter, "P2P failed: %v\n", err)
+			return 1
 		}
-		handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+		return handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 }
 
 // runListenMode 在监听模式下启动服务器
-func runListenMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) {
+func runListenMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	if ncconfig.arg_proxyc_Config == nil {
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
 			if err != nil {
-				panic(err)
+				fmt.Fprintf(ncconfig.LogWriter, "Get Free Port: %v\n", err)
+				return 1
 			}
 			port = strconv.Itoa(portInt)
 		}
 	}
 	if ncconfig.udpProtocol {
-		startUDPListener(console, ncconfig, network, host, port)
+		return startUDPListener(console, ncconfig, network, host, port)
 	} else {
-		startTCPListener(console, ncconfig, network, host, port)
+		return startTCPListener(console, ncconfig, network, host, port)
 	}
 }
 
 // startUDPListener 启动UDP监听器并处理传入会话
-func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) {
+func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	listenAddr := net.JoinHostPort(host, port)
 	addr, err := net.ResolveUDPAddr(network, listenAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving UDP address: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error resolving UDP address: %v\n", err)
+		return 1
 	}
 
 	if ncconfig.useSTUN {
-		if err = ShowPublicIP(network, addr.String()); err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
-			os.Exit(1)
+		if err = ShowPublicIP(ncconfig, network, addr.String()); err != nil {
+			fmt.Fprintf(ncconfig.LogWriter, "Error getting public IP: %v\n", err)
+			return 1
 		}
 		time.Sleep(1500 * time.Millisecond)
 	}
 
 	uconn, err := net.ListenUDP(network, addr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listening on UDP address: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error listening on UDP address: %v\n", err)
+		return 1
 	}
 	defer uconn.Close()
-	fmt.Fprintf(os.Stderr, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
+	fmt.Fprintf(ncconfig.LogWriter, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 	logDiscard := log.New(io.Discard, "", log.LstdFlags)
 	usessListener, err := netx.NewUDPCustomListener(uconn, logDiscard)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error NewUDPCustomListener: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error NewUDPCustomListener: %v\n", err)
+		return 1
 	}
 	defer usessListener.Close()
 
@@ -612,43 +613,43 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			newSess, err := usessListener.Accept()
 			if err != nil {
 				if err == net.ErrClosed {
-					fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
-					os.Exit(1)
+					fmt.Fprintf(ncconfig.LogWriter, "UDPCustomListener accept failed: %v\n", err)
+					return 1
 				}
 				continue
 			}
 			if !acl.ACL_inbound_allow(ncconfig.accessControl, newSess.RemoteAddr()) {
-				fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
+				fmt.Fprintf(ncconfig.LogWriter, "ACL refused: %s\n", newSess.RemoteAddr())
 				newSess.Close()
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
+			fmt.Fprintf(ncconfig.LogWriter, "UDP session established from %s\n", newSess.RemoteAddr().String())
 			go handleConnection(console, ncconfig, ncconfig.connConfig, newSess, stats_in, stats_out)
 		}
 	} else {
 		newSess, err := usessListener.Accept()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "UDPCustomListener accept failed: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(ncconfig.LogWriter, "UDPCustomListener accept failed: %v\n", err)
+			return 1
 		}
 		if !acl.ACL_inbound_allow(ncconfig.accessControl, newSess.RemoteAddr()) {
-			fmt.Fprintf(os.Stderr, "ACL refused: %s\n", newSess.RemoteAddr())
+			fmt.Fprintf(ncconfig.LogWriter, "ACL refused: %s\n", newSess.RemoteAddr())
 			newSess.Close()
-			os.Exit(1)
+			return 1
 		}
-		fmt.Fprintf(os.Stderr, "UDP session established from %s\n", newSess.RemoteAddr().String())
-		handleSingleConnection(console, ncconfig, newSess)
+		fmt.Fprintf(ncconfig.LogWriter, "UDP session established from %s\n", newSess.RemoteAddr().String())
+		return handleSingleConnection(console, ncconfig, newSess)
 	}
 }
 
 // startTCPListener 启动TCP/Unix监听器并处理传入连接
-func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) {
+func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	listenAddr := net.JoinHostPort(host, port)
 	if ncconfig.useUNIXdomain {
 		listenAddr = port
 		if err := cleanupUnixSocket(port); err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(ncconfig.LogWriter, "%v\n", err)
+			return 1
 		}
 	}
 
@@ -657,20 +658,20 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	socks5BindMode := false
 	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error create proxy client: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error create proxy client: %v\n", err)
+		return 1
 	}
 	if proxyClient.SupportBIND() {
-		fmt.Fprintf(os.Stderr, "Attempting SOCKS5 BIND on proxy at %s...\n", listenAddr)
+		fmt.Fprintf(ncconfig.LogWriter, "Attempting SOCKS5 BIND on proxy at %s...\n", listenAddr)
 		listener, err = proxyClient.Dialer.Listen(network, listenAddr)
 		//socks5listener的Close函数是空，无需Close()
 		socks5BindMode = true
 	} else {
 		lc := net.ListenConfig{}
 		if ncconfig.useSTUN {
-			if err = ShowPublicIP(network, listenAddr); err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
-				os.Exit(1)
+			if err = ShowPublicIP(ncconfig, network, listenAddr); err != nil {
+				fmt.Fprintf(ncconfig.LogWriter, "Error getting public IP: %v\n", err)
+				return 1
 			}
 			lc.Control = netx.ControlTCP
 		}
@@ -680,11 +681,11 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		}
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error listening on %s: %v\n", listenAddr, err)
+		return 1
 	}
 
-	fmt.Fprintf(os.Stderr, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
+	fmt.Fprintf(ncconfig.LogWriter, "Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
 	if port == "0" {
 		//记下成功绑定的端口，keepOpen的话，如果需要重新监听就继续用这个端口
 		listenAddr = listener.Addr().String()
@@ -701,7 +702,7 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
+				fmt.Fprintf(ncconfig.LogWriter, "Error accepting connection: %v\n", err)
 				if socks5BindMode {
 					goto RE_BIND
 				} else {
@@ -710,27 +711,27 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 				}
 			}
 			if conn.LocalAddr().Network() == "unix" {
-				fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
+				fmt.Fprintf(ncconfig.LogWriter, "Connection on %s received!\n", conn.LocalAddr().String())
 			} else {
 				if !acl.ACL_inbound_allow(ncconfig.accessControl, conn.RemoteAddr()) {
-					fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
+					fmt.Fprintf(ncconfig.LogWriter, "ACL refused: %s\n", conn.RemoteAddr())
 					conn.Close()
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "Connected from: %s        \n", conn.RemoteAddr().String())
+				fmt.Fprintf(ncconfig.LogWriter, "Connected from: %s        \n", conn.RemoteAddr().String())
 			}
 			go handleConnection(console, ncconfig, ncconfig.connConfig, conn, stats_in, stats_out)
 		RE_BIND:
 			if socks5BindMode {
 				listener.Close()
 				for tt := 0; tt < 60; tt++ {
-					fmt.Fprintf(os.Stderr, "Re-attempting SOCKS5 BIND on proxy at %s...", listenAddr)
+					fmt.Fprintf(ncconfig.LogWriter, "Re-attempting SOCKS5 BIND on proxy at %s...", listenAddr)
 					listener, err = proxyClient.Dialer.Listen(network, listenAddr)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error listening on %s: %v\n", listenAddr, err)
+						fmt.Fprintf(ncconfig.LogWriter, "Error listening on %s: %v\n", listenAddr, err)
 						time.Sleep(5 * time.Second)
 					} else {
-						fmt.Fprintf(os.Stderr, "completed\n")
+						fmt.Fprintf(ncconfig.LogWriter, "completed\n")
 						break
 					}
 				}
@@ -740,26 +741,26 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		conn, err := listener.Accept()
 		listener.Close()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error accepting connection: %v\n", err)
-			os.Exit((1))
+			fmt.Fprintf(ncconfig.LogWriter, "Error accepting connection: %v\n", err)
+			return 1
 		}
 
 		if conn.LocalAddr().Network() == "unix" {
-			fmt.Fprintf(os.Stderr, "Connection on %s received!\n", conn.LocalAddr().String())
+			fmt.Fprintf(ncconfig.LogWriter, "Connection on %s received!\n", conn.LocalAddr().String())
 		} else {
 			if !acl.ACL_inbound_allow(ncconfig.accessControl, conn.RemoteAddr()) {
-				fmt.Fprintf(os.Stderr, "ACL refused: %s\n", conn.RemoteAddr())
+				fmt.Fprintf(ncconfig.LogWriter, "ACL refused: %s\n", conn.RemoteAddr())
 				conn.Close()
-				os.Exit(1)
+				return 1
 			}
-			fmt.Fprintf(os.Stderr, "Connected from: %s\n", conn.RemoteAddr().String())
+			fmt.Fprintf(ncconfig.LogWriter, "Connected from: %s\n", conn.RemoteAddr().String())
 		}
-		handleSingleConnection(console, ncconfig, conn)
+		return handleSingleConnection(console, ncconfig, conn)
 	}
 }
 
 // runDialMode 在主动连接模式下启动客户端
-func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) {
+func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	var conn net.Conn
 	var err error
 
@@ -769,8 +770,8 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 
 	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error create proxy client: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error create proxy client: %v\n", err)
+		return 1
 	}
 
 	if ncconfig.useUNIXdomain {
@@ -785,19 +786,19 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 				localAddr, err = net.ResolveUDPAddr(network, ncconfig.localbind)
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving address: %v\n", err)
-				os.Exit(1)
+				fmt.Fprintf(ncconfig.LogWriter, "Error resolving address: %v\n", err)
+				return 1
 			}
 		}
 
 		if ncconfig.useSTUN {
 			if ncconfig.localbind == "" {
-				fmt.Fprintf(os.Stderr, "-stun need be with -local while connecting\n")
-				os.Exit(1)
+				fmt.Fprintf(ncconfig.LogWriter, "-stun need be with -local while connecting\n")
+				return 1
 			}
-			if err = ShowPublicIP(network, localAddr.String()); err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
-				os.Exit(1)
+			if err = ShowPublicIP(ncconfig, network, localAddr.String()); err != nil {
+				fmt.Fprintf(ncconfig.LogWriter, "Error getting public IP: %v\n", err)
+				return 1
 			}
 		}
 
@@ -816,8 +817,8 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(ncconfig.LogWriter, "Error: %v\n", err)
+		return 1
 	}
 
 	// 连接成功后打印信息
@@ -832,19 +833,19 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 			}
 		}
 		if proxyRemoteAddr != "" {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
+			fmt.Fprintf(ncconfig.LogWriter, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
 		} else {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s\n", remoteTargetAddr)
+			fmt.Fprintf(ncconfig.LogWriter, "UDP ready for: %s\n", remoteTargetAddr)
 		}
 	} else {
 		if ncconfig.arg_proxyc_Config == nil {
-			fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+			fmt.Fprintf(ncconfig.LogWriter, "Connected to: %s\n", conn.RemoteAddr().String())
 		} else {
-			fmt.Fprintf(os.Stderr, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteTargetAddr)
+			fmt.Fprintf(ncconfig.LogWriter, "Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteTargetAddr)
 		}
 	}
 
-	handleSingleConnection(console, ncconfig, conn)
+	return handleSingleConnection(console, ncconfig, conn)
 }
 
 func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
@@ -1086,7 +1087,7 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 }
 
 // 用于在数据传输时显示进度
-func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64) {
+func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64) {
 	bufsize := blocksize
 	if bufsize < 32*1024 {
 		bufsize = 32 * 1024 // reader 缓冲区更大，提高吞吐
@@ -1105,7 +1106,7 @@ func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReade
 	for {
 		n, err1 = reader.Read(buf)
 		if err1 != nil && err1 != io.EOF {
-			fmt.Fprintf(os.Stderr, "Read error: %v\n", err1)
+			fmt.Fprintf(ncconfig.LogWriter, "Read error: %v\n", err1)
 			break
 		}
 		if n == 0 {
@@ -1125,7 +1126,7 @@ func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReade
 
 		_, err = dst.Write(buf[:n])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
+			fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
 			break
 		}
 
@@ -1140,7 +1141,7 @@ func copyWithProgress(dst io.Writer, src io.Reader, blocksize int, bufferedReade
 	}
 }
 
-func copyCharDeviceWithProgress(enableCRLF bool, dst io.Writer, src io.Reader, stats *misc.ProgressStats) {
+func copyCharDeviceWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, stats *misc.ProgressStats) {
 	var n int
 	var err, err1 error
 	var line string
@@ -1150,7 +1151,7 @@ func copyCharDeviceWithProgress(enableCRLF bool, dst io.Writer, src io.Reader, s
 	for {
 		line, err1 = reader.ReadString('\n')
 		if err1 != nil && err1 != io.EOF {
-			fmt.Fprintf(os.Stderr, "ReadString error: %v\n", err1)
+			fmt.Fprintf(ncconfig.LogWriter, "ReadString error: %v\n", err1)
 			break
 		}
 
@@ -1158,7 +1159,7 @@ func copyCharDeviceWithProgress(enableCRLF bool, dst io.Writer, src io.Reader, s
 			if line[len(line)-1] == '\n' {
 				// 注意：line读到的可能是 "\r\n" 或 "\n"，都要统一处理
 				line = strings.TrimRight(line, "\r\n") // 去掉任何结尾的 \r 或 \n
-				if enableCRLF {
+				if ncconfig.enableCRLF {
 					line += "\r\n" // 统一加上 CRLF
 				} else {
 					line += "\n"
@@ -1166,7 +1167,7 @@ func copyCharDeviceWithProgress(enableCRLF bool, dst io.Writer, src io.Reader, s
 			}
 			n, err = writer.WriteString(line)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
+				fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
 				break
 			}
 			writer.Flush()
@@ -1232,7 +1233,7 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 	return config
 }
 
-func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *secure.NegotiatedConn, stats_in, stats_out *misc.ProgressStats) {
+func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *secure.NegotiatedConn, stats_in, stats_out *misc.ProgressStats) int {
 	defer atomic.AddInt32(&ncconfig.goroutineConnectionCounter, -1)
 	atomic.AddInt32(&ncconfig.goroutineConnectionCounter, 1)
 
@@ -1272,8 +1273,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			file, err = os.Open(ncconfig.sendfile)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(ncconfig.LogWriter, "Error opening file: %v\n", err)
+			return 1
 		}
 		defer file.Close()
 		input = file
@@ -1296,8 +1297,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		}
 		file, err = os.Create(writePath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error opening file for writing: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(ncconfig.LogWriter, "Error opening file for writing: %v\n", err)
+			return 1
 		}
 		defer file.Close()
 		output = file
@@ -1308,14 +1309,14 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		nconn.SetDeadline(time.Now().Add(15 * time.Second))
 		line, err := ReadString(nconn, '\n')
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error ReadString: %v\n", err)
-			return
+			fmt.Fprintf(ncconfig.LogWriter, "Error ReadString: %v\n", err)
+			return 1
 		}
 		nconn.SetDeadline(time.Time{})
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, ":") {
-			fmt.Fprintf(os.Stderr, "Invalid service command: %s\n", line)
-			return
+			fmt.Fprintf(ncconfig.LogWriter, "Invalid service command: %s\n", line)
+			return 1
 		}
 		serviceCommand = line
 	}
@@ -1323,8 +1324,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	if ncconfig.remoteCall != "" {
 		_, err = nconn.Write([]byte(ncconfig.remoteCall + "\n"))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error Sending: %v\n", err)
-			return
+			fmt.Fprintf(ncconfig.LogWriter, "Error Sending: %v\n", err)
+			return 1
 		}
 	}
 
@@ -1333,20 +1334,20 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		// 分割命令和参数（支持带空格的参数）
 		args, err := misc.ParseCommandLine(serviceCommand)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing command: %v\n", err)
-			return
+			fmt.Fprintf(ncconfig.LogWriter, "Error parsing command: %v\n", err)
+			return 1
 		}
 
 		if len(args) == 0 {
-			fmt.Fprintf(os.Stderr, "Empty command\n")
-			return
+			fmt.Fprintf(ncconfig.LogWriter, "Empty command\n")
+			return 1
 		}
 
 		builtinApp := args[0]
 		if builtinApp == ":mux" {
 			if ncconfig.app_mux_Config == nil {
-				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
 			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
@@ -1355,8 +1356,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			go App_mux_main_withconfig(pipeConn, ncconfig.app_mux_Config)
 		} else if builtinApp == ":s5s" {
 			if ncconfig.app_s5s_Config == nil {
-				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
 			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
@@ -1365,8 +1366,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			go App_s5s_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5s_Config)
 		} else if builtinApp == ":nc" {
 			if ncconfig.app_nc_Config == nil {
-				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
 			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
@@ -1379,8 +1380,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			go App_Netcat_main_withconfig(pipeConn, ncconfig.app_nc_Config)
 		} else if builtinApp == ":sh" {
 			if ncconfig.app_sh_Config == nil {
-				fmt.Fprintf(os.Stderr, "Not initialized %s config\n", builtinApp)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
 			}
 			pipeConn := misc.NewPipeConn(nconn)
 			input = pipeConn.In
@@ -1388,8 +1389,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			defer pipeConn.Close()
 			go App_shell_main_withconfig(pipeConn, ncconfig.app_sh_Config)
 		} else if strings.HasPrefix(builtinApp, ":") {
-			fmt.Fprintf(os.Stderr, "Invalid service command: %s\n", builtinApp)
-			return
+			fmt.Fprintf(ncconfig.LogWriter, "Invalid service command: %s\n", builtinApp)
+			return 1
 		} else {
 			// 创建命令
 			cmd = exec.Command(args[0], args[1:]...)
@@ -1397,20 +1398,20 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			// 创建管道
 			stdinPipe, err := cmd.StdinPipe()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Error creating stdin pipe: %v\n", err)
+				return 1
 			}
 
 			stdoutPipe, err := cmd.StdoutPipe()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Error creating stdout pipe: %v\n", err)
+				return 1
 			}
 
 			cmdErrorPipe, err = cmd.StderrPipe()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating stderr pipe: %v\n", err)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Error creating stderr pipe: %v\n", err)
+				return 1
 			}
 
 			input = stdoutPipe
@@ -1418,10 +1419,10 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 
 			// 启动命令
 			if err := cmd.Start(); err != nil {
-				fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
-				return
+				fmt.Fprintf(ncconfig.LogWriter, "Command start error: %v\n", err)
+				return 1
 			}
-			//fmt.Fprintf(os.Stderr, "PID:%d child created.\n", cmd.Process.Pid)
+			//fmt.Fprintf(ncconfig.LogWriter, "PID:%d child created.\n", cmd.Process.Pid)
 		}
 	}
 
@@ -1449,36 +1450,36 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			if ncconfig.enablePty {
 				ncconfig.term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "MakeRaw error: %v\n", err)
+					fmt.Fprintf(ncconfig.LogWriter, "MakeRaw error: %v\n", err)
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
-				copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out, 0)
+				copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, 0)
 			} else {
-				copyCharDeviceWithProgress(ncconfig.enableCRLF, nconn, input, stats_out)
+				copyCharDeviceWithProgress(ncconfig, nconn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes)
+			copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes)
 		}
 
 		time.Sleep(1 * time.Second)
 		nconn.CloseWrite()
-		//fmt.Fprintf(os.Stderr, "PID:%d (%s) conn-write routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
+		//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) conn-write routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
 	// 从连接读取并输出到输出
 	go func() {
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(output, nconn, bufsize, !nconn.IsUDP, stats_in, 0)
+		copyWithProgress(ncconfig, output, nconn, bufsize, !nconn.IsUDP, stats_in, 0)
 		time.Sleep(1 * time.Second)
-		//fmt.Fprintf(os.Stderr, "PID:%d (%s) conn-read routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
+		//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) conn-read routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
 
 	if cmdErrorPipe != nil {
 		go func() {
-			io.Copy(os.Stderr, cmdErrorPipe)
-			//fmt.Fprintf(os.Stderr, "PID:%d (%s) ErrorPipe routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
+			io.Copy(ncconfig.LogWriter, cmdErrorPipe)
+			//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) ErrorPipe routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 		}()
 	}
 
@@ -1496,28 +1497,29 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	}
 	select {
 	case <-abort:
-		//fmt.Fprintf(os.Stderr, "PID:%d (%s) Input routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
+		//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) Input routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	case <-done:
-		//fmt.Fprintf(os.Stderr, "PID:%d (%s) All routines completed.\n", os.Getpid(), nconn.RemoteAddr().String())
+		//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) All routines completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	case <-time.After(60 * time.Second):
-		//fmt.Fprintf(os.Stderr, "PID:%d (%s) Timeout after one routine exited.\n", os.Getpid(), nconn.RemoteAddr().String())
+		//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) Timeout after one routine exited.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}
 
-	//fmt.Fprintf(os.Stderr, "PID:%d (%s) closing nconn...\n", os.Getpid(), nconn.RemoteAddr().String())
+	//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) closing nconn...\n", os.Getpid(), nconn.RemoteAddr().String())
 	nconn.Close()
 	if ncconfig.term_oldstat != nil {
 		term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
 	}
 	// 如果使用了命令，等待命令结束
 	if cmd != nil {
-		//fmt.Fprintf(os.Stderr, "PID:%d killing cmd process...\n", os.Getpid())
+		//fmt.Fprintf(ncconfig.LogWriter, "PID:%d killing cmd process...\n", os.Getpid())
 		cmd.Process.Kill()
 		cmd.Wait()
 	}
-	//fmt.Fprintf(os.Stderr, "PID:%d (%s) connection done.\n", os.Getpid(), nconn.RemoteAddr().String())
+	//fmt.Fprintf(ncconfig.LogWriter, "PID:%d (%s) connection done.\n", os.Getpid(), nconn.RemoteAddr().String())
+	return 0
 }
 
-func handleSingleConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.Conn) {
+func handleSingleConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.Conn) int {
 	stats_in := misc.NewProgressStats()
 	stats_out := misc.NewProgressStats()
 
@@ -1531,26 +1533,26 @@ func handleSingleConnection(console net.Conn, ncconfig *AppNetcatConfig, conn ne
 		}()
 	}
 
-	handleConnection(console, ncconfig, ncconfig.connConfig, conn, stats_in, stats_out)
+	return handleConnection(console, ncconfig, ncconfig.connConfig, conn, stats_in, stats_out)
 }
 
-func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.NegotiationConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) {
+func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.NegotiationConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
 	nconn, err := secure.DoNegotiation(cfg, conn, ncconfig.LogWriter)
 	if err != nil {
 		conn.Close()
-		return
+		return 1
 	}
-	handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+	return handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
 }
 
 func isKCPEnabled(ncconfig *AppNetcatConfig) bool {
 	return ncconfig.udpProtocol && (ncconfig.kcpEnabled || ncconfig.kcpSEnabled)
 }
 
-func ShowPublicIP(network, bind string) error {
+func ShowPublicIP(ncconfig *AppNetcatConfig, network, bind string) error {
 	index, _, nata, err := easyp2p.GetPublicIP(network, bind, 7*time.Second)
 	if err == nil {
-		fmt.Fprintf(os.Stderr, "Public Address: %s (via %s)\n", nata, easyp2p.STUNServers[index])
+		fmt.Fprintf(ncconfig.LogWriter, "Public Address: %s (via %s)\n", nata, easyp2p.STUNServers[index])
 	}
 
 	return err
@@ -1636,12 +1638,12 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			}
 		}
 		if proxyRemoteAddr != "" {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, conn.RemoteAddr().String())
+			fmt.Fprintf(ncconfig.LogWriter, "UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, conn.RemoteAddr().String())
 		} else {
-			fmt.Fprintf(os.Stderr, "UDP ready for: %s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
+			fmt.Fprintf(ncconfig.LogWriter, "UDP ready for: %s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "Connected to: %s\n", conn.RemoteAddr().String())
+		fmt.Fprintf(ncconfig.LogWriter, "Connected to: %s\n", conn.RemoteAddr().String())
 	}
 	return nconn, nil
 }

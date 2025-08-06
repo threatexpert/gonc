@@ -9,5 +9,5 @@ import (
 
 func main() {
 	console := &misc.ConsoleIO{}
-	apps.App_Netcat_main(console, os.Args[1:])
+	os.Exit(apps.App_Netcat_main(console, os.Args[1:]))
 }
