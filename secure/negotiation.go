@@ -41,19 +41,16 @@ type NegotiationConfig struct {
 var (
 	UdpOutputBlockSize   int    = 1320
 	KcpWindowSize        int    = 1500
-	KeepAlive            int    = 0
 	UdpKeepAlivePayload  string = "ping\n"
 	KCPIdleTimeoutSecond int    = 41
 	UDPIdleTimeoutSecond int    = 60 * 5
-	TLSVerifyCert        bool   = false
 )
 
 func NewNegotiationConfig() *NegotiationConfig {
 	return &NegotiationConfig{
-		InsecureSkipVerify:   !TLSVerifyCert,
+		InsecureSkipVerify:   true,
 		UdpOutputBlockSize:   UdpOutputBlockSize,
 		KcpWindowSize:        KcpWindowSize,
-		KeepAlive:            KeepAlive,
 		UdpKeepAlivePayload:  UdpKeepAlivePayload,
 		KCPIdleTimeoutSecond: KCPIdleTimeoutSecond,
 		UDPIdleTimeoutSecond: UDPIdleTimeoutSecond,

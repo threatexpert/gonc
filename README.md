@@ -99,13 +99,13 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     ```
 
 ### 灵活服务配置
-- -exec可灵活的设置为每个连接提供服务的应用程序(-exec参数值中的第一个.代表gonc自身路径)，除了指定/bin/bash这种提供shell命令的方式，也可以用来端口转发流量，不过下面这种每个连接进来就会开启一个新的gonc进程：
+- -exec可灵活的设置为每个连接提供服务的应用程序，除了指定/bin/bash这种提供shell命令的方式，也可以用来端口转发流量，不过下面这种每个连接进来就会开启一个新的gonc进程：
     ```bash
-    gonc -keep-open -exec ". -tls www.baidu.com 443" -l 8000
+    gonc -keep-open -exec "gonc -tls www.baidu.com 443" -l 8000
     ```
-- 避免大量子进程，使用内置流量转发模块：
+- 避免大量子进程，使用内置命令方式调用nc模块：
     ```bash
-    gonc -keep-open -exec ":pf -tls www.baidu.com 443" -l 8000
+    gonc -keep-open -exec ":nc -tls www.baidu.com 443" -l 8000
     ```
 
 ### Socks5 代理服务
@@ -121,9 +121,9 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     `gonc.exe -tls -psk randomString -e :s5s -keep-open -acl acl.txt -P -l 1080`
 
-     另一端使用:pf（内置的端口转发命令）把socks5 over tls转为标准socks5，在本地127.0.0.1:3080提供本地客户端接入
+     另一端使用:nc把socks5 over tls转为标准socks5，在本地127.0.0.1:3080提供本地客户端接入
 
-    `gonc.exe -e ":pf -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+    `gonc.exe -e ":nc -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
 ### 多服务监听模式
 - 参考SSH的22端口，既可提供shell也提供sftp和端口转发功能，gonc使用 -e ":service" 也可监听在一个服务端口，基于tls+psk安全认证提供shell、socks5(支持CONNECNT+BIND)和文件服务。（请务必使用gonc -psk .生成高熵PSK替换randomString）
@@ -136,7 +136,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     另一端把socks5 over tls转为本地标准socks5端口1080
 
-    `gonc -e ":pf -tls -psk randomString -call :s5s <server-ip>:2222" -k -P -l -local 127.0.0.1:1080`
+    `gonc -e ":nc -tls -psk randomString -call :s5s <server-ip> 2222" -k -P -l -local 127.0.0.1:1080`
 
     另一端把文件服务为本地标准HTTP端口8000
 
@@ -148,11 +148,11 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     在被动等待连接的PC-S运行下面的参数（直接拿节点公钥来当口令，接口的监听端口51820）：
 
-    `gonc -p2p PS-S的公钥 -mqtt-wait -u -k -e ":pf -u 127.0.0.1:51820"`
+    `gonc -p2p PS-S的公钥 -mqtt-wait -u -k -e ":nc -u 127.0.0.1 51820"`
 
     其他发起主动连接的PC-C，设置WireGuard节点PS-S公钥的Endpoint = 127.0.0.1:51821，接口的监听端口51820，gonc运行下面的参数，-k可以让gonc在网络异常后自动重新建立连接。
 
-    `gonc -p2p PS-S的公钥 -mqtt-hello -u -k -e ":pf -u -local 127.0.0.1:51821 127.0.0.1:51820"`
+    `gonc -p2p PS-S的公钥 -mqtt-hello -u -k -e ":nc -u -local 127.0.0.1:51821 127.0.0.1 51820"`
 
 
 ## P2P NAT 穿透能力

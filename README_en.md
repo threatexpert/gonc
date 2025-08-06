@@ -102,11 +102,11 @@ README in [English](./README_en.md) and [中文](./README.md)
 ### Flexible Service Configuration
 - Use `-exec` to flexibly configure the application to provide services for each connection. For example, instead of specifying `/bin/bash` for shell commands, it can also be used for port forwarding. However, the following example starts a new `gonc` process for each connection:
     ```bash
-    gonc -keep-open -exec ". -tls www.baidu.com 443" -l 8000
+    gonc -keep-open -exec "gonc -tls www.baidu.com 443" -l 8000
     ```
-- To avoid spawning multiple child processes, use the built-in traffic forwarding module:
+- To avoid spawning multiple child processes, use the built-in nc module:
     ```bash
-    gonc -keep-open -exec ":pf -tls www.baidu.com 443" -l 8000
+    gonc -keep-open -exec ":nc -tls www.baidu.com 443" -l 8000
     ```
 
 ### Socks5 Proxy Service
@@ -122,20 +122,20 @@ README in [English](./README_en.md) and [中文](./README.md)
 
     `gonc.exe -tls -psk randomString -e :s5s -keep-open -acl acl.txt -P -l 1080`
 
-    On the other side, use `:pf` (built-in port forwarding command) to convert Socks5 over TLS to standard Socks5, providing local client access on 127.0.0.1:3080:
+    On the other side, use `:nc` (built-in nc command) to convert Socks5 over TLS to standard Socks5, providing local client access on 127.0.0.1:3080:
 
-    `gonc.exe -e ":pf -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+    `gonc.exe -e ":nc -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
 ### Establishing a Tunnel for Other Applications
  - Assist WireGuard in NAT Traversal to Form a VPN
 
     On the passive (listening) side, PC-S, run the following command (using the WireGuard peer’s public key as the randomString, and assuming WireGuard is listening on port 51820):
 
-    `gonc -p2p <PublicKey-of-PS-S> -mqtt-wait -u -k -e ":pf -u 127.0.0.1:51820"`
+    `gonc -p2p <PublicKey-of-PS-S> -mqtt-wait -u -k -e ":nc -u 127.0.0.1 51820"`
 
     On the active (initiating) side, PC-C, set the WireGuard peer (PS-S)'s Endpoint to 127.0.0.1:51821, with its own WireGuard interface listening on 51820. Then run the following command. The -k flag allows gonc to automatically reconnect if the network drops:
 
-    `gonc -p2p <PublicKey-of-PS-S> -mqtt-hello -u -k -e ":pf -u -local 127.0.0.1:51821 127.0.0.1:51820"`
+    `gonc -p2p <PublicKey-of-PS-S> -mqtt-hello -u -k -e ":nc -u -local 127.0.0.1:51821 127.0.0.1 51820"`
 
 
 ## P2P NAT Traversal Capabilities

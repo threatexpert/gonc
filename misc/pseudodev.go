@@ -4,6 +4,9 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"time"
 )
 
 // 伪设备实现
@@ -47,3 +50,21 @@ func (d *PseudoDevice) Write(p []byte) (n int, err error) {
 func (d *PseudoDevice) Close() error {
 	return nil
 }
+
+///
+
+type DummyAddr string
+
+func (d DummyAddr) Network() string { return string(d) }
+func (d DummyAddr) String() string  { return string(d) }
+
+type ConsoleIO struct{}
+
+func (s *ConsoleIO) Read(p []byte) (int, error)         { return os.Stdin.Read(p) }
+func (s *ConsoleIO) Write(p []byte) (int, error)        { return os.Stdout.Write(p) }
+func (s *ConsoleIO) Close() error                       { return nil }
+func (s *ConsoleIO) LocalAddr() net.Addr                { return DummyAddr("stdio") }
+func (s *ConsoleIO) RemoteAddr() net.Addr               { return DummyAddr("stdio") }
+func (s *ConsoleIO) SetDeadline(t time.Time) error      { return nil }
+func (s *ConsoleIO) SetReadDeadline(t time.Time) error  { return nil }
+func (s *ConsoleIO) SetWriteDeadline(t time.Time) error { return nil }

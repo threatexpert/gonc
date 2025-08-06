@@ -3,7 +3,6 @@ package misc
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"unicode"
 )
 
@@ -38,14 +37,6 @@ func ParseCommandLine(command string) ([]string, error) {
 
 	if inQuotes {
 		return nil, fmt.Errorf("unclosed quote in command line")
-	}
-
-	if len(args) > 0 && args[0] == "." {
-		exePath, err := os.Executable()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get executable path")
-		}
-		args[0] = exePath
 	}
 
 	return args, nil

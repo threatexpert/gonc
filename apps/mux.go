@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/httpfileshare"
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/xtaci/smux"
 )
 
@@ -39,11 +40,6 @@ type MuxSessionConfig struct {
 	AppMuxConfig
 	SessionConn net.Conn
 }
-
-type dummyAddr string
-
-func (d dummyAddr) Network() string { return string(d) }
-func (d dummyAddr) String() string  { return string(d) }
 
 type ChanError struct {
 	id  int
@@ -85,7 +81,7 @@ func (m *muxListener) Close() error {
 }
 
 func (m *muxListener) Addr() net.Addr {
-	return dummyAddr("mux")
+	return misc.DummyAddr("mux")
 }
 
 type streamWrapper struct {
@@ -101,11 +97,11 @@ func (s *streamWrapper) CloseWrite() error {
 // 实现 net.Conn 剩余方法：
 
 func (s *streamWrapper) LocalAddr() net.Addr {
-	return dummyAddr("local")
+	return misc.DummyAddr("local")
 }
 
 func (s *streamWrapper) RemoteAddr() net.Addr {
-	return dummyAddr("remote")
+	return misc.DummyAddr("remote")
 }
 
 func (s *streamWrapper) SetDeadline(t time.Time) error {
@@ -148,17 +144,6 @@ func App_mux_usage() {
 	fmt.Fprintln(os.Stderr, "   :mux httpclient <saveDir>")
 	fmt.Fprintln(os.Stderr, "   :mux -l listen_port")
 }
-
-// type stdioConn struct{}
-
-// func (s *stdioConn) Read(p []byte) (int, error)         { return os.Stdin.Read(p) }
-// func (s *stdioConn) Write(p []byte) (int, error)        { return os.Stdout.Write(p) }
-// func (s *stdioConn) Close() error                       { return nil }
-// func (s *stdioConn) LocalAddr() net.Addr                { return dummyAddr("stdio") }
-// func (s *stdioConn) RemoteAddr() net.Addr               { return dummyAddr("stdio") }
-// func (s *stdioConn) SetDeadline(t time.Time) error      { return nil }
-// func (s *stdioConn) SetReadDeadline(t time.Time) error  { return nil }
-// func (s *stdioConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // func mux_main() {
 // 	appMode := ""
