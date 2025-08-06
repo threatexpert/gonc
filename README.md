@@ -17,30 +17,29 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 ## 使用示例
 
 ### 基本用法
-- 像 `nc` 一样使用：
+- 可像 `nc` 一样使用：
     ```bash
     gonc www.baidu.com 80
     gonc -tls www.baidu.com 443
+    gonc -l 4444  #监听模式
     ```
 
 ### 高安全性加密 P2P 通信
-- 在两个不同内网中实现高安全性加密 P2P 通信，需约定一个口令（建议使用 `gonc -psk .` 生成高熵口令替换randomString）。该口令用于两端互相发现并派生证书，通信基于 TLS 1.3 保证安全性。
+- 双方约定一个相同的口令，然后双方都执行下面命令：
     ```bash
-    gonc -p2p randomString
+    gonc -p2p <口令>
     ```
-    另一端使用相同参数（程序会自己尝试TCP或UDP建立通信（TCP优先），自己会协商角色（tls client/server）并完成TLS协议）：
-    ```bash
-    gonc -p2p randomString
-    ```
+
+    双方就能基于口令发现彼此的网络地址，内网穿透 NAT ，双向认证和加密通讯。双方都用口令派生证书，基于 TLS 1.3 保证安全通信。（口令相当于证书私钥，建议使用 `gonc -psk .` 随机生成高强度的口令）
 
     注意如果另一端耽误了运行时机，先运行的大概半分钟内无法发现对端来交互信息则会退出。因此还支持基于MQTT消息订阅的等待机制，使用-mqtt-wait和-mqtt-hello来同步双方开始P2P的时机。例如，下面用了-mqtt-wait可以持续等待，
 
     ```bash
-    gonc -p2p randomString -mqtt-wait
+    gonc -p2p <口令> -mqtt-wait
     ```
     另一端使用：
     ```bash
-    gonc -p2p randomString -mqtt-hello
+    gonc -p2p <口令> -mqtt-hello
     ```
 
 ### 反弹 Shell（类UNIX支持pseudo-terminal shell ）
@@ -52,13 +51,13 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     ```bash
     gonc -tls -pty x.x.x.x 1234
     ```
-- 使用 P2P 方式反弹 Shell（`randomString` 用于身份认证，基于 TLS 1.3 实现安全通信）：
+- 使用 P2P 方式反弹 Shell（`<口令>` 用于身份认证，基于 TLS 1.3 实现安全通信）：
     ```bash
-    gonc -exec ":sh /bin/bash" -p2p randomString
+    gonc -exec ":sh /bin/bash" -p2p <口令>
     ```
     另一端：
     ```bash
-    gonc -pty -p2p randomString
+    gonc -pty -p2p <口令>
     ```
 
 ### 传输速度测试
@@ -78,25 +77,25 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 ### P2P 隧道与 Socks5 代理
 - 等待建立隧道：
     ```bash
-    gonc -p2p randomString -socks5server
+    gonc -p2p <口令> -socks5server
     ```
 - 另一端将本机监听端口127.0.0.1:3080提供socks5服务：
     ```bash
-    gonc -p2p randomString -socks5local-port 3080
+    gonc -p2p <口令> -socks5local-port 3080
     ```
 
 ### P2P 隧道与 HTTP 文件服务器
 - 启动 HTTP 文件服务器：
     ```bash
-    gonc -p2p randomString -httpserver c:/RootDir
+    gonc -p2p <口令> -httpserver c:/RootDir
     ```
 - 另一端访问文件列表（需手动打开浏览器访问 http://127.0.0.1:9999 可实现浏览对端的文件列表和下载文件）：
     ```bash
-    gonc -p2p randomString -httplocal-port 9999
+    gonc -p2p <口令> -httplocal-port 9999
     ```
     支持递归下载所有文件到本地并断点续传：
     ```bash
-    gonc -p2p randomString -download c:/SavePath
+    gonc -p2p <口令> -download c:/SavePath
     ```
 
 ### 灵活服务配置
@@ -147,7 +146,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 ### 给其他应用建立通道
 - 帮WireGuard打洞组VPN
 
-    在被动等待连接的PC-S运行下面的参数（直接拿节点公钥来当randomString，接口的监听端口51820）：
+    在被动等待连接的PC-S运行下面的参数（直接拿节点公钥来当口令，接口的监听端口51820）：
 
     `gonc -p2p PS-S的公钥 -mqtt-wait -u -k -e ":pf -u 127.0.0.1:51820"`
 
