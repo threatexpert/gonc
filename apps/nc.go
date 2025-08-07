@@ -2,14 +2,17 @@ package apps
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
@@ -34,8 +37,10 @@ var (
 )
 
 type AppNetcatConfig struct {
-	consoleMode                        bool
-	network, host, port, P2PSessionKey string
+	ConsoleMode bool
+	LogWriter   io.Writer
+
+	network, host, port, p2pSessionKey string
 
 	connConfig                 *secure.NegotiationConfig
 	sessionReady               bool
@@ -56,7 +61,6 @@ type AppNetcatConfig struct {
 
 	accessControl *acl.ACL
 	term_oldstat  *term.State
-	LogWriter     io.Writer
 
 	proxyProt         string
 	proxyAddr         string
@@ -92,7 +96,7 @@ type AppNetcatConfig struct {
 	enablePty         bool
 	useSTUN           bool
 	stunSrv           string
-	MQTTServers       string
+	mqttServers       string
 	autoP2P           string
 	useMutilPath      bool
 	useMQTTWait       bool
@@ -108,6 +112,7 @@ type AppNetcatConfig struct {
 	fileACL           string
 	plainTransport    bool
 	framedStdio       bool
+	p2pReportURL      string
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -155,6 +160,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.BoolVar(&config.enablePty, "pty", false, "put the terminal into raw mode")
 	fs.BoolVar(&config.useSTUN, "stun", false, "use STUN to discover public IP")
 	fs.StringVar(&config.autoP2P, "p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
+	fs.StringVar(&config.p2pReportURL, "p2p-report-url", "", "API for reporting P2P status")
 	fs.BoolVar(&config.useMutilPath, "mp", false, "enable multipath(NOT IMPL)")
 	fs.BoolVar(&config.useMQTTWait, "mqtt-wait", false, "wait for MQTT hello message before initiating P2P connection")
 	fs.BoolVar(&config.useMQTTHello, "mqtt-hello", false, "send MQTT hello message before initiating P2P connection")
@@ -185,7 +191,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 
 	//<----- Global flags
 	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
-	fs.StringVar(&config.MQTTServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
+	fs.StringVar(&config.mqttServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
 	disableCompress := fs.Bool("no-compress", false, "disable compression for http download")
 	VarhttpDownloadNoCompress = disableCompress
 	fs.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
@@ -237,7 +243,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	config.network = network
 	config.host = host
 	config.port = port
-	config.P2PSessionKey = P2PSessionKey
+	config.p2pSessionKey = P2PSessionKey
 
 	// 5. 配置TLS、DNS、会话协商参数等
 	if config.tlsSNI == "" {
@@ -257,17 +263,17 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	config, err := AppNetcatConfigByArgs("gonc", args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing :nc args: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error parsing gonc args: %v\n", err)
 		return 1
 	}
-	config.consoleMode = true
+	config.ConsoleMode = true
 
 	return App_Netcat_main_withconfig(console, config)
 }
 
 func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 	defer console.Close()
-	if config.P2PSessionKey != "" {
+	if config.p2pSessionKey != "" {
 		return runP2PMode(console, config)
 	} else {
 		if config.listenMode {
@@ -279,7 +285,7 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 }
 
 func firstInit(ncconfig *AppNetcatConfig) {
-	easyp2p.MQTTBrokerServers = parseMultiItems(ncconfig.MQTTServers, true)
+	easyp2p.MQTTBrokerServers = parseMultiItems(ncconfig.mqttServers, true)
 	easyp2p.STUNServers = parseMultiItems(ncconfig.stunSrv, true)
 	conflictCheck(ncconfig)
 }
@@ -529,6 +535,7 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 			nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
 			if err != nil {
 				fmt.Fprintf(ncconfig.LogWriter, "P2P failed: %v\n", err)
+				fmt.Fprintf(ncconfig.LogWriter, "Will retry in 10 seconds...\n")
 				time.Sleep(10 * time.Second)
 				continue
 			}
@@ -729,6 +736,7 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 					listener, err = proxyClient.Dialer.Listen(network, listenAddr)
 					if err != nil {
 						fmt.Fprintf(ncconfig.LogWriter, "Error listening on %s: %v\n", listenAddr, err)
+						fmt.Fprintf(ncconfig.LogWriter, "Will retry in 5 seconds...\n")
 						time.Sleep(5 * time.Second)
 					} else {
 						fmt.Fprintf(ncconfig.LogWriter, "completed\n")
@@ -1065,6 +1073,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		}
 	case ":nc":
 		ncconfig.app_nc_Config, err = AppNetcatConfigByArgs(":nc", args[1:])
+		if err == nil {
+			ncconfig.app_nc_Config.LogWriter = ncconfig.LogWriter
+		}
 	case ":sh":
 		ncconfig.app_sh_Config, err = PtyShellConfigByArgs(args[1:])
 	case ":service":
@@ -1261,7 +1272,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	var err error
 	var maxSendBytes int64
 
-	if !ncconfig.consoleMode {
+	if !ncconfig.ConsoleMode {
 		binaryInputMode = true
 	}
 
@@ -1563,14 +1574,16 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 	var salt string
 
 	if ncconfig.useMQTTWait {
-		salt, err = easyp2p.MqttWait(ncconfig.P2PSessionKey, 30*time.Minute, ncconfig.LogWriter)
+		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
+		salt, err = easyp2p.MqttWait(ncconfig.p2pSessionKey, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-wait: %v", err)
 		}
 	}
 
 	if ncconfig.useMQTTHello {
-		salt, err = easyp2p.MQTTHello(ncconfig.P2PSessionKey, 15*time.Second, ncconfig.LogWriter)
+		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
+		salt, err = easyp2p.MQTTHello(ncconfig.p2pSessionKey, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-hello: %v", err)
 		}
@@ -1580,14 +1593,19 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	//使用其他客户端push过来的salt，构建一个仅和对端单独共享的topic，避免P2P交换地址时有多个端点在一起错乱发生
+
 	topicSalt, err := Mqtt_ensure_ready(ncconfig)
 	if err != nil {
+		ReportP2PStatus(ncconfig, "", fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
 	}
+
+	ReportP2PStatus(ncconfig, topicSalt, "connecting", ncconfig.network, "", "")
 
 	var relayConn *easyp2p.RelayPacketConn
 	socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
 	if err != nil {
+		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
 		return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
 	} else if socks5UDPClient != nil {
 		relayConn = &easyp2p.RelayPacketConn{
@@ -1599,11 +1617,12 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 
 	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-	connInfo, err := easyp2p.Easy_P2P(ncconfig.network, ncconfig.P2PSessionKey+topicSalt, relayConn, ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P(ncconfig.network, ncconfig.p2pSessionKey+topicSalt, relayConn, ncconfig.LogWriter)
 	if err != nil {
 		if relayConn != nil {
 			relayConn.Close()
 		}
+		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
 	}
 
@@ -1612,7 +1631,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	if ncconfig.plainTransport {
 		config.IsClient = connInfo.IsClient
 	} else {
-		config.Key = ncconfig.P2PSessionKey
+		config.Key = ncconfig.p2pSessionKey
 		config.KeyType = "PSK"
 		config.IsClient = connInfo.IsClient
 
@@ -1628,6 +1647,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	nconn, err := secure.DoNegotiation(&config, conn, ncconfig.LogWriter)
 	if err != nil {
 		conn.Close()
+		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
 	}
 	if nconn.IsUDP {
@@ -1644,6 +1664,19 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 	} else {
 		fmt.Fprintf(ncconfig.LogWriter, "Connected to: %s\n", conn.RemoteAddr().String())
+	}
+	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
+	statusMode := "P2P"
+	if connInfo.RelayUsed {
+		statusMode = "Relay"
+	}
+	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
+	preOnClose := nconn.OnClose
+	nconn.OnClose = func() {
+		ReportP2PStatus(ncconfig, topicSalt, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
+		if preOnClose != nil {
+			preOnClose()
+		}
 	}
 	return nconn, nil
 }
@@ -1716,4 +1749,58 @@ func cleanupUnixSocket(path string) error {
 		return fmt.Errorf("path %s exists but is not a Unix socket (mode: %s), refusing to remove it", path, fileInfo.Mode().String())
 	}
 	return nil
+}
+
+type P2PStatusReport struct {
+	Topic     string `json:"topic"`     // random string
+	Status    string `json:"status"`    // wait / connecting / connected / disconnected / error
+	Network   string `json:"network"`   // tcp / udp
+	Mode      string `json:"mode"`      // p2p / relay
+	Peer      string `json:"peer"`      // IP:port
+	Timestamp int64  `json:"timestamp"` // unix time
+}
+
+func ReportP2PStatus(ncconfig *AppNetcatConfig, mqttsess, status, network, mode, peer string) {
+	if ncconfig.p2pReportURL == "" {
+		return
+	}
+
+	report := P2PStatusReport{
+		Topic:     mqttsess,
+		Status:    status,
+		Network:   network,
+		Mode:      mode,
+		Peer:      peer,
+		Timestamp: time.Now().Unix(),
+	}
+
+	body, err := json.Marshal(report)
+	if err != nil {
+		fmt.Fprintf(ncconfig.LogWriter, "ReportP2PStatus: marshal report: %v\n", err)
+		return
+	}
+
+	req, err := http.NewRequest("POST", ncconfig.p2pReportURL, bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(ncconfig.LogWriter, "ReportP2PStatus: create request: %v\n", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 5 * time.Second, // 控制整个请求过程
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(ncconfig.LogWriter, "ReportP2PStatus: http post: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		//respBody, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(ncconfig.LogWriter, "ReportP2PStatus: server returned %d\n", resp.StatusCode)
+		return
+	}
 }

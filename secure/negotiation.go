@@ -66,6 +66,7 @@ type NegotiatedConn struct {
 	ConnStack      []string
 	ConnLayers     []net.Conn
 	IsUDP          bool
+	OnClose        func()
 }
 
 func (nconn *NegotiatedConn) Close() error {
@@ -80,6 +81,12 @@ func (nconn *NegotiatedConn) Close() error {
 	nconn.ConnLayers = []net.Conn{}
 	nconn.ctx = nil
 	nconn.cancel = nil
+
+	onCloseCallback := nconn.OnClose
+	if onCloseCallback != nil {
+		nconn.OnClose = nil
+		onCloseCallback()
+	}
 	return nil
 }
 

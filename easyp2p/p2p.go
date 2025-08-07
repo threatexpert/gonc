@@ -828,9 +828,12 @@ func countUniquePublicIPs(infos []PunchingAddressInfo, ver string) int {
 }
 
 type P2PConnInfo struct {
-	Conns     []net.Conn
-	SharedKey [32]byte
-	IsClient  bool
+	Conns        []net.Conn
+	SharedKey    [32]byte
+	IsClient     bool
+	RelayUsed    bool
+	NetworksUsed []string
+	PeerAddress  string
 }
 
 func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
@@ -876,6 +879,8 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *R
 	var role int = 0 // 0: unknown, 1: client, 2: server
 	var mconn []net.Conn
 	var sharedKey [32]byte
+	var isRelayUsed bool
+	var networksUsed []string
 
 	for round, p2pInfo = range p2pInfos {
 		if strings.HasPrefix(p2pInfo.Network, "tcp") {
@@ -890,6 +895,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *R
 					}
 					sharedKey = p2pInfo.SharedKey
 				}
+				networksUsed = append(networksUsed, p2pInfo.Network)
 				if !multipathEnabled {
 					break
 				}
@@ -897,7 +903,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *R
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, relayConn, logWriter)
+			conn, isRoleClient, _, relayUsed, err2 := Auto_P2P_UDP_NAT_Traversal(p2pInfo.Network, sessionUid, p2pInfo, false, round+1, relayConn, logWriter)
 			if err2 == nil {
 				mconn = append(mconn, conn)
 				if role == 0 {
@@ -908,6 +914,10 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *R
 					}
 					sharedKey = p2pInfo.SharedKey
 				}
+				if !isRelayUsed {
+					isRelayUsed = relayUsed
+				}
+				networksUsed = append(networksUsed, p2pInfo.Network)
 				if !multipathEnabled {
 					break
 				}
@@ -924,9 +934,12 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *R
 
 	if len(mconn) > 0 {
 		connInfo := &P2PConnInfo{
-			Conns:     mconn,
-			SharedKey: sharedKey,
-			IsClient:  CorS[role],
+			Conns:        mconn,
+			SharedKey:    sharedKey,
+			IsClient:     CorS[role],
+			RelayUsed:    isRelayUsed,
+			NetworksUsed: networksUsed,
+			PeerAddress:  mconn[0].RemoteAddr().String(),
 		}
 		return connInfo, nil
 	}
@@ -961,7 +974,7 @@ func generateRandomPorts(count int) []int {
 	return ports
 }
 
-func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, relayConn *RelayPacketConn, logWriter io.Writer) (net.Conn, bool, []byte, error) {
+func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressInfo, needSharedKey bool, round int, relayConn *RelayPacketConn, logWriter io.Writer) (net.Conn, bool, []byte, bool, error) {
 	var isClient bool
 	var sharedKey []byte
 	var count = 10
@@ -1023,11 +1036,11 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 
 	localAddr, err := net.ResolveUDPAddr(network, p2pInfo.LocalLAN)
 	if err != nil {
-		return nil, false, nil, fmt.Errorf("failed to resolve local address: %v", err)
+		return nil, false, nil, false, fmt.Errorf("failed to resolve local address: %v", err)
 	}
 	remoteUDPAddr, err := net.ResolveUDPAddr(network, remoteAddr)
 	if err != nil {
-		return nil, false, nil, fmt.Errorf("failed to resolve remote address: %v", err)
+		return nil, false, nil, false, fmt.Errorf("failed to resolve remote address: %v", err)
 	}
 
 	type AddrPair struct {
@@ -1047,7 +1060,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	} else {
 		uconn, err = net.ListenUDP(network, localAddr)
 		if err != nil {
-			return nil, false, nil, fmt.Errorf("error binding UDP address: %v", err)
+			return nil, false, nil, false, fmt.Errorf("error binding UDP address: %v", err)
 		}
 	}
 
@@ -1068,7 +1081,7 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	if round > 0 {
 		err = Mqtt_P2P_Round_Sync(sessionUid, isClient, round, 25*time.Second, logWriter)
 		if err != nil {
-			return nil, false, nil, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
+			return nil, false, nil, isRelayUsed, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
 		}
 	}
 
@@ -1356,9 +1369,9 @@ func Auto_P2P_UDP_NAT_Traversal(network, sessionUid string, p2pInfo *P2PAddressI
 	cancel()
 	stopPunching()
 	if errFin != nil {
-		return nil, false, nil, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
+		return nil, false, nil, isRelayUsed, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
 	}
-	return uconnBrandnew, isClient, sharedKey, nil
+	return uconnBrandnew, isClient, sharedKey, isRelayUsed, nil
 }
 
 func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPacketConn, error) {
