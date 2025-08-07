@@ -1117,7 +1117,7 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 	for {
 		n, err1 = reader.Read(buf)
 		if err1 != nil && err1 != io.EOF {
-			fmt.Fprintf(ncconfig.LogWriter, "Read error: %v\n", err1)
+			//fmt.Fprintf(ncconfig.LogWriter, "Read error: %v\n", err1)
 			break
 		}
 		if n == 0 {
@@ -1137,7 +1137,7 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 
 		_, err = dst.Write(buf[:n])
 		if err != nil {
-			fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
+			//fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
 			break
 		}
 
@@ -1178,7 +1178,7 @@ func copyCharDeviceWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io
 			}
 			n, err = writer.WriteString(line)
 			if err != nil {
-				fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
+				//fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
 				break
 			}
 			writer.Flush()
@@ -1758,6 +1758,7 @@ type P2PStatusReport struct {
 	Mode      string `json:"mode"`      // p2p / relay
 	Peer      string `json:"peer"`      // IP:port
 	Timestamp int64  `json:"timestamp"` // unix time
+	PID       int    `json:"pid"`       // process ID
 }
 
 func ReportP2PStatus(ncconfig *AppNetcatConfig, mqttsess, status, network, mode, peer string) {
@@ -1772,6 +1773,7 @@ func ReportP2PStatus(ncconfig *AppNetcatConfig, mqttsess, status, network, mode,
 		Mode:      mode,
 		Peer:      peer,
 		Timestamp: time.Now().Unix(),
+		PID:       os.Getpid(),
 	}
 
 	body, err := json.Marshal(report)
