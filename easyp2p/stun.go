@@ -555,7 +555,9 @@ func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Durati
 	var wg sync.WaitGroup
 	resultsChan := make(chan []*STUNResult, len(networkList))
 	errorsChan := make(chan error, len(networkList))
+	bindUnspecified := false
 	if bind == "" {
+		bindUnspecified = true
 		port, err := GetFreePort()
 		if err != nil {
 			return nil, err
@@ -563,17 +565,31 @@ func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Durati
 		bind = fmt.Sprintf(":%d", port)
 	}
 
+	udpAttemptNumber := 0
 	for _, network := range networkList {
+		bindAddrCandidate := bind
 		if shPktCon != nil {
 			if !strings.HasPrefix(network, "udp") {
 				continue
 			}
 			// PacketConn 只支持 UDP
+		} else {
+			if udpAttemptNumber > 0 && bindUnspecified {
+				//并发的时候，除非第一个的udp需要调整端口，
+				//例如第一个GetPublicIPs(udp6，5555)成功接着GetPublicIPs(udp4, 5555)就无法绑定这个端口了
+				port, err := GetFreePort()
+				if err == nil {
+					bindAddrCandidate = fmt.Sprintf(":%d", port)
+				}
+			}
+		}
+		if strings.HasPrefix(network, "udp") {
+			udpAttemptNumber += 1
 		}
 		wg.Add(1)
 		go func(network string) {
 			defer wg.Done()
-			results, err := GetPublicIPs(network, bind, timeout, false, shPktCon)
+			results, err := GetPublicIPs(network, bindAddrCandidate, timeout, false, shPktCon)
 			if err != nil {
 				errorsChan <- fmt.Errorf("network %s: %v", network, err)
 				return
