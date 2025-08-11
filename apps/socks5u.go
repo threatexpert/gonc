@@ -331,13 +331,15 @@ func sendSocks5Response(conn net.Conn, rep byte, bindAddr string, bindPort int) 
 }
 
 // handleTCPConnectViaTunnel 处理 TCP CONNECT 命令并通过隧道转发
-func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int) error {
+func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, transparent bool, targetHost string, targetPort int) error {
 	// 发送代理请求给远端: "tcp://target_host:target_port\n"
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
 	_, err := tunnelStream.Write([]byte(requestLine))
 	if err != nil {
-		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		if !transparent {
+			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		}
 		return fmt.Errorf("write tunnel request error: %w", err)
 	}
 	log.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
@@ -347,14 +349,18 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targe
 	responseLine, err := ReadString(tunnelStream, '\n')
 	if err != nil {
 		log.Printf("%s->%s error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
-		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		if !transparent {
+			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		}
 		return fmt.Errorf("read tunnel response error: %w", err)
 	}
 	responseLine = strings.TrimSpace(responseLine)
 
 	if !strings.HasPrefix(responseLine, "OK") {
 		log.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
-		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0) // 根据远端错误细化SOCKS5错误码
+		if !transparent {
+			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0) // 根据远端错误细化SOCKS5错误码
+		}
 		return fmt.Errorf("tunnel TCP connect failed: %s", responseLine)
 	}
 
@@ -364,8 +370,9 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targe
 	// 但在这里，连接目标在远端，所以我们通常返回代理服务器本身的地址（即 0.0.0.0:0 或本地监听地址）
 	// 或者为了更严谨，可以要求远端在OK后回传其绑定的地址和端口。
 	// 这里简化，返回 0.0.0.0:0
-	sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
-
+	if !transparent {
+		sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
+	}
 	tunnelStream.SetReadDeadline(time.Time{})
 
 	handleProxy(clientConn, tunnelStream)
@@ -748,45 +755,52 @@ func handleTCPListen(clientConn net.Conn, serverIP string, targetHost string, ta
 	return nil
 }
 
-func handleSocks5uProxy(conn net.Conn, stream net.Conn) {
+func handleSocks5uProxy(conn net.Conn, stream net.Conn, cmd string, targetHost string, targetPort int) {
 	log.Printf("New client connected from %s", conn.RemoteAddr())
+	var err error
 
-	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	if cmd == "" {
+		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 
-	// 1. SOCKS5 握手
-	configNoAuth := Socks5ServerConfig{
-		AuthenticateUser: nil, // 不要求认证
+		// 1. SOCKS5 握手
+		configNoAuth := Socks5ServerConfig{
+			AuthenticateUser: nil, // 不要求认证
+		}
+		err = handleSocks5Handshake(conn, configNoAuth)
+		if err != nil {
+			log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
+
+		// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
+		req, err := handleSocks5Request(conn)
+		if err != nil {
+			log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
+
+		conn.SetReadDeadline(time.Time{})
+		cmd = req.Command
+		targetHost, targetPort = req.Host, req.Port
 	}
-	err := handleSocks5Handshake(conn, configNoAuth)
-	if err != nil {
-		log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
 
-	// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
-	req, err := handleSocks5Request(conn)
-	if err != nil {
-		log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-
-	conn.SetReadDeadline(time.Time{})
-
-	if req.Command == "CONNECT" {
-		err = handleTCPConnectViaTunnel(conn, stream, req.Host, req.Port)
+	switch cmd {
+	case "CONNECT", "T-CONNECT":
+		transparent := cmd == "T-CONNECT"
+		err = handleTCPConnectViaTunnel(conn, stream, transparent, targetHost, targetPort)
 		if err != nil {
 			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 			return
 		}
-	} else if req.Command == "UDP" {
-		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, "", req.Host, req.Port)
+	case "UDP":
+		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, "", targetHost, targetPort)
 		if err != nil {
 			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 			return
 		}
 	}
 
-	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
+	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), cmd)
 }
 
 func ReadString(conn io.Reader, delim byte) (string, error) {

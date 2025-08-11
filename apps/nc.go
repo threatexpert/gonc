@@ -1250,13 +1250,6 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 
 	defer nconn.Close()
 
-	var bufsize int = 32 * 1024
-	blocksize := bufsize
-	if nconn.IsUDP {
-		//往udp连接拷贝数据，如果源是文件，应该限制每次拷贝到udp包的大小
-		blocksize = nconn.Config.UdpOutputBlockSize
-	}
-
 	if !ncconfig.sessionReady {
 		stats_in.ResetStart()
 		stats_out.ResetStart()
@@ -1271,11 +1264,18 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	var cmd *exec.Cmd
 	var err error
 	var maxSendBytes int64
+	var bufsize int = 32 * 1024
+	var blocksize int = bufsize
 
 	if !ncconfig.ConsoleMode {
 		binaryInputMode = true
 	}
-
+	if nconn.IsUDP {
+		//源如果是stdio或文件流，应该限制每次拷贝形成的udp包的大小
+		if ncconfig.ConsoleMode || ncconfig.sendfile != "" {
+			blocksize = nconn.Config.UdpOutputBlockSize
+		}
+	}
 	if ncconfig.sendfile != "" {
 		var file io.ReadCloser
 		if ncconfig.sendfile == "/dev/zero" || ncconfig.sendfile == "/dev/urandom" {

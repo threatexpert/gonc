@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ var (
 	httpServeDir                    = "."
 	VarmuxLastListenAddress         = ""
 	VarhttpDownloadNoCompress *bool = new(bool)
+	MagicDNServer                   = "gonc.cc"
 )
 
 type AppMuxConfig struct {
@@ -391,21 +393,32 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 		return err
 	}
 
+	bindUnspecified := !strings.Contains(cfg.Port, ":")
+	network := "tcp"
 	laddr := cfg.Port
 	if VarmuxLastListenAddress != "" {
 		laddr = VarmuxLastListenAddress
 	}
 	if !strings.Contains(laddr, ":") {
-		laddr = "127.0.0.1:" + laddr
+		laddr = "0.0.0.0:" + laddr
 	}
-	ln, err := net.Listen("tcp", laddr)
+	if strings.HasPrefix(laddr, "0.0.0.0") {
+		network = "tcp4"
+	}
+	ln, err := net.Listen(network, laddr)
 	if err != nil {
 		return fmt.Errorf("listen failed: %v", err)
 	}
 
 	actualListenAddr := ln.Addr().String()
+	_, actualListenPort, _ := net.SplitHostPort(actualListenAddr)
 
-	fmt.Fprintf(os.Stderr, "[%s] Listening on %s\n", peerMode, ln.Addr().String())
+	if bindUnspecified {
+		fmt.Fprintf(os.Stderr, "[%s] Listening on %s (Only accept from 127.0.0.1/8)\n", peerMode, ln.Addr().String())
+		fmt.Fprintf(os.Stderr, "The address format like 10.0.0.1-3389.gonc.cc:%s can use for transparent proxy access to the target address(10.0.0.1:3389).\n", actualListenPort)
+	} else {
+		fmt.Fprintf(os.Stderr, "[%s] Listening on %s\n", peerMode, ln.Addr().String())
+	}
 	if peerMode == "httpserver" {
 		_, port, _ := net.SplitHostPort(ln.Addr().String())
 		fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser\n", port)
@@ -451,8 +464,30 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 			}
 			return fmt.Errorf("listener accept failed: %v", err)
 		}
+		magicTarget := ""
+		if bindUnspecified {
+			// Only accept 127.0.0.0/8
+			rhost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			if !strings.HasPrefix(rhost, "127.") {
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "Only accept from 127.0.0.0/8, client(%s) closed.\n", conn.RemoteAddr().String())
+				continue
+			}
+			lhost, _, err := net.SplitHostPort(conn.LocalAddr().String())
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			if lhost != "127.0.0.1" {
+				magicTarget = lhost
+			}
+		}
 
-		go func(c net.Conn) {
+		go func(c net.Conn, magicTarget string) {
 			defer c.Close()
 			var stream net.Conn
 			var err error
@@ -469,12 +504,59 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 			streamWithCloseWrite := &streamWrapper{Conn: stream}
 			defer streamWithCloseWrite.Close()
 			if peerMode == "socks5" {
-				handleSocks5uProxy(c, streamWithCloseWrite)
+				targetHost := ""
+				targetPort := 0
+				cmd := ""
+				if magicTarget != "" {
+					targetHost, targetPort, err = dnsLookupMagicIP(magicTarget)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "dnsLookupMagicIP failed:", err)
+						return
+					}
+					cmd = "T-CONNECT" //透明代理
+				}
+				handleSocks5uProxy(c, streamWithCloseWrite, cmd, targetHost, targetPort)
 			} else {
 				handleProxy(c, streamWithCloseWrite)
 			}
-		}(conn)
+		}(conn, magicTarget)
 	}
+}
+
+// ipToken 例如 "127.4.5.6"
+func dnsLookupMagicIP(ipToken string) (string, int, error) {
+	// 验证并解析 IP
+	parsed := net.ParseIP(ipToken)
+	if parsed == nil || parsed.To4() == nil {
+		return "", 0, fmt.Errorf("invalid ipToken: %s", ipToken)
+	}
+	b := parsed.To4()
+
+	// 拼域名，比如 127.4.5.6.domain.io
+	queryName := fmt.Sprintf("%d.%d.%d.%d.%s", b[0], b[1], b[2], b[3], MagicDNServer)
+
+	// 系统默认 resolver 查询 TXT
+	txtRecords, err := net.LookupTXT(queryName)
+	if err != nil {
+		return "", 0, fmt.Errorf("TXT lookup failed: %v", err)
+	}
+	if len(txtRecords) == 0 {
+		return "", 0, fmt.Errorf("no TXT record found for %s", queryName)
+	}
+
+	// 假设 TXT 格式是 "ip:port"
+	parts := strings.SplitN(txtRecords[0], ":", 2)
+	if len(parts) != 2 {
+		return "", 0, fmt.Errorf("invalid TXT format: %s", txtRecords[0])
+	}
+
+	host := parts[0]
+	port, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port: %v", err)
+	}
+
+	return host, port, nil
 }
 
 func handleForwardMode(cfg MuxSessionConfig) error {
