@@ -3,6 +3,7 @@ package apps
 import (
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -91,6 +92,8 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 		fmt.Fprintln(os.Stderr, "DNSLookupMagicIP failed:", err)
 		return
 	}
+
+	log.Printf("connecting %s:%d\n", targetHost, targetPort)
 
 	targetConn, err := config.dialer.Dialer.DialTimeout("tcp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)), 20*time.Second)
 	if err != nil {
