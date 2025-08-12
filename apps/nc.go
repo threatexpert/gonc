@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	VERSION = "v2.3.1"
+	VERSION = "v2.3.2"
 )
 
 type AppNetcatConfig struct {
@@ -58,6 +58,7 @@ type AppNetcatConfig struct {
 	app_sh_Config     *PtyShellConfig
 	app_nc_args       string
 	app_nc_Config     *AppNetcatConfig
+	app_tp_Config     *AppTPConfig
 
 	accessControl *acl.ACL
 	term_oldstat  *term.State
@@ -980,6 +981,7 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":s5s", "SOCKS5 server")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":nc", "netcat")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":sh", "pseudo-terminal shell")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":tp", "transparent proxy")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":service", "dynamic service mode, clients can use -call to invoke the above configured and enabled services.")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "To get help for a built-in command, run:")
@@ -1078,6 +1080,8 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		}
 	case ":sh":
 		ncconfig.app_sh_Config, err = PtyShellConfigByArgs(args[1:])
+	case ":tp":
+		ncconfig.app_tp_Config, err = AppTPConfigByArgs(args[1:])
 	case ":service":
 	default:
 		if strings.HasPrefix(builtinApp, ":") {
@@ -1399,6 +1403,16 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_shell_main_withconfig(pipeConn, ncconfig.app_sh_Config)
+		} else if builtinApp == ":tp" {
+			if ncconfig.app_tp_Config == nil {
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go App_tp_main_withconfig(pipeConn, ncconfig.app_tp_Config)
 		} else if strings.HasPrefix(builtinApp, ":") {
 			fmt.Fprintf(ncconfig.LogWriter, "Invalid service command: %s\n", builtinApp)
 			return 1

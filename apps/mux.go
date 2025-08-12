@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -26,7 +25,6 @@ var (
 	httpServeDir                    = "."
 	VarmuxLastListenAddress         = ""
 	VarhttpDownloadNoCompress *bool = new(bool)
-	MagicDNServer                   = "gonc.cc"
 )
 
 type AppMuxConfig struct {
@@ -508,9 +506,9 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 				targetPort := 0
 				cmd := ""
 				if magicTarget != "" {
-					targetHost, targetPort, err = dnsLookupMagicIP(magicTarget)
+					targetHost, targetPort, err = DNSLookupMagicIP(magicTarget, false)
 					if err != nil {
-						fmt.Fprintln(os.Stderr, "dnsLookupMagicIP failed:", err)
+						fmt.Fprintln(os.Stderr, "DNSLookupMagicIP failed:", err)
 						return
 					}
 					cmd = "T-CONNECT" //透明代理
@@ -521,42 +519,6 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 			}
 		}(conn, magicTarget)
 	}
-}
-
-// ipToken 例如 "127.4.5.6"
-func dnsLookupMagicIP(ipToken string) (string, int, error) {
-	// 验证并解析 IP
-	parsed := net.ParseIP(ipToken)
-	if parsed == nil || parsed.To4() == nil {
-		return "", 0, fmt.Errorf("invalid ipToken: %s", ipToken)
-	}
-	b := parsed.To4()
-
-	// 拼域名，比如 127.4.5.6.domain.io
-	queryName := fmt.Sprintf("%d.%d.%d.%d.%s", b[0], b[1], b[2], b[3], MagicDNServer)
-
-	// 系统默认 resolver 查询 TXT
-	txtRecords, err := net.LookupTXT(queryName)
-	if err != nil {
-		return "", 0, fmt.Errorf("TXT lookup failed: %v", err)
-	}
-	if len(txtRecords) == 0 {
-		return "", 0, fmt.Errorf("no TXT record found for %s", queryName)
-	}
-
-	// 假设 TXT 格式是 "ip:port"
-	parts := strings.SplitN(txtRecords[0], ":", 2)
-	if len(parts) != 2 {
-		return "", 0, fmt.Errorf("invalid TXT format: %s", txtRecords[0])
-	}
-
-	host := parts[0]
-	port, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return "", 0, fmt.Errorf("invalid port: %v", err)
-	}
-
-	return host, port, nil
 }
 
 func handleForwardMode(cfg MuxSessionConfig) error {
