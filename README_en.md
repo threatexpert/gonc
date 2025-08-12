@@ -14,6 +14,10 @@ README in [English](./README_en.md) and [中文](./README.md)
 
 ---
 
+[Latest version download](https://github.com/threatexpert/gonc/releases)
+
+---
+
 ## Usage Examples
 
 ### Basic Usage
