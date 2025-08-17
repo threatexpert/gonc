@@ -104,7 +104,6 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 	handleProxy(conn, targetConn)
 }
 
-// ipToken 例如 "127.4.5.6"
 func DNSLookupMagicIP(ipToken string, allowPublicIP bool) (string, int, error) {
 	// 验证并解析 IP
 	parsed := net.ParseIP(ipToken)
@@ -116,33 +115,86 @@ func DNSLookupMagicIP(ipToken string, allowPublicIP bool) (string, int, error) {
 	// 拼域名，比如 127.4.5.6.domain.io
 	queryName := fmt.Sprintf("%d.%d.%d.%d.%s", b[0], b[1], b[2], b[3], MagicDNServer)
 
-	// 系统默认 resolver 查询 TXT
-	txtRecords, err := net.LookupTXT(queryName)
-	if err != nil {
-		return "", 0, fmt.Errorf("TXT lookup failed: %v", err)
-	}
-	if len(txtRecords) == 0 {
-		return "", 0, fmt.Errorf("no TXT record found for %s", queryName)
+	type result struct {
+		host string
+		port int
+		err  error
 	}
 
-	// 假设 TXT 格式是 "ip:port"
-	parts := strings.SplitN(txtRecords[0], ":", 2)
-	if len(parts) != 2 {
-		return "", 0, fmt.Errorf("invalid TXT format: %s", txtRecords[0])
-	}
+	results := make(chan result, 2)
 
-	host := parts[0]
-	port, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return "", 0, fmt.Errorf("invalid port: %v", err)
-	}
+	// 查询 TXT
+	go func() {
+		txtRecords, err := net.LookupTXT(queryName)
+		if err != nil {
+			results <- result{"", 0, err}
+			return
+		}
+		if len(txtRecords) == 0 {
+			results <- result{"", 0, fmt.Errorf("no TXT record found")}
+			return
+		}
 
-	if !allowPublicIP {
-		parsedHost := net.ParseIP(host)
-		if parsedHost == nil || !(parsedHost.IsPrivate() || parsedHost.IsLoopback()) {
-			return "", 0, fmt.Errorf("public IPs are not allowed: %s", host)
+		parts := strings.SplitN(txtRecords[0], ":", 2)
+		if len(parts) != 2 {
+			results <- result{"", 0, fmt.Errorf("invalid TXT format: %s", txtRecords[0])}
+			return
+		}
+
+		host := parts[0]
+		port, err := strconv.Atoi(parts[1])
+		if err != nil {
+			results <- result{"", 0, fmt.Errorf("invalid port: %v", err)}
+			return
+		}
+
+		results <- result{host, port, nil}
+	}()
+
+	// 查询 CNAME
+	go func() {
+		cname, err := net.LookupCNAME(queryName)
+		if err != nil {
+			results <- result{"", 0, err}
+			return
+		}
+
+		// cname 返回通常带最后的点，去掉
+		cname = strings.TrimSuffix(cname, ".")
+		cname = strings.TrimSuffix(cname, MagicDNServer)
+		cname = strings.TrimSuffix(cname, ".") // 确保去掉最后的点
+
+		// 现在格式是 "host-port"， 或x-domain-port
+		idx := strings.LastIndex(cname, "-")
+		if idx == -1 {
+			// 没有找到 '-'，直接返回原值，port为空
+			results <- result{"", 0, fmt.Errorf("invalid CNAME format: %s", cname)}
+			return
+		}
+
+		host, portStr := cname[:idx], cname[idx+1:]
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			results <- result{"", 0, fmt.Errorf("invalid port: %v", err)}
+			return
+		}
+
+		results <- result{host, port, nil}
+	}()
+
+	// 哪个先成功就用哪个
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err == nil {
+			if !allowPublicIP {
+				parsedHost := net.ParseIP(r.host)
+				if parsedHost == nil || !(parsedHost.IsPrivate() || parsedHost.IsLoopback()) {
+					return "", 0, fmt.Errorf("public IPs are not allowed: %s", r.host)
+				}
+			}
+			return r.host, r.port, nil
 		}
 	}
 
-	return host, port, nil
+	return "", 0, fmt.Errorf("both TXT and CNAME lookups failed")
 }

@@ -391,14 +391,18 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 		return err
 	}
 
-	bindUnspecified := !strings.Contains(cfg.Port, ":")
+	transproxy := !strings.Contains(cfg.Port, ":") && peerMode == "socks5"
 	network := "tcp"
 	laddr := cfg.Port
 	if VarmuxLastListenAddress != "" {
 		laddr = VarmuxLastListenAddress
 	}
 	if !strings.Contains(laddr, ":") {
-		laddr = "0.0.0.0:" + laddr
+		if transproxy {
+			laddr = "0.0.0.0:" + laddr
+		} else {
+			laddr = "127.0.0.1:" + laddr
+		}
 	}
 	if strings.HasPrefix(laddr, "0.0.0.0") {
 		network = "tcp4"
@@ -411,15 +415,15 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	actualListenAddr := ln.Addr().String()
 	_, actualListenPort, _ := net.SplitHostPort(actualListenAddr)
 
-	if bindUnspecified {
+	if transproxy {
 		fmt.Fprintf(os.Stderr, "[%s] Listening on %s (Only accept from 127.0.0.1/8)\n", peerMode, ln.Addr().String())
 		fmt.Fprintf(os.Stderr, "The address format like 10.0.0.1-3389.gonc.cc:%s can use for transparent proxy access to the target address(10.0.0.1:3389).\n", actualListenPort)
 	} else {
 		fmt.Fprintf(os.Stderr, "[%s] Listening on %s\n", peerMode, ln.Addr().String())
 	}
-	if peerMode == "httpserver" {
-		_, port, _ := net.SplitHostPort(ln.Addr().String())
-		fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser\n", port)
+	switch peerMode {
+	case "httpserver":
+		fmt.Fprintf(os.Stderr, "You can open http://127.0.0.1:%s in your browser\n", actualListenPort)
 	}
 	if cfg.Port == "0" {
 		VarmuxLastListenAddress = ln.Addr().String()
@@ -463,7 +467,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 			return fmt.Errorf("listener accept failed: %v", err)
 		}
 		magicTarget := ""
-		if bindUnspecified {
+		if transproxy {
 			// Only accept 127.0.0.0/8
 			rhost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 			if err != nil {
