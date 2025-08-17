@@ -28,7 +28,25 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     gonc -l 4444  #监听模式
     ```
 
-### 高安全性加密 P2P 通信
+### P2P 传输文件的例子
+- 发送文件的一端，执行下面命令启动 HTTP 文件服务器，最后一个参数c:/RootDir就是要发送的文件所在目录：
+    ```bash
+    gonc -p2p <口令> -httpserver c:/RootDir
+    ```
+- 另一端下载文件的2种方式：
+    
+    1、执行下面命令后，会自动下载完整目录，支持递归下载所有文件到本地，中断重新执行会自动断点续传：
+    ```bash
+    gonc -p2p <口令> -download c:/SavePath
+    ```
+
+    2、这种不会自动开始下载，需手动打开浏览器访问 http://127.0.0.1:9999 浏览对端的文件列表和针对性下载文件
+    ```bash
+    gonc -p2p <口令> -httplocal-port 9999
+    ```
+
+
+### 玩转 P2P 通信
 - 双方约定一个相同的口令，然后双方都执行下面命令：
     ```bash
     gonc -p2p <口令>
@@ -36,7 +54,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     双方就能基于口令发现彼此的网络地址，内网穿透 NAT ，双向认证和加密通讯。双方都用口令派生证书，基于 TLS 1.3 保证安全通信。（口令相当于证书私钥，建议使用 `gonc -psk .` 随机生成高强度的口令）
 
-    注意如果另一端耽误了运行时机，先运行的大概半分钟内无法发现对端来交互信息则会退出。因此还支持基于MQTT消息订阅的等待机制，使用-mqtt-wait和-mqtt-hello来同步双方开始P2P的时机。例如，下面用了-mqtt-wait可以持续等待，
+    注意这条命令在两端的运行时差不能太久（30秒以内），否则错过NAT打洞时机会失败退出。因此还支持基于MQTT消息订阅的等待机制，使用-mqtt-wait和-mqtt-hello来同步双方开始P2P的时机。例如，下面用了-mqtt-wait可以持续等待，
 
     ```bash
     gonc -p2p <口令> -mqtt-wait
@@ -45,6 +63,23 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     ```bash
     gonc -p2p <口令> -mqtt-hello
     ```
+
+    以上这样建立的裸连接，也只是可以互相打字发消息哦。如果你是懂nc的，现在要p2p传输数据的话，例如发送文件的命令应该类似是这样：
+
+    ```bash
+    cat 文件路径 | gonc -p2p 口令 -mqtt-wait    #linux风格
+    
+    或
+
+    gonc -p2p 口令 -mqtt-wait -send 文件路径    #用-send参数，兼容linux和windows
+    ```
+
+    另一端使用：
+
+    ```bash
+    gonc -p2p 口令 > 保存文件名
+    ```
+
 
 ### 反弹 Shell（类UNIX支持pseudo-terminal shell ）
 - 监听端（不使用 `-keep-open`，仅接受一次连接；未使用 `-psk`，无身份认证）：
@@ -96,19 +131,6 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
     该域名会被解析为类似127.b.c.d的IP，因此远程桌面客户端会连入本地的socks5代理端口3080，然后gonc根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
 
-### P2P 隧道与 HTTP 文件服务器
-- 启动 HTTP 文件服务器：
-    ```bash
-    gonc -p2p <口令> -httpserver c:/RootDir
-    ```
-- 另一端访问文件列表（需手动打开浏览器访问 http://127.0.0.1:9999 可实现浏览对端的文件列表和下载文件）：
-    ```bash
-    gonc -p2p <口令> -httplocal-port 9999
-    ```
-    支持递归下载所有文件到本地并断点续传：
-    ```bash
-    gonc -p2p <口令> -download c:/SavePath
-    ```
 
 ### 灵活服务配置
 - -exec可灵活的设置为每个连接提供服务的应用程序，除了指定/bin/bash这种提供shell命令的方式，也可以用来端口转发流量，不过下面这种每个连接进来就会开启一个新的gonc进程：
