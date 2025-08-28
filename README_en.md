@@ -6,7 +6,7 @@ README in [English](./README_en.md) and [中文](./README.md)
 
 - 🔁 **Automated NAT Traversal**: Use `-p2p` to automatically perform TCP/UDP NAT traversal and establish peer-to-peer connections without manual configuration, relying on public STUN and MQTT services for address exchange.
 - 🚀 **Reliable UDP Transmission**: Integrated with the KCP protocol, ensuring reliable communication over UDP when TCP cannot traverse NAT.
-- 🔒 **End-to-End Encrypted Authentication**: Supports TLS for TCP and DTLS for UDP with mutual authentication based on a shared password.
+- 🔒 **End-to-End Encrypted Authentication**: Supports TLS for TCP and DTLS for UDP with mutual authentication based on a shared passphrase.
 - 🧩 **Embeddable Service Program**: Use `-exec` to run the tool as a sub-service, supporting scenarios like traffic forwarding, Socks5 proxy, and HTTP file service with multiplexing capabilities.
 - 🖥️ **Pseudo-Terminal Support**: Combined with `-exec` and `-pty`, it provides a pseudo-terminal environment for interactive programs like `/bin/sh`, enhancing shell control (supports TAB, Ctrl+C, etc.).
 - 💻 **Raw Input Mode**: Enables console `raw` mode with `-pty`, offering a native terminal-like experience when accessing a shell.
@@ -27,24 +27,47 @@ README in [English](./README_en.md) and [中文](./README.md)
     gonc -tls www.baidu.com 443
     ```
 
-### Secure Encrypted P2P Communication
-- Establish secure encrypted P2P communication between two different networks by agreeing on a password (use `gonc -psk .` to generate a high-entropy password to replace `randomString`). This password is used for mutual discovery and certificate derivation, ensuring communication security with TLS 1.3.
+### P2P Tunnel and HTTP File Server
+- Both sides agree on the same passphrase. On the file-sending side, run the following command to start an HTTP file server. The last argument c:/RootDir is the directory containing the files to be sent:
     ```bash
-    gonc -p2p randomString
+    gonc -p2p passphrase -httpserver c:/RootDir
+    ```
+- On the receiving side, there are two options:
+
+1. Automatically download the entire directory
+
+    After running the following command, all files will be downloaded recursively to the local machine. If the process is interrupted, re-running the command will automatically resume from where it left off:
+
+    ```bash
+    gonc -p2p <passphrase> -download c:/SavePath
+    ```
+
+2. Browse and selectively download via browser
+
+    This option does not start downloading automatically. Instead, you need to manually open a browser and visit http://127.0.0.1:9999 to view the peer’s file list and download files as needed:
+
+    ```bash
+    gonc -p2p <passphrase> -httplocal-port 9999
+    ```
+
+### Secure Encrypted P2P Communication
+- Establish secure encrypted P2P communication between two different networks by agreeing on a passphrase (use `gonc -psk .` to generate a high-entropy passphrase to replace `passphrase`). This passphrase is used for mutual discovery and certificate derivation, ensuring communication security with TLS 1.3.
+    ```bash
+    gonc -p2p passphrase
     ```
     On the other side, use the same parameters (the program will automatically attempt TCP or UDP communication (TCP preferred), negotiate roles (TLS client/server), and complete the TLS protocol):
     ```bash
-    gonc -p2p randomString
+    gonc -p2p passphrase
     ```
 
     Note that if the other end delays the running time, it will exit if it cannot find the other end to interact with information within about half a minute. Therefore, it also supports a waiting mechanism based on MQTT message subscription, using -mqtt-wait and -mqtt-hello to synchronize the timing of the two parties to start P2P. For example, the following uses -mqtt-wait to wait continuously，
 
     ```bash
-    gonc -p2p randomString -mqtt-wait
+    gonc -p2p passphrase -mqtt-wait
     ```
     On the other side, 
     ```bash
-    gonc -p2p randomString -mqtt-hello
+    gonc -p2p passphrase -mqtt-hello
     ```
 
 ### Reverse Shell (Pseudo-Terminal Support for UNIX-like Systems)
@@ -56,13 +79,13 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```bash
     gonc -tls -pty x.x.x.x 1234
     ```
-- Use P2P for reverse shell (`randomString` is used for authentication, ensuring secure communication with TLS 1.3):
+- Use P2P for reverse shell (`passphrase` is used for authentication, ensuring secure communication with TLS 1.3):
     ```bash
-    gonc -exec ":sh /bin/bash" -p2p randomString
+    gonc -exec ":sh /bin/bash" -p2p passphrase
     ```
     On the other side:
     ```bash
-    gonc -pty -p2p randomString
+    gonc -pty -p2p passphrase
     ```
 
 ### Transmission Speed Test
@@ -80,28 +103,22 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```
 
 ### P2P Tunnel and Socks5 Proxy
-- Wait to establish a tunnel:
+- Wait for the tunnel to be established:
     ```bash
-    gonc -p2p randomString -socks5server
+    gonc -p2p passphrase -socks5server
     ```
-- On the other side, provide a Socks5 service on the local port 127.0.0.1:3080:
+- On the other side, expose a local SOCKS5 service on port 3080:
     ```bash
-    gonc -p2p randomString -socks5local-port 3080
+    gonc -p2p passphrase -socks5local-port 3080
     ```
 
-### P2P Tunnel and HTTP File Server
-- Start an HTTP file server:
-    ```bash
-    gonc -p2p randomString -httpserver c:/RootDir
+    Next, for example, if you want to connect to 10.0.0.1:3389 in the remote network, you can simply enter the following address in your local Remote Desktop client:
+
     ```
-- Access the file list from the other side (manually open a browser to access http://127.0.0.1:9999 to browse and download files):
-    ```bash
-    gonc -p2p randomString -httplocal-port 9999
+    10.0.0.1-3389.gonc.cc:3080
     ```
-    Support recursive download of all files with resume capability:
-    ```bash
-    gonc -p2p randomString -download c:/SavePath
-    ```
+
+    This domain will be resolved into an IP in the form of 127.b.c.d. As a result, the Remote Desktop client will connect to the local SOCKS5 proxy on port 3080, and then gonc will reverse-parse the 127.b.c.d address to extract the information 10.0.0.1-3389 from the domain name.
 
 ### Flexible Service Configuration
 - Use `-exec` to flexibly configure the application to provide services for each connection. For example, instead of specifying `/bin/bash` for shell commands, it can also be used for port forwarding. However, the following example starts a new `gonc` process for each connection:
@@ -124,16 +141,16 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```
 - Secure Socks5 over TLS: Since standard Socks5 is unencrypted, use [`-e :s5s`](#) with [`-tls`](#) and [`-psk`](#) to customize secure Socks5 over TLS communication. Use [`-P`](#) to monitor connection transmission information, and [`-acl`](#) to implement access control for incoming connections and proxy destinations. For the `acl.txt` file format, see [acl-example.txt](./acl-example.txt).
 
-    `gonc.exe -tls -psk randomString -e :s5s -keep-open -acl acl.txt -P -l 1080`
+    `gonc.exe -tls -psk passphrase -e :s5s -keep-open -acl acl.txt -P -l 1080`
 
     On the other side, use `:nc` (built-in nc command) to convert Socks5 over TLS to standard Socks5, providing local client access on 127.0.0.1:3080:
 
-    `gonc.exe -e ":nc -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+    `gonc.exe -e ":nc -tls -psk passphrase x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
 ### Establishing a Tunnel for Other Applications
  - Assist WireGuard in NAT Traversal to Form a VPN
 
-    On the passive (listening) side, PC-S, run the following command (using the WireGuard peer’s public key as the randomString, and assuming WireGuard is listening on port 51820):
+    On the passive (listening) side, PC-S, run the following command (using the WireGuard peer’s public key as the passphrase, and assuming WireGuard is listening on port 51820):
 
     `gonc -p2p <PublicKey-of-PS-S> -mqtt-wait -u -k -e ":nc -u 127.0.0.1 51820"`
 
@@ -159,11 +176,11 @@ README in [English](./README_en.md) and [中文](./README.md)
 
  - When P2P fails, you only need one side of gonc to retry the P2P process using the -x option to route through the SOCKS5 relay:
 
-    `gonc -p2p <randomString> -x "-psk <password> -tls <socks5server-ip>:1080" `
+    `gonc -p2p <passphrase> -x "-psk <password> -tls <socks5server-ip>:1080" `
 
     Alternatively, you can use a standard SOCKS5 proxy server that supports UDP forwarding:
 
-    `gonc -p2p <randomString> -x "<socks5server-ip>:1080" -auth "user:password"`
+    `gonc -p2p <passphrase> -x "<socks5server-ip>:1080" -auth "user:password"`
 
 For example, if both peers are behind symmetric NATs and P2P fails, having just one side use a SOCKS5 UDP relay effectively changes its NAT behavior to “easy,” making it much easier to establish a connection. The data remains end-to-end encrypted.
 
