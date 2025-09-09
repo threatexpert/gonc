@@ -1,16 +1,14 @@
-## Introduction to go-netcat
+## Introduction to gonc
 
 README in [English](./README_en.md) and [中文](./README.md)
 
-`go-netcat` is a Golang-based `netcat` tool designed to facilitate peer-to-peer communication. Its main features include:
+`gonc` is a Golang-based `netcat` tool designed to facilitate peer-to-peer communication. Its main features include:
 
-- 🔁 **Automated NAT Traversal**: Use `-p2p` to automatically perform TCP/UDP NAT traversal and establish peer-to-peer connections without manual configuration, relying on public STUN and MQTT services for address exchange.
-- 🚀 **Reliable UDP Transmission**: Integrated with the KCP protocol, ensuring reliable communication over UDP when TCP cannot traverse NAT.
-- 🔒 **End-to-End Encrypted Authentication**: Supports TLS for TCP and DTLS for UDP with mutual authentication based on a shared passphrase.
-- 🧩 **Embeddable Service Program**: Use `-exec` to run the tool as a sub-service, supporting scenarios like traffic forwarding, Socks5 proxy, and HTTP file service with multiplexing capabilities.
-- 🖥️ **Pseudo-Terminal Support**: Combined with `-exec` and `-pty`, it provides a pseudo-terminal environment for interactive programs like `/bin/sh`, enhancing shell control (supports TAB, Ctrl+C, etc.).
-- 💻 **Raw Input Mode**: Enables console `raw` mode with `-pty`, offering a native terminal-like experience when accessing a shell.
-- 📈 **Real-Time Speed Statistics**: Displays real-time speed statistics for both sending and receiving directions, useful for testing transmission performance.
+- 🔁 **Automated NAT Traversal**: Zero configuration. Both sides only need to agree on a passphrase. By using the -p2p parameter, peers can automatically discover each other’s network addresses and establish a point-to-point connection through NAT traversal, leveraging public STUN and MQTT services for address exchange.
+
+- 🔒 **End-to-End Encrypted with Mutual Authentication**: Supports TLS for TCP and DTLS for UDP encrypted transmission, with passphrase-based mutual identity authentication.
+
+- 🧩 **Flexible Service Configuration**: With the -e parameter, you can flexibly set the application to serve each connection. For example, -e /bin/sh can provide a remote cmd shell. You can also use built-in virtual commands for convenient SOCKS5 service, HTTP file service, and traffic forwarding.
 
 ---
 
