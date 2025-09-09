@@ -223,3 +223,7 @@ To handle these NAT types, gonc employs several traversal strategies:
  - The peer with the harder NAT sends UDP packets with a low TTL to reduce interference from the remote firewall
 
  - As a last resort, uses a "birthday paradox" strategy: the harder side uses 600 random source ports, and the other side tries 600 random destination ports, increasing the chance of a successful UDP port collision
+
+The following diagram shows the process of gonc establishing a P2P connection between a home broadband network (hard NAT) and a peer on a mobile network (symmetric NAT). Since both sides have IPv6, the -4 option is used on both ends to force IPv4 in order to demonstrate NAT traversal.
+
+![hole-punching](./hole-punching.gif)
