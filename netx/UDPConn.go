@@ -529,21 +529,30 @@ func (d *UDPCustomDialer) DialUDP(network string, remoteAddr *net.UDPAddr) (net.
 	default:
 	}
 
-	// Step 1: Use net.Dial to determine the actual local IP that would be used
-	tmpConn, err := net.Dial(network, remoteAddr.String())
-	if err != nil {
-		d.logger.Printf("Failed to establish dummy connection to %s to determine local IP: %v", remoteAddr, err)
-		// Fallback: If we can't determine the specific local IP, use the listener's IP
-		// This might still be [::] or 0.0.0.0 if the listener is wildcard.
-		// Or, you could return an error here if precise local IP is critical.
-		listenerAddr := d.conn.LocalAddr().(*net.UDPAddr)
-		d.logger.Printf("Falling back to listener's IP (%s) for custom connection local address.", listenerAddr.IP)
-		return nil, fmt.Errorf("failed to determine local IP for outgoing connection: %w", err)
+	var localIP net.IP
+	laddr := d.conn.LocalAddr()
+	if udpAddr, ok := laddr.(*net.UDPAddr); ok {
+		if !udpAddr.IP.IsUnspecified() {
+			localIP = udpAddr.IP
+		}
 	}
-	defer tmpConn.Close() // Close the temporary connection immediately
+	if localIP == nil {
+		// Step 1: Use net.Dial to determine the actual local IP that would be used
+		tmpConn, err := net.Dial(network, remoteAddr.String())
+		if err != nil {
+			d.logger.Printf("Failed to establish dummy connection to %s to determine local IP: %v", remoteAddr, err)
+			// Fallback: If we can't determine the specific local IP, use the listener's IP
+			// This might still be [::] or 0.0.0.0 if the listener is wildcard.
+			// Or, you could return an error here if precise local IP is critical.
+			listenerAddr := d.conn.LocalAddr().(*net.UDPAddr)
+			d.logger.Printf("Falling back to listener's IP (%s) for custom connection local address.", listenerAddr.IP)
+			return nil, fmt.Errorf("failed to determine local IP for outgoing connection: %w", err)
+		}
+		defer tmpConn.Close() // Close the temporary connection immediately
 
-	// Get the local IP from the temporary connection
-	localIP := tmpConn.LocalAddr().(*net.UDPAddr).IP
+		// Get the local IP from the temporary connection
+		localIP = tmpConn.LocalAddr().(*net.UDPAddr).IP
+	}
 
 	remoteAddrStr := remoteAddr.String()
 

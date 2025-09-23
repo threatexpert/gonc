@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	VERSION = "v2.3.5"
+	VERSION = "v2.3.6"
 )
 
 type AppNetcatConfig struct {
@@ -1631,7 +1631,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 
 	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-	connInfo, err := easyp2p.Easy_P2P(ncconfig.network, ncconfig.p2pSessionKey+topicSalt, relayConn, ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P_MP(ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
 	if err != nil {
 		if relayConn != nil {
 			relayConn.Close()

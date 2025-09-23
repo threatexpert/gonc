@@ -563,6 +563,16 @@ func GetNetworksPublicIPs(networkList []string, bind string, timeout time.Durati
 			return nil, err
 		}
 		bind = fmt.Sprintf(":%d", port)
+	} else if strings.HasSuffix(bind, ":0") {
+		host, _, err := net.SplitHostPort(bind)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bind address: %v", err)
+		}
+		port, err := GetFreePort()
+		if err != nil {
+			return nil, err
+		}
+		bind = net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	}
 
 	udpAttemptNumber := 0

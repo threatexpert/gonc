@@ -457,6 +457,10 @@ type RelayPacketConn struct {
 }
 
 func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
+	return Do_autoP2PEx2(networks, "", sessionUid, timeout, needSharedKey, relayConn, logWriter)
+}
+
+func Do_autoP2PEx2(networks []string, bind, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
 
 	myInfoForExchange := exchangeAddressPayload{
 		Addresses: []PunchingAddressInfo{},
@@ -469,9 +473,9 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 	if relayConn == nil || !relayConn.FallbackMode {
 		// 单轮 STUN 探测（无 relay 或直接使用 relay）
 		if relayConn == nil {
-			directResults, err = GetNetworksPublicIPs(networks, "", 5*time.Second, nil)
+			directResults, err = GetNetworksPublicIPs(networks, bind, 5*time.Second, nil)
 		} else {
-			relayResults, err = GetNetworksPublicIPs(networks, "", 5*time.Second, relayConn)
+			relayResults, err = GetNetworksPublicIPs(networks, bind, 5*time.Second, relayConn)
 		}
 		allResults = append(directResults, relayResults...)
 		if err != nil {
@@ -482,9 +486,9 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 	} else {
 		// Fallback 模式，尝试两轮：先直连STUN获取地址信息，再走 relay获取地址信息
 		// 第一轮（直连）
-		directResults, _ = GetNetworksPublicIPs(networks, "", 5*time.Second, nil)
+		directResults, _ = GetNetworksPublicIPs(networks, bind, 5*time.Second, nil)
 		// 第二轮（使用中继）
-		relayResults, err = GetNetworksPublicIPs(networks, "", 5*time.Second, relayConn)
+		relayResults, err = GetNetworksPublicIPs(networks, bind, 5*time.Second, relayConn)
 		// 合并
 		allResults = append(directResults, relayResults...)
 		if len(allResults) == 0 && err != nil {
@@ -837,14 +841,14 @@ type P2PConnInfo struct {
 }
 
 func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
-	connInfo, err := Easy_P2P_MP(network, sessionUid, false, relayConn, logWriter)
+	connInfo, err := Easy_P2P_MP(network, "", sessionUid, false, relayConn, logWriter)
 	if err != nil {
 		return nil, err
 	}
 	return connInfo, nil
 }
 
-func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
+func Easy_P2P_MP(network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	var networksToTryStun []string
 	switch network {
@@ -867,7 +871,7 @@ func Easy_P2P_MP(network, sessionUid string, multipathEnabled bool, relayConn *R
 	fmt.Fprintf(logWriter, "=== Checking NAT reachability ===\n")
 
 	// --- 2. Get address information for all required networks in one go ---
-	p2pInfos, err := Do_autoP2PEx(networksToTryStun, sessionUid, 25*time.Second, true, relayConn, logWriter)
+	p2pInfos, err := Do_autoP2PEx2(networksToTryStun, bind, sessionUid, 25*time.Second, true, relayConn, logWriter)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
 		return nil, fmt.Errorf("failed to exchange address info: %w", err)
