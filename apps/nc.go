@@ -89,6 +89,7 @@ type AppNetcatConfig struct {
 	kcpEnabled        bool
 	kcpSEnabled       bool
 	localbind         string
+	localbindIP       string
 	remoteAddr        string
 	progressEnabled   bool
 	runCmd            string
@@ -426,6 +427,14 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig, args []string) (netwo
 		}
 	}
 
+	if ncconfig.localbind != "" {
+		localbindIP, _, err := net.SplitHostPort(ncconfig.localbind)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("invalid local bind address: %v", err)
+		}
+		ncconfig.localbindIP = localbindIP
+	}
+
 	switch len(args) {
 	case 2:
 		host, port = args[0], args[1]
@@ -511,9 +520,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig, args []string) (netwo
 // configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
 func configureDNS(ncconfig *AppNetcatConfig) {
 	if ncconfig.useDNS != "" {
-		setDns(ncconfig.useDNS)
+		setDns(ncconfig.useDNS, ncconfig.localbindIP)
 	} else if isAndroid() {
-		setDns("8.8.8.8:53")
+		setDns("8.8.8.8:53", ncconfig.localbindIP)
 	}
 }
 
@@ -1589,7 +1598,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 	if ncconfig.useMQTTWait {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MqttWait(ncconfig.p2pSessionKey, 30*time.Minute, ncconfig.LogWriter)
+		salt, err = easyp2p.MqttWait(ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-wait: %v", err)
 		}
@@ -1597,7 +1606,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MQTTHello(ncconfig.p2pSessionKey, 15*time.Second, ncconfig.LogWriter)
+		salt, err = easyp2p.MQTTHello(ncconfig.p2pSessionKey, ncconfig.localbindIP, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-hello: %v", err)
 		}
@@ -1703,21 +1712,36 @@ func do_P2P_multipath(ncconfig *AppNetcatConfig, enableMP bool) (*secure.Negotia
 	return nil, fmt.Errorf("multipath not implemented yet")
 }
 
-func setDns(address2 string) {
+func setDns(dnsServer string, localIP string) {
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{
 				Timeout: time.Second * 5,
 			}
-			if strings.Contains(address2, ":") {
-				if _, _, err := net.SplitHostPort(address2); err != nil {
-					address2 = net.JoinHostPort(address2, "53")
+
+			// 如果指定了本地IP，就绑定
+			if localIP != "" {
+				ip := net.ParseIP(localIP)
+				if ip != nil {
+					if strings.HasPrefix(network, "udp") {
+						d.LocalAddr = &net.UDPAddr{IP: ip}
+					} else if strings.HasPrefix(network, "tcp") {
+						d.LocalAddr = &net.TCPAddr{IP: ip}
+					}
+				}
+			}
+
+			// 确保端口存在
+			if strings.Contains(dnsServer, ":") {
+				if _, _, err := net.SplitHostPort(dnsServer); err != nil {
+					dnsServer = net.JoinHostPort(dnsServer, "53")
 				}
 			} else {
-				address2 = net.JoinHostPort(address2, "53")
+				dnsServer = net.JoinHostPort(dnsServer, "53")
 			}
-			return d.DialContext(ctx, network, address2)
+
+			return d.DialContext(ctx, network, dnsServer)
 		},
 	}
 }
