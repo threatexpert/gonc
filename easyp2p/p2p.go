@@ -37,7 +37,7 @@ var (
 		"tcp://broker.hivemq.com:1883",
 		"tcp://broker.emqx.io:1883",
 		"tcp://test.mosquitto.org:1883",
-		"guest:guest@ssl://u160a01e.ala.cn-hangzhou.emqxsl.cn:8883",
+		"guest:guest@tcp://mqtt.gonc.cc:1883",
 	}
 
 	DebugServerRole         string

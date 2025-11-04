@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	VERSION = "v2.3.6"
+	VERSION = "v2.3.7"
 )
 
 type AppNetcatConfig struct {
@@ -194,6 +194,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	//<----- Global flags
 	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
 	fs.StringVar(&config.mqttServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
+	fs.StringVar(&MagicDNServer, "magicdns", MagicDNServer, "MagicDNServer")
 	disableCompress := fs.Bool("no-compress", false, "disable compression for http download")
 	VarhttpDownloadNoCompress = disableCompress
 	fs.StringVar(&easyp2p.TopicExchange, "mqtt-nat-topic", easyp2p.TopicExchange, "")
