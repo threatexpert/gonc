@@ -84,7 +84,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     另一端使用：
 
     ```bash
-    gonc -p2p 口令 > 保存文件名
+    gonc -p2p 口令 -mqtt-hello > 保存文件名
     ```
 
 
