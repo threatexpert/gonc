@@ -1930,7 +1930,7 @@ func MQTTHello(sessionUid, localIP string, timeout time.Duration, logWriter io.W
 		return true, nil
 	}
 
-	recvData, _, err := MQTT_SecureExchange(EXMODE_mutual, msgSYN, topicCID, topicSalt, sessionUid, localIP, timeout, filterACK)
+	recvData, srvIndex, err := MQTT_SecureExchange(EXMODE_mutual, msgSYN, topicCID, topicSalt, sessionUid, localIP, timeout, filterACK)
 	if err != nil {
 		return "", err
 	}
@@ -1938,7 +1938,8 @@ func MQTTHello(sessionUid, localIP string, timeout time.Duration, logWriter io.W
 		return "", fmt.Errorf("not the expected message")
 	}
 
-	logwts(logWriter, "MQTT: Hello operation completed. tid: %s\n", tid)
+	_, _, brokerServer := ParseMQTTServerV2(MQTTBrokerServers[srvIndex])
+	logwts(logWriter, "MQTT: Hello operation completed (via %s). tid: %s\n", brokerServer, tid)
 	return tid, nil
 }
 

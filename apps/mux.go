@@ -417,7 +417,13 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 
 	if transproxy {
 		fmt.Fprintf(os.Stderr, "[%s] Listening on %s (Only accept from 127.0.0.1/8)\n", peerMode, ln.Addr().String())
-		fmt.Fprintf(os.Stderr, "The address format like 10.0.0.1-3389.%s:%s can use for transparent proxy access to the target address(10.0.0.1:3389).\n", MagicDNServer, actualListenPort)
+		donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
+		if donotUsePublicMagicDNS {
+			targetIpPref := strings.TrimRight(MagicDNServer, ".0")
+			fmt.Fprintf(os.Stderr, "The address format like 127.1.13.61:%s can use for transparent proxy access to the target address(%s.1:3389).\n", actualListenPort, targetIpPref)
+		} else {
+			fmt.Fprintf(os.Stderr, "The address format like 10.0.0.1-3389.%s:%s can use for transparent proxy access to the target address(10.0.0.1:3389).\n", MagicDNServer, actualListenPort)
+		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[%s] Listening on %s\n", peerMode, ln.Addr().String())
 	}

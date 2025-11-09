@@ -104,13 +104,64 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 	handleProxy(conn, targetConn)
 }
 
+func IsValidABC0IP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+
+	// 检查最后一个字节是否为 0
+	if ip[3] != 0 {
+		return false
+	}
+	return true
+}
+
+func ExtractBCDFrom127(ipStr string) (b int, cd int, err error) {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return 0, 0, fmt.Errorf("invalid IP format")
+	}
+	ip = ip.To4()
+	if ip == nil {
+		return 0, 0, fmt.Errorf("not an IPv4 address")
+	}
+
+	if ip[0] != 127 {
+		return 0, 0, fmt.Errorf("not a 127.x.x.x address")
+	}
+
+	b = int(ip[1])
+	c := int(ip[2])
+	d := int(ip[3])
+	cd = c*256 + d
+
+	return b, cd, nil
+}
+
 func DNSLookupMagicIP(ipToken string, allowPublicIP bool) (string, int, error) {
+
 	// 验证并解析 IP
 	parsed := net.ParseIP(ipToken)
 	if parsed == nil || parsed.To4() == nil {
 		return "", 0, fmt.Errorf("invalid ipToken: %s", ipToken)
 	}
 	b := parsed.To4()
+
+	donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
+	if donotUsePublicMagicDNS {
+		targetIpPref := strings.TrimRight(MagicDNServer, ".0")
+		targetIpD, targetPort, err := ExtractBCDFrom127(ipToken)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid ipToken: %v", err)
+		}
+		return fmt.Sprintf("%s.%d", targetIpPref, targetIpD), targetPort, nil
+	}
 
 	// 拼域名，比如 127.4.5.6.domain.io
 	queryName := fmt.Sprintf("%d.%d.%d.%d.%s", b[0], b[1], b[2], b[3], MagicDNServer)
