@@ -419,7 +419,14 @@ func (s *Server) serveRecursiveList(w http.ResponseWriter, r *http.Request, base
 
 	s.logger.Printf("Starting recursive NDJSON list from '%s' (requested path '%s') for %s", startWalkPath, r.URL.Path, r.RemoteAddr)
 
-	err := filepath.WalkDir(startWalkPath, func(currentPath string, d fs.DirEntry, err error) error {
+	_, err := os.Stat(startWalkPath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusNotFound)
+		s.logger.Printf("Invalid path '%s': %v", startWalkPath, err)
+		return
+	}
+
+	err = filepath.WalkDir(startWalkPath, func(currentPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			s.logger.Printf("Error walking path %s: %v (during recursive list for %s)", currentPath, err, r.RemoteAddr)
 			return nil

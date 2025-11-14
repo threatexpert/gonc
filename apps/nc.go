@@ -108,6 +108,7 @@ type AppNetcatConfig struct {
 	useDNS            string
 	runAppFileServ    string
 	runAppFileGet     string
+	downloadSubPath   string
 	appMuxListenMode  bool
 	appMuxListenOn    string
 	appMuxSocksMode   bool
@@ -170,7 +171,8 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.BoolVar(&config.useIPv6, "6", false, "Forces to use IPv4 addresses only")
 	fs.StringVar(&config.useDNS, "dns", "", "set DNS Server")
 	fs.StringVar(&config.runAppFileServ, "httpserver", "", "http server root directory")
-	fs.StringVar(&config.runAppFileGet, "download", "", "http client download directory")
+	fs.StringVar(&config.runAppFileGet, "download", "", "Enable directory download; specifies the local path where the remote directory will be saved")
+	fs.StringVar(&config.downloadSubPath, "download-subpath", "", "Remote directory to download (default: /); used together with -download")
 	fs.BoolVar(&config.appMuxListenMode, "httplocal", false, "local listen mode for remote httpserver")
 	fs.StringVar(&config.appMuxListenOn, "httplocal-port", "", "local listen port for remote httpserver")
 	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "for socks5 tunnel")
@@ -303,7 +305,11 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.keepOpen = true
 	} else if ncconfig.runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileGet, "\\", "/")
+		downloadSubPath := strings.ReplaceAll(ncconfig.downloadSubPath, "\\", "/")
 		ncconfig.runCmd = fmt.Sprintf(":mux httpclient \"%s\"", escapedPath)
+		if downloadSubPath != "" {
+			ncconfig.runCmd += fmt.Sprintf(" \"%s\"", downloadSubPath)
+		}
 		if ncconfig.appMuxListenOn != "" {
 			VarmuxLastListenAddress = ncconfig.appMuxListenOn
 		}

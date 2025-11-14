@@ -370,6 +370,7 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 	req.Header.Set("Accept", "application/json")
 	c.setAcceptEncodingForCompress(req)
 
+	var collectedFiles []FileInfo // Collect files here
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -380,7 +381,7 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		c.logError("Server returned non-OK status for file list (%s): %s", fullRequestURL, resp.Status)
-		return nil, fmt.Errorf("server returned non-OK status for file list (%s): %s", fullRequestURL, resp.Status)
+		return collectedFiles, nil //let it keep running
 	}
 
 	var reader io.Reader = resp.Body
@@ -409,7 +410,6 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 		c.logInfo("Warning: Unknown Content-Encoding '%s' for file list. Attempting direct read.", contentEncoding)
 	}
 
-	var collectedFiles []FileInfo // Collect files here
 	scanner := bufio.NewScanner(reader)
 
 	for scanner.Scan() {
@@ -423,56 +423,6 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 		var fileInfo FileInfo
 		if err := json.Unmarshal(line, &fileInfo); err != nil {
 			c.logError("Error unmarshaling JSON line: %v, line: %s", err, string(line))
-			continue
-		}
-
-		if fileInfo.IsDir {
-			if !c.config.DryRun {
-				urlPathRelativeToRoot := path.Clean(serverURL.Path)
-				if urlPathRelativeToRoot == "." {
-					urlPathRelativeToRoot = "/"
-				} else if !strings.HasPrefix(urlPathRelativeToRoot, "/") {
-					urlPathRelativeToRoot = "/" + urlPathRelativeToRoot
-				}
-				adjustedRelativePath := fileInfo.Path
-				if strings.HasPrefix(fileInfo.Path, urlPathRelativeToRoot) {
-					adjustedRelativePath = strings.TrimPrefix(fileInfo.Path, urlPathRelativeToRoot)
-					if strings.HasPrefix(adjustedRelativePath, "/") && len(adjustedRelativePath) > 1 {
-						adjustedRelativePath = adjustedRelativePath[1:]
-					} else if adjustedRelativePath == "/" {
-						adjustedRelativePath = ""
-					}
-				}
-
-				if adjustedRelativePath != "" {
-					dirPath := filepath.Join(c.config.LocalDir, filepath.FromSlash(adjustedRelativePath))
-					c.logVerbose("Creating directory: %s", dirPath)
-					if err := os.MkdirAll(dirPath, 0755); err != nil {
-						c.logError("Warning: Failed to create directory %s: %v", dirPath, err)
-					}
-				} else {
-					c.logVerbose("Skipping creating base directory, as it is the target local directory: %s", c.config.LocalDir)
-				}
-			} else if c.config.Verbose && fileInfo.Path != requestPath {
-				urlPathRelativeToRoot := path.Clean(serverURL.Path)
-				if urlPathRelativeToRoot == "." {
-					urlPathRelativeToRoot = "/"
-				} else if !strings.HasPrefix(urlPathRelativeToRoot, "/") {
-					urlPathRelativeToRoot = "/" + urlPathRelativeToRoot
-				}
-				adjustedRelativePath := fileInfo.Path
-				if strings.HasPrefix(fileInfo.Path, urlPathRelativeToRoot) {
-					adjustedRelativePath = strings.TrimPrefix(fileInfo.Path, urlPathRelativeToRoot)
-					if strings.HasPrefix(adjustedRelativePath, "/") && len(adjustedRelativePath) > 1 {
-						adjustedRelativePath = adjustedRelativePath[1:]
-					} else if adjustedRelativePath == "/" {
-						adjustedRelativePath = ""
-					}
-				}
-				if adjustedRelativePath != "" {
-					c.logVerbose("Dry run: Would create directory: %s", filepath.Join(c.config.LocalDir, filepath.FromSlash(adjustedRelativePath)))
-				}
-			}
 			continue
 		}
 
@@ -492,7 +442,9 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 	// After collecting all files, calculate totals and populate progress tracker
 	for _, fileInfo := range collectedFiles {
 		c.progressTracker.IncrementTotalFiles()
-		c.progressTracker.AddTotalBytes(fileInfo.Size)
+		if !fileInfo.IsDir {
+			c.progressTracker.AddTotalBytes(fileInfo.Size)
+		}
 	}
 
 	c.logInfo("Finished fetching file list. Total files to process: %d, total bytes: %s",
@@ -548,24 +500,6 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		return ctx.Err() // Return context cancellation error immediately
 	default:
 	}
-	remoteURL, err := url.Parse(c.config.ServerURL)
-	if err != nil {
-		c.logError("Error parsing server URL for %s: %v", fileInfo.Path, err)
-		return err
-	}
-
-	standardizedPath := filepath.ToSlash(fileInfo.Path)
-
-	// 2. 对路径进行 URL 编码，保留斜杠。
-	//    这将处理路径中包含的 # 等特殊字符，将它们编码为 %23，而不是被 url.Parse 识别为 Fragment。
-	encodedFileInfoURLPath := encodePathSegmentPreservingSlashes(standardizedPath)
-
-	parsedFileInfoURLPath, err := url.Parse(encodedFileInfoURLPath)
-	if err != nil {
-		return fmt.Errorf("error parsing fileInfo.Path '%s' as URL: %w", fileInfo.Path, err)
-	}
-
-	downloadURL := remoteURL.ResolveReference(parsedFileInfoURLPath).String()
 
 	proposedLocalPath := filepath.Join(c.config.LocalDir, filepath.FromSlash(fileInfo.Path))
 	cleanedLocalPath := filepath.Clean(proposedLocalPath)
@@ -576,6 +510,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	}
 	localFilePath := cleanedLocalPath
 
+	var downloadURL string
 	var localFileExists bool
 	var localFileSize int64
 	fileMode := os.O_CREATE | os.O_WRONLY
@@ -588,24 +523,53 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		return fmt.Errorf("error checking local file %s: %w", localFilePath, err)
 	}
 
-	if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
-		c.logVerbose("Resuming download for %s. Local size: %d, Server size: %d", localFilePath, localFileSize, fileInfo.Size)
-		fileMode |= os.O_APPEND
-		c.progressTracker.AddBytesDownloaded(localFileSize)
-	} else if c.config.Resume && localFileExists && localFileSize >= fileInfo.Size {
-		c.logVerbose("File %s already appears complete (local size %d >= server size %d). Skipping download.", localFilePath, localFileSize, fileInfo.Size)
-		c.progressTracker.AddBytesDownloaded(localFileSize)
+	if fileInfo.IsDir {
+		if !c.config.DryRun {
+			if err := os.MkdirAll(localFilePath, 0755); err != nil {
+				return fmt.Errorf("error creating directory for %s: %w", localFilePath, err)
+			}
+		}
 		return nil
-	} else if localFileExists && !c.config.Overwrite {
-		c.logInfo("Skipping existing file (use -o to overwrite): %s", localFilePath)
-		c.progressTracker.AddBytesDownloaded(localFileSize)
-		return nil
-	} else if localFileExists && c.config.Overwrite {
-		c.logInfo("Overwriting existing file: %s", localFilePath)
-	} else if c.config.DryRun {
-		c.logInfo("Dry run: Would download %s to %s", downloadURL, localFilePath)
-		return nil
+	} else {
+		remoteURL, err := url.Parse(c.config.ServerURL)
+		if err != nil {
+			c.logError("Error parsing server URL for %s: %v", fileInfo.Path, err)
+			return err
+		}
+
+		standardizedPath := filepath.ToSlash(fileInfo.Path)
+
+		// 2. 对路径进行 URL 编码，保留斜杠。
+		//    这将处理路径中包含的 # 等特殊字符，将它们编码为 %23，而不是被 url.Parse 识别为 Fragment。
+		encodedFileInfoURLPath := encodePathSegmentPreservingSlashes(standardizedPath)
+
+		parsedFileInfoURLPath, err := url.Parse(encodedFileInfoURLPath)
+		if err != nil {
+			return fmt.Errorf("error parsing fileInfo.Path '%s' as URL: %w", fileInfo.Path, err)
+		}
+
+		downloadURL = remoteURL.ResolveReference(parsedFileInfoURLPath).String()
+
+		if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
+			c.logVerbose("Resuming download for %s. Local size: %d, Server size: %d", localFilePath, localFileSize, fileInfo.Size)
+			fileMode |= os.O_APPEND
+			c.progressTracker.AddBytesDownloaded(localFileSize)
+		} else if c.config.Resume && localFileExists && localFileSize >= fileInfo.Size {
+			c.logVerbose("File %s already appears complete (local size %d >= server size %d). Skipping download.", localFilePath, localFileSize, fileInfo.Size)
+			c.progressTracker.AddBytesDownloaded(localFileSize)
+			return nil
+		} else if localFileExists && !c.config.Overwrite {
+			c.logInfo("Skipping existing file (use -o to overwrite): %s", localFilePath)
+			c.progressTracker.AddBytesDownloaded(localFileSize)
+			return nil
+		} else if localFileExists && c.config.Overwrite {
+			c.logInfo("Overwriting existing file: %s", localFilePath)
+		} else if c.config.DryRun {
+			c.logInfo("Dry run: Would download %s to %s", downloadURL, localFilePath)
+			return nil
+		}
 	}
+
 	// Attach context to the request for HTTP client operation
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
