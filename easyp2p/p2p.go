@@ -468,21 +468,10 @@ type RelayPacketConn struct {
 	FallbackMode bool
 }
 
-func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
-	return Do_autoP2PEx2(networks, "", sessionUid, timeout, needSharedKey, relayConn, logWriter)
-}
-
-func Do_autoP2PEx2(networks []string, bind, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
-
-	myInfoForExchange := exchangeAddressPayload{
-		Addresses: []PunchingAddressInfo{},
-	}
+func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacketConn, logWriter io.Writer) ([]PunchingAddressInfo, []*STUNResult, error) {
+	Addresses := []PunchingAddressInfo{}
 	var allResults, directResults, relayResults []*STUNResult
 	var err error
-	localBindIP := ""
-	if bind != "" {
-		localBindIP, _, _ = net.SplitHostPort(bind)
-	}
 
 	fmt.Fprintf(logWriter, "    Getting local public IP info via %d STUN servers...", len(STUNServers))
 
@@ -511,13 +500,14 @@ func Do_autoP2PEx2(networks []string, bind, sessionUid string, timeout time.Dura
 			fmt.Fprintf(logWriter, "Failed(%v)\n", err)
 		} else {
 			fmt.Fprintf(logWriter, "(%d answers)", succeededSTUNResults(allResults))
+			err = nil
 		}
 	}
 
 	if len(allResults) > 0 {
 		analyzed := analyzeSTUNResults(directResults)
 		for _, item := range analyzed {
-			myInfoForExchange.Addresses = append(myInfoForExchange.Addresses, PunchingAddressInfo{
+			Addresses = append(Addresses, PunchingAddressInfo{
 				Network: item.Network,
 				NatType: item.NATType,
 				Lan:     item.LAN,
@@ -526,20 +516,41 @@ func Do_autoP2PEx2(networks []string, bind, sessionUid string, timeout time.Dura
 		}
 		analyzed = analyzeSTUNResults(relayResults)
 		for _, item := range analyzed {
-			myInfoForExchange.Addresses = append(myInfoForExchange.Addresses, PunchingAddressInfo{
+			Addresses = append(Addresses, PunchingAddressInfo{
 				Network: item.Network,
 				NatType: "relay",
 				Lan:     item.LAN,
 				Nat:     item.NAT,
 			})
 		}
-		if len(myInfoForExchange.Addresses) == 0 {
+
+		if len(Addresses) == 0 {
 			fmt.Fprintln(logWriter, "Failed")
 		} else {
 			fmt.Fprintf(logWriter, "OK\n")
-			addressesPrint(logWriter, myInfoForExchange.Addresses)
+			addressesPrint(logWriter, Addresses)
 		}
 	}
+
+	return Addresses, allResults, err
+}
+
+func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
+	return Do_autoP2PEx2(networks, "", sessionUid, timeout, needSharedKey, relayConn, logWriter)
+}
+
+func Do_autoP2PEx2(networks []string, bind, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, error) {
+
+	myInfoForExchange := exchangeAddressPayload{
+		Addresses: []PunchingAddressInfo{},
+	}
+	var err error
+	localBindIP := ""
+	if bind != "" {
+		localBindIP, _, _ = net.SplitHostPort(bind)
+	}
+
+	myInfoForExchange.Addresses, _, _ = DetectNATAddressInfo(networks, bind, relayConn, logWriter)
 
 	var priv *ecdsa.PrivateKey
 	if needSharedKey && len(myInfoForExchange.Addresses) > 0 {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/easyp2p"
+	"github.com/threatexpert/gonc/v2/httpfileshare"
 	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
@@ -116,6 +117,10 @@ type AppNetcatConfig struct {
 	plainTransport    bool
 	framedStdio       bool
 	p2pReportURL      string
+	featureModulesRun []string
+	Args              []string
+	natchecker        bool
+	httpdownload      bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -192,6 +197,8 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.StringVar(&config.app_s5s_args, ":s5s", "-", "enable and config :s5s for dynamic service")
 	fs.StringVar(&config.app_sh_args, ":sh", "-", "enable and config :sh for dynamic service")
 	fs.StringVar(&config.app_nc_args, ":nc", "-", "enable and config :nc for dynamic service")
+	fs.BoolVar(&config.natchecker, "nat-checker", false, "detect NAT type and public IP")
+	fs.BoolVar(&config.httpdownload, "http-download", false, "<localDir> <urlPath>; download from gonc's (-httplocal-port) HTTP service")
 
 	//<----- Global flags
 	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
@@ -237,9 +244,11 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 		os.Exit(1)
 	}
 
+	config.Args = fs.Args()
+
 	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
-	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(config, fs.Args())
-	if err != nil {
+	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(config)
+	if err != nil && len(config.featureModulesRun) == 0 {
 		fmt.Fprintf(os.Stderr, "Error determining network address: %v\n", err)
 		usage_less(argv0)
 		os.Exit(1)
@@ -278,6 +287,9 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 
 func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 	defer console.Close()
+	if len(config.featureModulesRun) != 0 {
+		return runFeatureModules(console, config)
+	}
 	if config.p2pSessionKey != "" {
 		return runP2PMode(console, config)
 	} else {
@@ -381,6 +393,12 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		}
 		ncconfig.arg_proxyc_Config = xconfig
 	}
+	if ncconfig.natchecker {
+		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "nat-checker")
+	}
+	if ncconfig.httpdownload {
+		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "http-download")
+	}
 }
 
 func configureSecurity(ncconfig *AppNetcatConfig) error {
@@ -415,7 +433,7 @@ func configureSecurity(ncconfig *AppNetcatConfig) error {
 }
 
 // determineNetworkAndAddress 解析网络协议、主机、端口和P2P密钥
-func determineNetworkAndAddress(ncconfig *AppNetcatConfig, args []string) (network, host, port, P2PSessionKey string, err error) {
+func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port, P2PSessionKey string, err error) {
 	if ncconfig.kcpEnabled || ncconfig.kcpSEnabled {
 		ncconfig.udpProtocol = true
 	}
@@ -437,32 +455,32 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig, args []string) (netwo
 	if ncconfig.localbind != "" {
 		localbindIP, _, err := net.SplitHostPort(ncconfig.localbind)
 		if err != nil {
-			return "", "", "", "", fmt.Errorf("invalid local bind address: %v", err)
+			return network, "", "", "", fmt.Errorf("invalid local bind address: %v", err)
 		}
 		ncconfig.localbindIP = localbindIP
 	}
 
-	switch len(args) {
+	switch len(ncconfig.Args) {
 	case 2:
-		host, port = args[0], args[1]
+		host, port = ncconfig.Args[0], ncconfig.Args[1]
 	case 1:
 		if ncconfig.listenMode {
-			port = args[0]
+			port = ncconfig.Args[0]
 		} else if ncconfig.useUNIXdomain {
-			port = args[0]
+			port = ncconfig.Args[0]
 		} else {
-			return "", "", "", "", fmt.Errorf("invalid arguments")
+			return network, "", "", "", fmt.Errorf("invalid arguments")
 		}
 	case 0:
 		if ncconfig.listenMode && ncconfig.localbind != "" {
 			host, port, err = net.SplitHostPort(ncconfig.localbind)
 			if err != nil {
-				return "", "", "", "", fmt.Errorf("invalid local address %q: %v", ncconfig.localbind, err)
+				return network, "", "", "", fmt.Errorf("invalid local address %q: %v", ncconfig.localbind, err)
 			}
 		} else if !ncconfig.listenMode && ncconfig.remoteAddr != "" {
 			host, port, err = net.SplitHostPort(ncconfig.remoteAddr)
 			if err != nil {
-				return "", "", "", "", fmt.Errorf("invalid remote address %q: %v", ncconfig.remoteAddr, err)
+				return network, "", "", "", fmt.Errorf("invalid remote address %q: %v", ncconfig.remoteAddr, err)
 			}
 		} else if ncconfig.autoP2P != "" {
 			ncconfig.listenMode = false
@@ -490,7 +508,7 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig, args []string) (netwo
 				}
 				fmt.Fprintf(os.Stderr, "Keep this key secret! It is used to establish the secure P2P tunnel: %s\n", P2PSessionKey)
 			} else if secure.IsWeakPassword(P2PSessionKey) {
-				return "", "", "", "", fmt.Errorf("weak password detected")
+				return network, "", "", "", fmt.Errorf("weak password detected")
 			}
 			if !ncconfig.plainTransport {
 				//没-plain的情况，P2P默认启用kcp tls
@@ -508,17 +526,17 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig, args []string) (netwo
 
 			if ncconfig.arg_proxyc_Config != nil {
 				if ncconfig.arg_proxyc_Config.Prot != "socks5" {
-					return "", "", "", "", fmt.Errorf("only allow socks5 proxy with p2p")
+					return network, "", "", "", fmt.Errorf("only allow socks5 proxy with p2p")
 				}
 				if strings.HasPrefix(network, "tcp") {
-					return "", "", "", "", fmt.Errorf("only allow socks5 proxy with p2p udp mode")
+					return network, "", "", "", fmt.Errorf("only allow socks5 proxy with p2p udp mode")
 				}
 			}
 		} else {
-			return "", "", "", "", fmt.Errorf("not enough arguments")
+			return network, "", "", "", fmt.Errorf("not enough arguments")
 		}
 	default:
-		return "", "", "", "", fmt.Errorf("too many arguments")
+		return network, "", "", "", fmt.Errorf("too many arguments")
 	}
 
 	return network, host, port, P2PSessionKey, nil
@@ -871,6 +889,86 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	}
 
 	return handleSingleConnection(console, ncconfig, conn)
+}
+
+func runFeatureModules(console net.Conn, ncconfig *AppNetcatConfig) int {
+	ret := 0
+	for _, module := range ncconfig.featureModulesRun {
+		switch module {
+		case "nat-checker":
+			ret = runNATChecker(console, ncconfig)
+			if ret != 0 {
+				return ret
+			}
+		case "http-download":
+			ret = runHTTPDownload(console, ncconfig)
+			if ret != 0 {
+				return ret
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown feature module: %s\n", module)
+			return 1
+		}
+	}
+	return 0
+}
+
+func runHTTPDownload(console net.Conn, ncconfig *AppNetcatConfig) int {
+	ctx, done := context.WithCancel(context.Background())
+	defer done()
+
+	if len(ncconfig.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "not enough arguments\n")
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, " -http-download <localDir> <serverURL>\n")
+		return 1
+	}
+	localDir := ncconfig.Args[0]
+	serverURL := ncconfig.Args[1]
+	if !strings.HasPrefix(serverURL, "http://") && !strings.HasPrefix(serverURL, "https://") {
+		fmt.Fprintf(os.Stderr, "invalid serverURL, must start with http:// or https://\n")
+		return 1
+	}
+
+	httpcfg := httpfileshare.ClientConfig{
+		ServerURL:              serverURL,
+		LocalDir:               localDir,
+		Concurrency:            2,
+		Resume:                 true,
+		DryRun:                 false,
+		Verbose:                false,
+		LogLevel:               httpfileshare.LogLevelError,
+		LoggerOutput:           os.Stderr,
+		ProgressOutput:         os.Stderr,
+		ProgressUpdateInterval: 1 * time.Second,
+		NoCompress:             *VarhttpDownloadNoCompress,
+	}
+
+	c, err := httpfileshare.NewClient(httpcfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create HTTP client: %v\n", err)
+		return 1
+	}
+	if err := c.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Client operation failed: %v\n", err)
+		return 1
+	}
+
+	return 0
+}
+
+func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
+
+	networksToTryStun := []string{"tcp6", "tcp4", "udp6", "udp4"}
+
+	fmt.Fprintf(os.Stderr, "=== Checking NAT Address Info ===\n")
+
+	Addresses, allSTUNResults, _ := easyp2p.DetectNATAddressInfo(networksToTryStun, ncconfig.localbind, nil, ncconfig.LogWriter)
+	if len(allSTUNResults) > 0 && len(Addresses) > 0 {
+		return 0
+	}
+
+	return 1
 }
 
 func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
