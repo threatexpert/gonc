@@ -4,13 +4,15 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 import zipfile
+import shutil
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BIN_DIR = SCRIPT_DIR / "bin"
 INDEX_HTML = BIN_DIR / "index.html"
 NOTFOUND_HTML = BIN_DIR / "404.html"
-HEADERS_FILE = BIN_DIR / "_headers"   # 放在根目录
-BIN_ZIP = BIN_DIR / "bin.zip"
+#HEADERS_FILE = BIN_DIR / "_headers"
+REDIRECTS_FILE = BIN_DIR / "_redirects"
+R2STORAGE_URL_BASE = "https://gonc.download"
 
 # ---------- 固定文案 ----------
 HEADER_TEXT = """
@@ -190,30 +192,45 @@ def build_headers(files):
         lines.append(f'  Content-Disposition: attachment; filename="{name}"')
         lines.append("")  # 空行分隔
 
-    HEADERS_FILE.write_text("\n".join(lines), encoding="utf-8")
-    print(f"✔ 已生成 {HEADERS_FILE}")
+    #HEADERS_FILE.write_text("\n".join(lines), encoding="utf-8")
+    #print(f"✔ 已生成 {HEADERS_FILE}")
 
-def build_zip(files_to_zip):
+def build_zip(files_to_zip, zip_name):
     """
     files_to_zip: list of Path 对象
-    将指定文件打包成 bin.zip，如果已存在先删除
+    将指定文件打包成 .zip，如果已存在先删除
     """
-    # 如果 bin.zip 已存在，先删除
-    if BIN_ZIP.exists():
-        print(f"⚠ {BIN_ZIP} 已存在，删除...")
-        BIN_ZIP.unlink()
+    DEPLOY_ZIP = BIN_DIR / zip_name
+    # 如果 .zip 已存在，先删除
+    if DEPLOY_ZIP.exists():
+        print(f"⚠ {DEPLOY_ZIP} 已存在，删除...")
+        DEPLOY_ZIP.unlink()
 
-    print(f"⚠ {BIN_ZIP} 打包中({len(files_to_zip)}个文件)..." )
+    print(f"⚠ {DEPLOY_ZIP} 打包中({len(files_to_zip)}个文件)..." )
 
     # 打包指定文件
-    with zipfile.ZipFile(BIN_ZIP, "w", zipfile.ZIP_DEFLATED) as zipf:
+    with zipfile.ZipFile(DEPLOY_ZIP, "w", zipfile.ZIP_DEFLATED) as zipf:
         for f in files_to_zip:
             if f.is_file():
                 zipf.write(f, arcname=f.name)  # 保持文件名，不带目录
-    print(f"✔ 已生成 {BIN_ZIP}")
+    print(f"✔ 已生成 {DEPLOY_ZIP}")
 
-# ---------- 生成 index.html ----------
-def build_index():
+def build_redirects(files, version):
+    """
+    生成 Cloudflare Pages 用的 _redirects 文件，
+    将所有 gonc 二进制文件重定向到 R2 存储路径。
+    """
+    lines = []
+
+    for name, size, sha in files:
+        target = f"{R2STORAGE_URL_BASE}/{version}/{name}"
+        lines.append(f"/{name}    {target}    302")
+
+    REDIRECTS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"✔ 已生成 {REDIRECTS_FILE}")
+
+
+def build_pages():
     files = []
 
     for f in BIN_DIR.iterdir():
@@ -238,7 +255,7 @@ def build_index():
     for name, size, sha in files:
         html.append(
             f"<tr>"
-            f"<td><a href='./{name}' download='{name}'>{name}</a></td>"
+            f"<td><a href='{R2STORAGE_URL_BASE}/{version}/{name}' download='{name}'>{name}</a></td>"
             f"<td>{size}</td>"
             f"<td><code>{sha}</code></td>"
             f"</tr>"
@@ -252,9 +269,23 @@ def build_index():
     NOTFOUND_HTML.write_text("<h1>404 Not Found</h1><p>The file you requested does not exist.</p>", encoding="utf-8")
     print(f"✔ 已生成 {NOTFOUND_HTML}")
     build_headers(files)
+    build_redirects(files, version)
 
-    file_paths = [INDEX_HTML, NOTFOUND_HTML] + [BIN_DIR / name for name, size, sha in files]
-    build_zip(file_paths)
+    file_paths = [
+        INDEX_HTML,
+        NOTFOUND_HTML,
+        # HEADERS_FILE, 
+        REDIRECTS_FILE
+    ]
+    os.makedirs(BIN_DIR / version, exist_ok=True)
+    for name, size, sha in files:
+        shutil.copy2((BIN_DIR / name), (BIN_DIR / version / name))
+        if sha != sha256_of_file(BIN_DIR / version / name):
+            raise Exception(f"复制文件校验失败: {name}")
+
+    build_zip(file_paths, f"deploy_{version}.zip")
+    for f in file_paths:
+        os.remove(f)
 
 if __name__ == "__main__":
-    build_index()
+    build_pages()
