@@ -12,7 +12,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
 ---
 
-[最新版本下载](https://github.com/threatexpert/gonc/releases/latest)
+[最新版本下载](https://www.gonc.cc/)
 
 ---
 
@@ -52,6 +52,12 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     gonc -p2p <口令> -httplocal-port 9999
     ```
 
+    这时如果需要下载某个子目录，浏览器就不方便了，但可以这样再运行一个gonc命令：
+    
+
+    ```bash
+    gonc -http-download c:/SavePath http://127.0.0.1:9999/subdir
+    ```
 
 ### 玩转 P2P 通信
 - 双方约定一个相同的口令，然后双方都执行下面命令：
@@ -86,6 +92,13 @@ README in [English](./README_en.md) 、 [中文](./README.md)
     ```bash
     gonc -p2p 口令 -mqtt-hello > 保存文件名
     ```
+- 检查你的NAT类型
+
+    ```bash
+    gonc -nat-checker
+    ```
+
+    这会检查你的ipv6和ipv4的tcp和udp的NAT地址，并且研判端口经过NAT后的变化，如果没有列出tcp6或udp6的地址说明你没有ipv6。每行协议地址最后如果是(easy)，则表示该协议打洞成功率最高，(hard)则表示较为困难，(symm)类型是最难的，symm必须依赖对端是easy或hard才有可能P2P。
 
 
 ### 反弹 Shell（类UNIX支持pseudo-terminal shell ）

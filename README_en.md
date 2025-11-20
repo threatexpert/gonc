@@ -12,7 +12,7 @@ README in [English](./README_en.md) and [中文](./README.md)
 
 ---
 
-[Latest version download](https://github.com/threatexpert/gonc/releases/latest)
+[Latest version download](https://www.gonc.cc/)
 
 ---
 
@@ -56,6 +56,13 @@ README in [English](./README_en.md) and [中文](./README.md)
     gonc -p2p <passphrase> -httplocal-port 9999
     ```
 
+    If you need to download a specific subdirectory, the browser becomes inconvenient, but you can do it like this:
+
+
+    ```bash
+    gonc -http-download c:/SavePath http://127.0.0.1:9999/subdir
+    ```
+
 ### Secure Encrypted P2P Communication
 - Establish secure encrypted P2P communication between two different networks by agreeing on a passphrase (use `gonc -psk .` to generate a high-entropy passphrase to replace `passphrase`). This passphrase is used for mutual discovery and certificate derivation, ensuring communication security with TLS 1.3.
     ```bash
@@ -75,6 +82,14 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```bash
     gonc -p2p passphrase -mqtt-hello
     ```
+
+- Check your NAT type
+    ``bash
+    gonc -nat-checker
+
+    ```
+
+    This will check your IPv6 and IPv4 TCP and UDP NAT addresses and analyze port changes after NAT. If no TCP6 or UDP6 addresses are listed, it means you don't have IPv6. Each protocol address ends with "(easy)", indicating the highest success rate for hole punching; "(hard)" indicates a higher success rate; and "(symm)" is the most difficult. Symm requires the other end to be either "easy" or "hard" for P2P to work.
 
 ### Reverse Shell (Pseudo-Terminal Support for UNIX-like Systems)
 - Listener (does not use `-keep-open`, accepts only one connection; no authentication with `-psk`):
