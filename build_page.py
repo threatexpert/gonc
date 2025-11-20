@@ -255,7 +255,7 @@ def build_pages():
     for name, size, sha in files:
         html.append(
             f"<tr>"
-            f"<td><a href='{R2STORAGE_URL_BASE}/{version}/{name}' download='{name}'>{name}</a></td>"
+            f"<td><a href='{name}' download='{name}'>{name}</a></td>"
             f"<td>{size}</td>"
             f"<td><code>{sha}</code></td>"
             f"</tr>"
@@ -282,6 +282,7 @@ def build_pages():
         shutil.copy2((BIN_DIR / name), (BIN_DIR / version / name))
         if sha != sha256_of_file(BIN_DIR / version / name):
             raise Exception(f"复制文件校验失败: {name}")
+    shutil.copy2(INDEX_HTML, (BIN_DIR / version / "index.html"))
 
     build_zip(file_paths, f"deploy_{version}.zip")
     for f in file_paths:
