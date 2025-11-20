@@ -84,9 +84,8 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```
 
 - Check your NAT type
-    ``bash
+    ```bash
     gonc -nat-checker
-
     ```
 
     This will check your IPv6 and IPv4 TCP and UDP NAT addresses and analyze port changes after NAT. If no TCP6 or UDP6 addresses are listed, it means you don't have IPv6. Each protocol address ends with "(easy)", indicating the highest success rate for hole punching; "(hard)" indicates a higher success rate; and "(symm)" is the most difficult. Symm requires the other end to be either "easy" or "hard" for P2P to work.
