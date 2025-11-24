@@ -316,55 +316,24 @@ func firstInit(ncconfig *AppNetcatConfig) {
 func configureAppMode(ncconfig *AppNetcatConfig) {
 	if ncconfig.runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileServ, "\\", "/")
-		if ncconfig.portRotate {
-			ncconfig.runCmd = ":service"
-			ncconfig.remoteCall = ":pr"
-			if ncconfig.app_pr_args == "-" {
-				ncconfig.app_pr_args = ""
-			}
-			ncconfig.app_mux_args = fmt.Sprintf("httpserver \"%s\"", escapedPath)
-		} else {
-			ncconfig.runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
-		}
+		ncconfig.runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
 	} else if ncconfig.runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileGet, "\\", "/")
 		downloadSubPath := strings.ReplaceAll(ncconfig.downloadSubPath, "\\", "/")
-
-		httpclientArgs := fmt.Sprintf("httpclient \"%s\"", escapedPath)
+		ncconfig.runCmd = fmt.Sprintf(":mux httpclient \"%s\"", escapedPath)
 		if downloadSubPath != "" {
-			httpclientArgs += fmt.Sprintf(" \"%s\"", downloadSubPath)
+			ncconfig.runCmd += fmt.Sprintf(" \"%s\"", downloadSubPath)
 		}
-
-		if ncconfig.portRotate {
-			ncconfig.runCmd = ":service"
-			ncconfig.remoteCall = ":pr"
-			if ncconfig.app_pr_args == "-" {
-				ncconfig.app_pr_args = ""
-			}
-			ncconfig.app_mux_args = httpclientArgs
-		} else {
-			ncconfig.runCmd = fmt.Sprintf(":mux %s", httpclientArgs)
-		}
-
 		if ncconfig.appMuxListenOn != "" {
 			VarmuxLastListenAddress = ncconfig.appMuxListenOn
 		}
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
 	} else if ncconfig.appMuxSocksMode {
-		if ncconfig.portRotate {
-			ncconfig.runCmd = ":service"
-			ncconfig.remoteCall = ":pr"
-			if ncconfig.app_pr_args == "-" {
-				ncconfig.app_pr_args = ""
-			}
-			ncconfig.app_mux_args = "socks5"
-		} else {
-			ncconfig.runCmd = ":mux socks5"
-		}
+		ncconfig.runCmd = ":mux socks5"
 		if !ncconfig.useMQTTWait {
 			ncconfig.useMQTTWait = true
 		}
@@ -374,18 +343,20 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		if ncconfig.appMuxListenOn == "" {
 			ncconfig.appMuxListenOn = "0"
 		}
-		if ncconfig.portRotate {
-			ncconfig.runCmd = ":service"
+		ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
+		ncconfig.useMQTTHello = true
+		ncconfig.keepOpen = true
+	}
+
+	if ncconfig.portRotate {
+		if strings.HasPrefix(ncconfig.runCmd, ":mux ") {
 			ncconfig.remoteCall = ":pr"
 			if ncconfig.app_pr_args == "-" {
 				ncconfig.app_pr_args = ""
 			}
-			ncconfig.app_mux_args = fmt.Sprintf("-l %s", ncconfig.appMuxListenOn)
-		} else {
-			ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
+			ncconfig.app_mux_args = strings.TrimPrefix(ncconfig.runCmd, ":mux ")
+			ncconfig.runCmd = ":service"
 		}
-		ncconfig.useMQTTHello = true
-		ncconfig.keepOpen = true
 	}
 
 	if ncconfig.runCmd != "" && ncconfig.runCmd != ":service" {

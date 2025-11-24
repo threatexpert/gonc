@@ -28,8 +28,12 @@ import (
 type AppPortRotateConfig struct {
 	Period               uint   //触发Rotate的条件，单位秒，表示数据通道建立的时间周期
 	RotationTrafficLimit uint64 //触发Rotate的条件，表示传输数据量达到多少字节后进行Rotate
-	IsClient             bool   // 运行时补充：标记当前是否为Client
 	HttpAddr             string // 本地HTTP管理接口地址
+	ncconfig             AppNetcatConfig
+	ncconfigCopied       bool
+	stats_in             *misc.ProgressStats
+	stats_out            *misc.ProgressStats
+	isRotating           int32 // 0 = not rotating
 }
 
 // AppPortRotateConfigByArgs 解析给定的 []string 参数，生成 AppPortRotateConfig
@@ -94,8 +98,26 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 	// 关闭控制通道的进度条信息，如果有需要，应该开启数据通道的进度条
 	ncconfig.sessionReady = false
 
-	// 补全配置中的身份信息
-	config.IsClient = nconnConfig.IsClient
+	if !config.ncconfigCopied {
+		config.ncconfig = *ncconfig
+		config.ncconfigCopied = true
+		config.ncconfig.remoteCall = ""
+		config.ncconfig.runCmd = ":mux"
+		config.ncconfig.goroutineConnectionCounter = 0
+		config.stats_in = misc.NewProgressStats()
+		config.stats_out = misc.NewProgressStats()
+
+		if config.ncconfig.progressEnabled {
+			wg := &sync.WaitGroup{}
+			done := make(chan bool)
+			showProgress(&config.ncconfig, config.stats_in, config.stats_out, done, wg)
+			defer func() {
+				done <- true
+				wg.Wait()
+			}()
+		}
+	}
+	config.ncconfig.sessionReady = false
 
 	bridge, err := netx.NewBridge()
 	if err != nil {
@@ -111,7 +133,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	// 建立初始数据连接
 	// 初始连接使用配置中的默认网络类型 (空字符串表示不覆盖)
-	connC, err := makeP2PDataSession(ncconfig, int(dataSessId), "")
+	connC, err := makeP2PDataSession(config, int(dataSessId), "")
 	if err != nil {
 		logPR(ncconfig.LogWriter, "makeP2PDataSession failed: %v", err)
 		controlConn.Close()
@@ -138,11 +160,9 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	// --- 控制器与事件处理器初始化 ---
 
-	newNCConfig := *ncconfig
-
 	// 定义业务处理器，用于处理 RotateController 回调的事件
 	handler := &rotateBusinessHandler{
-		ncconfig:               &newNCConfig,
+		ncconfig:               &config.ncconfig,
 		bridge:                 bridge,
 		config:                 config, // 注入配置指针，以便在同步时修改
 		dataSessIdPtr:          &dataSessId,
@@ -156,7 +176,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 	// 创建控制器
 	// 注意：这里传给 NewRotateController 的 config 是值拷贝，仅用于发送给对端初始配置
 	// 后续 handler.OnConfigSynced 修改的是上面的 config 指针指向的内存，即主循环使用的配置
-	ctrl := NewRotateController(controlConn, *config, handler)
+	ctrl := NewRotateController(controlConn, nconnConfig.IsClient, *config, handler)
 	handler.ctrl = ctrl // 相互引用
 
 	// 启动控制器 (开始 Ping/Pong 和 ReadLoop)
@@ -190,7 +210,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	// --- Client 端的主动轮转逻辑 (定时器) ---
 	go func() {
-		if !config.IsClient {
+		if !nconnConfig.IsClient {
 			return // Server 端只需等待命令，不需要主动检查
 		}
 
@@ -242,40 +262,27 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 		}
 	}()
 
-	newNCConfig.remoteCall = ""
-	newNCConfig.runCmd = ":mux"
-	newNCConfig.goroutineConnectionCounter = 0
-
-	stats_in := misc.NewProgressStats()
-	stats_out := misc.NewProgressStats()
-
-	if newNCConfig.progressEnabled {
-		newNCConfig.sessionReady = true
-		wg := &sync.WaitGroup{}
-		done := make(chan bool)
-		showProgress(&newNCConfig, stats_in, stats_out, done, wg)
-		defer func() {
-			done <- true
-			wg.Wait()
-		}()
-	}
-
-	handleNegotiatedConnection(&misc.ConsoleIO{}, &newNCConfig, secureDataSess, stats_in, stats_out)
+	config.ncconfig.sessionReady = true
+	handleNegotiatedConnection(&misc.ConsoleIO{}, &config.ncconfig, secureDataSess, config.stats_in, config.stats_out)
 	logPR(ncconfig.LogWriter, "PortRotate ends")
 }
 
-func makeP2PDataSession(ncconfig *AppNetcatConfig, id int, networkOverride string) (net.Conn, error) {
+func makeP2PDataSession(config *AppPortRotateConfig, id int, networkOverride string) (net.Conn, error) {
+
+	defer atomic.AddInt32(&config.isRotating, -1)
+	atomic.AddInt32(&config.isRotating, 1)
+
 	// 确定使用的协议：如果有 Override 则使用，否则使用配置的默认值
-	targetNetwork := ncconfig.network
+	targetNetwork := config.ncconfig.network
 	if networkOverride != "" {
 		targetNetwork = networkOverride
 	}
 
-	logPR(ncconfig.LogWriter, "Making P2P data session with id %d (Network: %s)", id, targetNetwork)
+	logPR(config.ncconfig.LogWriter, "Making P2P data session with id %d (Network: %s)", id, targetNetwork)
 	topicSalt := fmt.Sprintf("%d", id)
 
 	// 注意：这里我们将 networkOverride 传递给 Easy_P2P_MP
-	connInfo, err := easyp2p.Easy_P2P_MP(targetNetwork, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, nil, ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P_MP(targetNetwork, config.ncconfig.localbind, config.ncconfig.p2pSessionKey+topicSalt, false, nil, config.ncconfig.LogWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -322,6 +329,7 @@ type RotateEventHandler interface {
 
 type RotateController struct {
 	conn      net.Conn
+	isClient  bool
 	config    AppPortRotateConfig
 	handler   RotateEventHandler
 	sendCh    chan packet
@@ -334,13 +342,14 @@ type packet struct {
 	payload []byte
 }
 
-func NewRotateController(conn net.Conn, cfg AppPortRotateConfig, handler RotateEventHandler) *RotateController {
+func NewRotateController(conn net.Conn, isClient bool, cfg AppPortRotateConfig, handler RotateEventHandler) *RotateController {
 	return &RotateController{
-		conn:    conn,
-		config:  cfg,
-		handler: handler,
-		sendCh:  make(chan packet, 64),
-		closeCh: make(chan struct{}),
+		conn:     conn,
+		isClient: isClient,
+		config:   cfg,
+		handler:  handler,
+		sendCh:   make(chan packet, 64),
+		closeCh:  make(chan struct{}),
 	}
 }
 
@@ -398,7 +407,7 @@ func (c *RotateController) writeLoop() {
 	interval := 15 * time.Second
 	var ticker *time.Ticker
 
-	if c.config.IsClient {
+	if c.isClient {
 		ticker = time.NewTicker(interval)
 	} else {
 		ticker = time.NewTicker(24 * time.Hour) // Server 不主动 Ping，仅占位
@@ -536,21 +545,11 @@ type rotateBusinessHandler struct {
 	// receiverPending 追踪作为接收方，已经建立但尚未 Commit 的连接
 	receiverPending map[int]net.Conn
 	recvMu          sync.Mutex
-
-	// 轮转状态锁，防止重入
-	rotationMu sync.Mutex
-	isRotating bool
 }
 
 // Handler 内部日志方法，复用全局辅助函数
 func (h *rotateBusinessHandler) log(format string, v ...interface{}) {
 	logPR(h.ncconfig.LogWriter, format, v...)
-}
-
-func (h *rotateBusinessHandler) resetRotatingState() {
-	h.rotationMu.Lock()
-	h.isRotating = false
-	h.rotationMu.Unlock()
 }
 
 func (h *rotateBusinessHandler) OnConfigSynced(remoteConfig AppPortRotateConfig) {
@@ -603,7 +602,7 @@ func (h *rotateBusinessHandler) OnPortRotate(id int, network string) {
 
 		// 1. 接收方建立 P2P 连接（与发起方并行）
 		// 使用命令中指定的 network，如果为空则使用默认
-		newConn, err := makeP2PDataSession(h.ncconfig, id, network)
+		newConn, err := makeP2PDataSession(h.config, id, network)
 		if err != nil {
 			h.log("Rotate Error: Receiver makeP2PDataSession failed: %v", err)
 			h.ctrl.SendPortRotateAck(id, 500)
@@ -654,14 +653,10 @@ func (h *rotateBusinessHandler) OnPortRotateCommit(id int) {
 // 增加 network 参数，用于手动指定协议
 func (h *rotateBusinessHandler) TriggerRotation(source string, network string) {
 	// 检查是否已有轮转在进行中
-	h.rotationMu.Lock()
-	if h.isRotating {
-		h.rotationMu.Unlock()
+	if h.config.isRotating > 0 {
 		h.log("[%s] Rotation skipped: already in progress", source)
 		return
 	}
-	h.isRotating = true
-	h.rotationMu.Unlock()
 
 	// 1. 增加 ID
 	newId := atomic.AddInt32(h.dataSessIdPtr, 1)
@@ -697,10 +692,9 @@ func (h *rotateBusinessHandler) InitiateRotation(id int, network string) {
 
 	// 1. 建立 P2P 连接（阻塞直到对方也调用 makeP2PDataSession）
 	// 使用指定的 network
-	newConn, err := makeP2PDataSession(h.ncconfig, id, network)
+	newConn, err := makeP2PDataSession(h.config, id, network)
 	if err != nil {
 		h.log("Rotate Error: Initiator makeP2PDataSession failed: %v", err)
-		h.resetRotatingState() // 失败，释放状态
 		// 失败回滚：恢复 ready 状态
 		h.ncconfig.sessionReady = true
 		return
@@ -724,7 +718,6 @@ func (h *rotateBusinessHandler) InitiateRotation(id int, network string) {
 func (h *rotateBusinessHandler) OnPortRotateAck(id int, errCode int) {
 	h.log("Received PortRotateAck (Ready) for ID: %d, Code: %d", id, errCode)
 	if errCode != 0 {
-		h.resetRotatingState() // 失败，释放状态
 		// 收到错误码，回滚 ready 状态
 		h.ncconfig.sessionReady = true
 		return
@@ -764,8 +757,6 @@ func (h *rotateBusinessHandler) performInitiatorSwitch(id int, conn net.Conn) {
 	delete(h.pendingRotations, id)
 	h.pendingMu.Unlock()
 
-	// 轮转完成，释放状态
-	h.resetRotatingState()
 	// 切换完成，恢复 ready 状态
 	h.ncconfig.sessionReady = true
 }
@@ -785,7 +776,7 @@ func (h *rotateBusinessHandler) StartHTTPServer(addr string) {
 
 func (h *rotateBusinessHandler) ServeHTTP_Info(w http.ResponseWriter, r *http.Request) {
 	info := map[string]interface{}{
-		"is_client":         h.config.IsClient,
+		"is_client":         h.ctrl.isClient,
 		"current_id":        atomic.LoadInt32(h.dataSessIdPtr),
 		"total_bytes":       h.bridge.TotalTraffic,
 		"last_rotate_bytes": atomic.LoadUint64(h.lastRotationTrafficPtr),
@@ -814,6 +805,12 @@ func (h *rotateBusinessHandler) ServeHTTP_Rotate(w http.ResponseWriter, r *http.
 			fmt.Fprintf(w, "Invalid network type: %s\n", network)
 			return
 		}
+	}
+
+	if h.config.isRotating > 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Rotation already in progress. Try again later.\n")
+		return
 	}
 
 	// 手动触发，传递 network 参数
