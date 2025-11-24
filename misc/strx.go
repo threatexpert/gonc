@@ -3,6 +3,8 @@ package misc
 import (
 	"bytes"
 	"fmt"
+	"strconv"
+	"strings"
 	"unicode"
 )
 
@@ -40,4 +42,25 @@ func ParseCommandLine(command string) ([]string, error) {
 	}
 
 	return args, nil
+}
+
+func ParseSize(s string) (uint64, error) {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	multipliers := map[string]uint64{
+		"K": 1024, "KB": 1024,
+		"M": 1024 * 1024, "MB": 1024 * 1024,
+		"G": 1024 * 1024 * 1024, "GB": 1024 * 1024 * 1024,
+	}
+
+	for suffix, mult := range multipliers {
+		if strings.HasSuffix(s, suffix) {
+			v := strings.TrimSuffix(s, suffix)
+			n, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			return n * mult, nil
+		}
+	}
+	return strconv.ParseUint(s, 10, 64)
 }

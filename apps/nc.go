@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.3.8"
+	VERSION = "v2.3.9"
 )
 
 type AppNetcatConfig struct {
@@ -60,6 +60,8 @@ type AppNetcatConfig struct {
 	app_nc_args       string
 	app_nc_Config     *AppNetcatConfig
 	app_tp_Config     *AppTPConfig
+	app_pr_args       string
+	app_pr_Config     *AppPortRotateConfig
 
 	accessControl *acl.ACL
 	term_oldstat  *term.State
@@ -121,6 +123,7 @@ type AppNetcatConfig struct {
 	Args              []string
 	natchecker        bool
 	httpdownload      bool
+	portRotate        bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -181,6 +184,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.BoolVar(&config.appMuxListenMode, "httplocal", false, "local listen mode for remote httpserver")
 	fs.StringVar(&config.appMuxListenOn, "httplocal-port", "", "local listen port for remote httpserver")
 	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "for socks5 tunnel")
+	fs.BoolVar(&config.portRotate, "port-rotate", false, "enable port rotation feature")
 	fs.StringVar(&config.fileACL, "acl", "", "ACL file for inbound/outbound connections")
 	fs.BoolVar(&config.plainTransport, "plain", false, "use plain TCP/UDP without TLS/KCP/Encryption for P2P")
 	fs.BoolVar(&config.framedStdio, "framed", false, "stdin/stdout is framed stream (2 bytes length prefix for each frame)")
@@ -197,6 +201,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.StringVar(&config.app_s5s_args, ":s5s", "-", "enable and config :s5s for dynamic service")
 	fs.StringVar(&config.app_sh_args, ":sh", "-", "enable and config :sh for dynamic service")
 	fs.StringVar(&config.app_nc_args, ":nc", "-", "enable and config :nc for dynamic service")
+	fs.StringVar(&config.app_pr_args, ":pr", "-", "enable and config :pr for dynamic service")
 	fs.BoolVar(&config.natchecker, "nat-checker", false, "detect NAT type and public IP")
 	fs.BoolVar(&config.httpdownload, "http-download", false, "<localDir> <urlPath>; download from gonc's (-httplocal-port) HTTP service")
 
@@ -311,24 +316,55 @@ func firstInit(ncconfig *AppNetcatConfig) {
 func configureAppMode(ncconfig *AppNetcatConfig) {
 	if ncconfig.runAppFileServ != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileServ, "\\", "/")
-		ncconfig.runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
+		if ncconfig.portRotate {
+			ncconfig.runCmd = ":service"
+			ncconfig.remoteCall = ":pr"
+			if ncconfig.app_pr_args == "-" {
+				ncconfig.app_pr_args = ""
+			}
+			ncconfig.app_mux_args = fmt.Sprintf("httpserver \"%s\"", escapedPath)
+		} else {
+			ncconfig.runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
+		}
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
 	} else if ncconfig.runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileGet, "\\", "/")
 		downloadSubPath := strings.ReplaceAll(ncconfig.downloadSubPath, "\\", "/")
-		ncconfig.runCmd = fmt.Sprintf(":mux httpclient \"%s\"", escapedPath)
+
+		httpclientArgs := fmt.Sprintf("httpclient \"%s\"", escapedPath)
 		if downloadSubPath != "" {
-			ncconfig.runCmd += fmt.Sprintf(" \"%s\"", downloadSubPath)
+			httpclientArgs += fmt.Sprintf(" \"%s\"", downloadSubPath)
 		}
+
+		if ncconfig.portRotate {
+			ncconfig.runCmd = ":service"
+			ncconfig.remoteCall = ":pr"
+			if ncconfig.app_pr_args == "-" {
+				ncconfig.app_pr_args = ""
+			}
+			ncconfig.app_mux_args = httpclientArgs
+		} else {
+			ncconfig.runCmd = fmt.Sprintf(":mux %s", httpclientArgs)
+		}
+
 		if ncconfig.appMuxListenOn != "" {
 			VarmuxLastListenAddress = ncconfig.appMuxListenOn
 		}
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
 	} else if ncconfig.appMuxSocksMode {
-		ncconfig.runCmd = ":mux socks5"
+		if ncconfig.portRotate {
+			ncconfig.runCmd = ":service"
+			ncconfig.remoteCall = ":pr"
+			if ncconfig.app_pr_args == "-" {
+				ncconfig.app_pr_args = ""
+			}
+			ncconfig.app_mux_args = "socks5"
+		} else {
+			ncconfig.runCmd = ":mux socks5"
+		}
 		if !ncconfig.useMQTTWait {
 			ncconfig.useMQTTWait = true
 		}
@@ -338,7 +374,16 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		if ncconfig.appMuxListenOn == "" {
 			ncconfig.appMuxListenOn = "0"
 		}
-		ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
+		if ncconfig.portRotate {
+			ncconfig.runCmd = ":service"
+			ncconfig.remoteCall = ":pr"
+			if ncconfig.app_pr_args == "-" {
+				ncconfig.app_pr_args = ""
+			}
+			ncconfig.app_mux_args = fmt.Sprintf("-l %s", ncconfig.appMuxListenOn)
+		} else {
+			ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
+		}
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
 	}
@@ -373,6 +418,13 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		}
 		if ncconfig.app_nc_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":nc "+ncconfig.app_nc_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
+		if ncconfig.app_pr_args != "-" {
+			err := preinitBuiltinAppConfig(ncconfig, ":pr "+ncconfig.app_pr_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
@@ -1196,6 +1248,8 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		ncconfig.app_sh_Config, err = PtyShellConfigByArgs(args[1:])
 	case ":tp":
 		ncconfig.app_tp_Config, err = AppTPConfigByArgs(args[1:])
+	case ":pr":
+		ncconfig.app_pr_Config, err = AppPortRotateConfigByArgs(args[1:])
 	case ":service":
 	default:
 		if strings.HasPrefix(builtinApp, ":") {
@@ -1433,6 +1487,14 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		output = file
 	}
 
+	if ncconfig.remoteCall != "" {
+		_, err = nconn.Write([]byte(ncconfig.remoteCall + "\n"))
+		if err != nil {
+			fmt.Fprintf(ncconfig.LogWriter, "Error Sending: %v\n", err)
+			return 1
+		}
+	}
+
 	serviceCommand := strings.TrimSpace(ncconfig.runCmd)
 	if serviceCommand == ":service" {
 		nconn.SetDeadline(time.Now().Add(15 * time.Second))
@@ -1448,14 +1510,6 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			return 1
 		}
 		serviceCommand = line
-	}
-
-	if ncconfig.remoteCall != "" {
-		_, err = nconn.Write([]byte(ncconfig.remoteCall + "\n"))
-		if err != nil {
-			fmt.Fprintf(ncconfig.LogWriter, "Error Sending: %v\n", err)
-			return 1
-		}
 	}
 
 	if serviceCommand != "" {
@@ -1527,6 +1581,16 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_tp_main_withconfig(pipeConn, ncconfig.app_tp_Config)
+		} else if builtinApp == ":pr" {
+			if ncconfig.app_pr_Config == nil {
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go App_PortRotate_main_withconfig(pipeConn, nconn.Config, ncconfig, ncconfig.app_pr_Config)
 		} else if strings.HasPrefix(builtinApp, ":") {
 			fmt.Fprintf(ncconfig.LogWriter, "Invalid service command: %s\n", builtinApp)
 			return 1
