@@ -697,6 +697,39 @@ func (h *rotateBusinessHandler) InitiateRotation(id int, network string) {
 		h.log("Rotate Error: Initiator makeP2PDataSession failed: %v", err)
 		// 失败回滚：恢复 ready 状态
 		h.ncconfig.sessionReady = true
+
+		// 如果指定了特定网络，失败后不重试
+		if network != "" {
+			return
+		}
+
+		// [新增逻辑] 失败后 30秒 自动重试
+		// 使用 goroutine + timer + select 来处理生命周期和状态检查
+		go func(failedID int) {
+			h.log("Rotation failed. Scheduling auto-retry in 30 seconds...")
+
+			// 创建定时器
+			timer := time.NewTimer(30 * time.Second)
+			defer timer.Stop()
+
+			select {
+			case <-h.ctrl.closeCh:
+				// 模块已关闭，取消重试
+				return
+			case <-timer.C:
+				// 定时器触发
+			}
+
+			// 检查 ID 是否发生变化（期间是否有其他触发成功或失败导致ID递增）
+			currentID := int(atomic.LoadInt32(h.dataSessIdPtr))
+			if currentID != failedID {
+				h.log("Auto-retry skipped: ID changed from %d to %d", failedID, currentID)
+				return
+			}
+
+			// 触发重试
+			h.TriggerRotation("AutoRetry", "")
+		}(id)
 		return
 	}
 
