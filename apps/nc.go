@@ -1183,6 +1183,10 @@ func conflictCheck(ncconfig *AppNetcatConfig) {
 		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
 		os.Exit(1)
 	}
+	if ncconfig.portRotate && !strings.HasPrefix(ncconfig.runCmd, ":mux ") {
+		fmt.Fprintf(os.Stderr, "-portrate and -e \":mux ...\"(socks5server/httpserver) must be used together\n")
+		os.Exit(1)
+	}
 }
 
 func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) error {
