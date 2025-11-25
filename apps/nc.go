@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.3.9"
+	VERSION = "v2.4.0"
 )
 
 type AppNetcatConfig struct {
@@ -356,6 +356,9 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 			}
 			ncconfig.app_mux_args = strings.TrimPrefix(ncconfig.runCmd, ":mux ")
 			ncconfig.runCmd = ":service"
+		} else {
+			fmt.Fprintf(os.Stderr, "-portrate and -e \":mux ...\"(socks5server/httpserver) must be used together\n")
+			os.Exit(1)
 		}
 	}
 
@@ -1181,10 +1184,6 @@ func conflictCheck(ncconfig *AppNetcatConfig) {
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") && (ncconfig.autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
-		os.Exit(1)
-	}
-	if ncconfig.portRotate && !strings.HasPrefix(ncconfig.runCmd, ":mux ") {
-		fmt.Fprintf(os.Stderr, "-portrate and -e \":mux ...\"(socks5server/httpserver) must be used together\n")
 		os.Exit(1)
 	}
 }
