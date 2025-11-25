@@ -224,6 +224,11 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 			case <-ctrl.closeCh:
 				return // 控制器关闭，退出循环
 			case <-ticker.C:
+				// [Fix] 如果正在轮转中，直接跳过检测，避免日志刷屏 "Traffic limit reached" -> "Skipped"
+				if atomic.LoadInt32(&config.isRotating) > 0 {
+					continue
+				}
+
 				shouldRotate := false
 
 				// 获取当前的配置值（可能已被同步逻辑更新）
@@ -653,7 +658,7 @@ func (h *rotateBusinessHandler) OnPortRotateCommit(id int) {
 // 增加 network 参数，用于手动指定协议
 func (h *rotateBusinessHandler) TriggerRotation(source string, network string) {
 	// 检查是否已有轮转在进行中
-	if h.config.isRotating > 0 {
+	if atomic.LoadInt32(&h.config.isRotating) > 0 {
 		h.log("[%s] Rotation skipped: already in progress", source)
 		return
 	}
@@ -840,7 +845,7 @@ func (h *rotateBusinessHandler) ServeHTTP_Rotate(w http.ResponseWriter, r *http.
 		}
 	}
 
-	if h.config.isRotating > 0 {
+	if atomic.LoadInt32(&h.config.isRotating) > 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, "Rotation already in progress. Try again later.\n")
 		return
