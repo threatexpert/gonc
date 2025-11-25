@@ -20,7 +20,7 @@ var (
 	lastStunClientLock sync.Mutex
 	STUNServers        []string = []string{
 		"tcp://turn.cloudflare.com:80",
-		"udp://turn.cloudflare.com:53",
+		"udp://turn.cloudflare.com:53?3478",
 		"udp://stun.l.google.com:19302",
 		"udp://stun.miwifi.com:3478",
 		"global.turn.twilio.com:3478",
@@ -114,7 +114,12 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 			}
 
 			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s ...\n", useNetwork, stunAddr)
-			conn, err := dialer.DialContext(ctx, useNetwork, stunAddr)
+			var conn net.Conn
+			if strings.Contains(stunAddr, "?") {
+				conn, err = netx.DialRace(ctx, useNetwork, stunAddr, dialer.DialContext)
+			} else {
+				conn, err = dialer.DialContext(ctx, useNetwork, stunAddr)
+			}
 			if err != nil {
 				//fmt.Fprintf(os.Stderr, "STUN dial failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				// 如果 context 被取消，错误会是 "context canceled"
@@ -383,9 +388,17 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			dialer := &net.Dialer{LocalAddr: laddr}
 			if strings.HasPrefix(useNetwork, "tcp") {
 				dialer.Control = netx.ControlTCP
-				conn, err = dialer.DialContext(ctx, useNetwork, stunAddr)
+				if strings.Contains(stunAddr, "?") {
+					conn, err = netx.DialRace(ctx, useNetwork, stunAddr, dialer.DialContext)
+				} else {
+					conn, err = dialer.DialContext(ctx, useNetwork, stunAddr)
+				}
 			} else {
-				conn, err = UDPDialer.DialContext(ctx, useNetwork, stunAddr)
+				if strings.Contains(stunAddr, "?") {
+					conn, err = netx.DialRace(ctx, useNetwork, stunAddr, UDPDialer.DialContext)
+				} else {
+					conn, err = UDPDialer.DialContext(ctx, useNetwork, stunAddr)
+				}
 			}
 
 			if err != nil {
