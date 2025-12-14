@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/threatexpert/gonc/v2/misc"
+	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
@@ -35,7 +36,7 @@ func NewHttpConnectClient(config *ProxyClientConfig) *HttpConnectClient {
 func getFullHttpHeader(conn net.Conn) (string, error) {
 	result := ""
 	for {
-		line, err := ReadString(conn, '\n')
+		line, err := netx.ReadString(conn, '\n', 4096)
 		if err != nil {
 			return "", fmt.Errorf("failed to read headers: %v", err)
 		}

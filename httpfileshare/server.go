@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,41 +30,102 @@ type FileInfo struct {
 
 // ServerConfig holds the server configuration.
 type ServerConfig struct {
-	ListenAddr    string
-	RootDirectory string
-	LoggerOutput  io.Writer
-	EnableZstd    bool
-	Listener      net.Listener
+	ListenAddr   string
+	RootPaths    []string // Changed from RootDirectory string to support multiple paths
+	LoggerOutput io.Writer
+	EnableZstd   bool
+	Listener     net.Listener
+	WebMode      bool
+}
+
+// virtualMount represents a mapped path in multi-root mode.
+type virtualMount struct {
+	Alias    string // The name shown in the virtual root (e.g., "movies")
+	RealPath string // The absolute path on disk
 }
 
 // Server represents our HTTP static file server.
 type Server struct {
 	config ServerConfig
-	fs     http.FileSystem
 	logger *log.Logger
+	// Internal state for path resolution
+	mounts     []virtualMount // Used for multi-path mode to map /alias -> /abs/path
+	singleRoot string         // Used for backward compatibility (single path mode)
 }
 
 // NewServer creates a new Server instance.
 func NewServer(cfg ServerConfig) (*Server, error) {
-	absRoot, err := filepath.Abs(cfg.RootDirectory)
-	if err != nil {
-		return nil, fmt.Errorf("invalid root directory path: %w", err)
+	if len(cfg.RootPaths) == 0 {
+		return nil, fmt.Errorf("at least one root path must be provided")
 	}
-	cfg.RootDirectory = absRoot
 
 	if cfg.LoggerOutput == nil {
 		cfg.LoggerOutput = io.Discard
 	}
-
 	serverLogger := log.New(cfg.LoggerOutput, "[HTTP_SERVER] ", log.Ldate|log.Ltime)
-
-	fileSystem := http.Dir(cfg.RootDirectory)
 
 	s := &Server{
 		config: cfg,
-		fs:     fileSystem,
 		logger: serverLogger,
 	}
+
+	// Process paths to ensure they are absolute
+	var absPaths []string
+	for _, p := range cfg.RootPaths {
+		// [修复 1] Windows下，如果路径是 "d:" 或 "D:" (长度为2且以冒号结尾)，
+		// 意味着用户想要的是该盘符的根目录，而不是该盘符的"当前工作目录"。
+		// 我们手动追加一个路径分隔符，将其强制转为绝对根路径 "d:\"。
+		if len(p) == 2 && p[1] == ':' {
+			p = p + string(os.PathSeparator)
+		}
+
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid root path %s: %w", p, err)
+		}
+		absPaths = append(absPaths, abs)
+	}
+
+	if len(absPaths) == 1 {
+		// Single path mode: behaves exactly like the original version
+		s.singleRoot = absPaths[0]
+		s.logger.Printf("Server initialized in Single-Root mode: %s", s.singleRoot)
+	} else {
+		// Multi path mode: generate virtual mounts
+		seenAliases := make(map[string]int)
+		for _, p := range absPaths {
+			// [修复 2] 获取显示的名称
+			baseName := filepath.Base(p)
+
+			// Windows 下，filepath.Base("D:\") 返回的是 "\"
+			// 如果检测到是根目录，我们改用卷标名（例如 "D:"）
+			if baseName == string(os.PathSeparator) || baseName == "." {
+				vol := filepath.VolumeName(p)
+				if vol != "" {
+					baseName = strings.TrimRight(vol, ":") // 这里 baseName 变为 "D:"
+				} else {
+					// 如果是 Linux 根目录 "/" 或其他情况，给个默认名
+					baseName = "ROOT"
+				}
+			}
+
+			// Handle duplicate names by appending a counter (e.g., data, data-2)
+			alias := baseName
+			if count, exists := seenAliases[alias]; exists {
+				seenAliases[baseName]++
+				alias = fmt.Sprintf("%s-%d", baseName, count+1)
+			} else {
+				seenAliases[alias] = 1
+			}
+
+			s.mounts = append(s.mounts, virtualMount{
+				Alias:    alias,
+				RealPath: p,
+			})
+		}
+		s.logger.Printf("Server initialized in Multi-Root mode with %d paths", len(s.mounts))
+	}
+
 	return s, nil
 }
 
@@ -138,10 +200,17 @@ func (s *Server) Start() error {
 	var ln net.Listener
 	var err error
 
+	servingMsg := ""
+	if s.singleRoot != "" {
+		servingMsg = fmt.Sprintf("serving from %s", s.singleRoot)
+	} else {
+		servingMsg = fmt.Sprintf("serving %d virtual roots", len(s.mounts))
+	}
+
 	if s.config.Listener != nil {
 		// Use the provided custom listener
 		ln = s.config.Listener
-		s.logger.Printf("Starting HTTP server on custom listener, serving from %s", s.config.RootDirectory)
+		s.logger.Printf("Starting HTTP server on custom listener, %s", servingMsg)
 	} else {
 		// Fallback to standard TCP listener if no custom listener is provided
 		if s.config.ListenAddr == "" {
@@ -151,7 +220,7 @@ func (s *Server) Start() error {
 		if err != nil {
 			return fmt.Errorf("failed to create standard TCP listener on %s: %w", s.config.ListenAddr, err)
 		}
-		s.logger.Printf("Starting HTTP server on standard TCP listener at %s, serving from %s", ln.Addr(), s.config.RootDirectory)
+		s.logger.Printf("Starting HTTP server on standard TCP listener at %s, %s", ln.Addr(), servingMsg)
 	}
 
 	// Always defer closing the listener that was opened/provided
@@ -228,27 +297,106 @@ func serveFavicon(w http.ResponseWriter, r *http.Request) {
 	w.Write(faviconData)
 }
 
+// resolvePath maps a URL path to a physical disk path based on the configuration.
+// It returns the full path on disk, and a boolean indicating if this is the virtual root.
+func (s *Server) resolvePath(urlPath string) (fullPath string, isVirtualRoot bool, err error) {
+	urlPath = path.Clean(urlPath)
+	if strings.HasPrefix(urlPath, "..") {
+		return "", false, fmt.Errorf("directory traversal attempt")
+	}
+
+	// Case 1: Single Root Mode (Backward Compatibility)
+	if s.singleRoot != "" {
+		return filepath.Join(s.singleRoot, urlPath), false, nil
+	}
+
+	// Case 2: Multi Root Mode
+	// If it's the root "/", we are in the virtual directory listing
+	if urlPath == "." || urlPath == "/" {
+		return "", true, nil
+	}
+
+	// Split the path to find which mount point (alias) is requested
+	// e.g. /movies/action/1.mp4 -> part[0]="", part[1]="movies", part[2]="action/1.mp4"
+	// clean path always starts with / so splitting gives empty first element
+	parts := strings.SplitN(urlPath, "/", 3)
+	if len(parts) < 2 {
+		return "", false, fmt.Errorf("invalid path")
+	}
+
+	alias := parts[1]
+	remainder := ""
+	if len(parts) > 2 {
+		remainder = parts[2]
+	}
+
+	// Find the matching mount
+	for _, m := range s.mounts {
+		if m.Alias == alias {
+			return filepath.Join(m.RealPath, remainder), false, nil
+		}
+	}
+
+	return "", false, os.ErrNotExist
+}
+
+// virtualFileInfo wraps fs.FileInfo to override the Name() method.
+type virtualFileInfo struct {
+	fs.FileInfo
+	name string
+}
+
+func (v virtualFileInfo) Name() string {
+	return v.name
+}
+
 // serveFiles handles all requests to the root path.
 func (s *Server) serveFiles(w http.ResponseWriter, r *http.Request) {
 	requestedPath := path.Clean(r.URL.Path)
-	if strings.HasPrefix(requestedPath, "..") {
-		http.Error(w, "Access Denied", http.StatusForbidden)
-		s.logger.Printf("Access denied: Directory traversal attempt for path '%s' from %s", r.URL.Path, r.RemoteAddr)
-		return
-	}
-
-	fullPathOnDisk := filepath.Join(s.config.RootDirectory, requestedPath)
 
 	prefersJSONRecursive := strings.Contains(r.Header.Get("Accept"), "application/json")
 
 	if prefersJSONRecursive {
-		s.serveRecursiveList(w, r, s.config.RootDirectory)
+		s.serveRecursiveList(w, r)
 		return
 	}
 
-	f, err := s.fs.Open(requestedPath)
+	fullPathOnDisk, isVirtualRoot, err := s.resolvePath(requestedPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "no such file or directory") {
+		if strings.Contains(err.Error(), "directory traversal") {
+			http.Error(w, "Access Denied", http.StatusForbidden)
+			s.logger.Printf("Access denied: %v for path '%s' from %s", err, r.URL.Path, r.RemoteAddr)
+		} else if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			s.logger.Printf("Not found: Path '%s' requested from %s", r.URL.Path, r.RemoteAddr)
+		} else {
+			s.logger.Printf("Error resolving path '%s': %v", r.URL.Path, err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Handle Virtual Root Listing (Multi-path mode only)
+	if isVirtualRoot {
+		// Construct a list of fake FileInfos representing the roots
+		var entries []fs.FileInfo
+		for _, m := range s.mounts {
+			stat, err := os.Stat(m.RealPath)
+			if err != nil {
+				s.logger.Printf("Warning: Could not stat mounted path %s: %v", m.RealPath, err)
+				continue
+			}
+			// Create a wrapper to show the Alias as the name instead of the folder name
+			entries = append(entries, virtualFileInfo{FileInfo: stat, name: m.Alias})
+		}
+		s.serveHTMLDirectoryListing(w, r, entries, "/")
+		return
+	}
+
+	// Handle Physical File/Directory
+	f, err := os.Open(fullPathOnDisk)
+	if err != nil {
+		if os.IsNotExist(err) {
 			http.NotFound(w, r)
 			s.logger.Printf("Not found: Path '%s' requested from %s", r.URL.Path, r.RemoteAddr)
 		} else {
@@ -267,18 +415,49 @@ func (s *Server) serveFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if stat.IsDir() {
-		httpFile, ok := f.(*os.File) // *os.File implements http.File
-		if !ok {
-			s.logger.Printf("Error: Opened directory %s is not an *os.File for readdir purposes", fullPathOnDisk)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
 		if !strings.HasSuffix(r.URL.Path, "/") {
 			http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
 			s.logger.Printf("Redirected: %s to %s/ (from %s)", r.URL.Path, r.URL.Path, r.RemoteAddr)
 			return
 		}
-		s.serveHTMLDirectoryListing(w, r, httpFile, requestedPath)
+		// Check for index files (index.html, index.htm) if WebMode is enabled
+		if s.config.WebMode {
+			indexFiles := []string{"index.html", "index.htm"}
+			for _, indexName := range indexFiles {
+				indexFilePath := filepath.Join(fullPathOnDisk, indexName)
+				if idxStat, err := os.Stat(indexFilePath); err == nil && !idxStat.IsDir() {
+					fIndex, err := os.Open(indexFilePath)
+					if err == nil {
+						defer fIndex.Close()
+						s.logger.Printf("WebMode: Serving %s for directory %s", indexName, r.URL.Path)
+						s.handleFileDownload(w, r, fIndex, idxStat)
+						return
+					}
+				}
+			}
+		}
+
+		// 1. 读取目录项 (DirEntry)，即使有错误也尝试获取已读取的部分
+		dirEntries, err := f.ReadDir(-1)
+		if err != nil {
+			// ReadDir 如果在读到一半时出错，会返回已读取的部分和错误。
+			// 我们记录警告，但不要中断，尝试显示已经读到的文件。
+			s.logger.Printf("Warning: Error reading directory listing for %s (showing partial results): %v", fullPathOnDisk, err)
+		}
+
+		// 2. 将 DirEntry 转换为 FileInfo，并过滤掉无法访问的文件
+		var entries []fs.FileInfo
+		for _, de := range dirEntries {
+			info, err := de.Info()
+			if err != nil {
+				// 如果某个特定文件无法获取详情（例如权限不足），记录日志并跳过，不影响其他文件显示
+				s.logger.Printf("Warning: Skipping file '%s' in '%s': could not stat: %v", de.Name(), fullPathOnDisk, err)
+				continue
+			}
+			entries = append(entries, info)
+		}
+
+		s.serveHTMLDirectoryListing(w, r, entries, r.URL.Path)
 		return
 	}
 
@@ -288,14 +467,15 @@ func (s *Server) serveFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveHTMLDirectoryListing serves an HTML page for directory listing (for browsers).
-// This version generates HTML by concatenating strings instead of using html/template.
-func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Request, file *os.File, requestedPath string) {
-	entries, err := file.Readdir(-1) // Readdir works on *os.File
-	if err != nil {
-		s.logger.Printf("Error reading directory %s for HTML listing: %v (requested by %s from %s)", requestedPath, err, r.URL.Path, r.RemoteAddr)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
+// Refactored to accept []fs.FileInfo instead of reading the file itself.
+func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Request, entries []fs.FileInfo, displayPath string) {
+	// Sort entries: directories first, then by name
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir() != entries[j].IsDir() {
+			return entries[i].IsDir() // Directories first
+		}
+		return entries[i].Name() < entries[j].Name()
+	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
@@ -324,7 +504,7 @@ func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Reques
 </head>
 <body>
     <h1>Directory Listing for `)
-	sb.WriteString(htmlEscape(r.URL.Path)) // Escape path to prevent XSS
+	sb.WriteString(htmlEscape(displayPath)) // Escape path to prevent XSS
 	sb.WriteString(`</h1>
 
     <table>
@@ -338,7 +518,7 @@ func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Reques
         <tbody>`)
 
 	// Parent Directory Link
-	if r.URL.Path != "/" {
+	if displayPath != "/" {
 		sb.WriteString(`
             <tr>
                 <td><a href="../">.. (Parent Directory)</a></td>
@@ -388,12 +568,12 @@ func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Reques
 </body>
 </html>`)
 
-	_, err = w.Write([]byte(sb.String()))
+	_, err := w.Write([]byte(sb.String()))
 	if err != nil {
-		s.logger.Printf("Error writing HTML directory listing for '%s': %v (requested by %s from %s)", requestedPath, err, r.URL.Path, r.RemoteAddr)
+		s.logger.Printf("Error writing HTML directory listing for '%s': %v (requested by %s from %s)", displayPath, err, r.URL.Path, r.RemoteAddr)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 	} else {
-		s.logger.Printf("served directory listing for '%s' to %s", r.URL.Path, r.RemoteAddr)
+		s.logger.Printf("served directory listing for '%s' to %s", displayPath, r.RemoteAddr)
 	}
 }
 
@@ -410,81 +590,102 @@ func htmlEscape(s string) string {
 }
 
 // serveRecursiveList walks the given base path recursively and streams FileInfo objects as NDJSON.
-func (s *Server) serveRecursiveList(w http.ResponseWriter, r *http.Request, basePath string) {
+func (s *Server) serveRecursiveList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Transfer-Encoding", "chunked")
 
 	requestedPath := path.Clean(r.URL.Path)
-	startWalkPath := filepath.Join(s.config.RootDirectory, requestedPath)
 
-	s.logger.Printf("Starting recursive NDJSON list from '%s' (requested path '%s') for %s", startWalkPath, r.URL.Path, r.RemoteAddr)
+	// Define a helper walker function
+	walkAndStream := func(rootDiskPath string, virtualPrefix string) {
+		s.logger.Printf("Starting recursive NDJSON list from '%s' (prefix '%s') for %s", rootDiskPath, virtualPrefix, r.RemoteAddr)
 
-	_, err := os.Stat(startWalkPath)
-	if err != nil {
-		http.Error(w, "invalid path", http.StatusNotFound)
-		s.logger.Printf("Invalid path '%s': %v", startWalkPath, err)
+		err := filepath.WalkDir(rootDiskPath, func(currentPath string, d fs.DirEntry, err error) error {
+			if err != nil {
+				s.logger.Printf("Error walking path %s: %v", currentPath, err)
+				return nil
+			}
+
+			// Calculate relative path from the specific root
+			relPath, err := filepath.Rel(rootDiskPath, currentPath)
+			if err != nil {
+				return nil
+			}
+
+			// Prepend the virtual prefix (Alias) if we are in multi-root mode
+			// If virtualPrefix is empty (Single Root), it behaves normally.
+			// If virtualPrefix is "/Movies", and file is "action/x.mp4", result is "/Movies/action/x.mp4"
+			fullVirtualPath := path.Join(virtualPrefix, filepath.ToSlash(relPath))
+			if !strings.HasPrefix(fullVirtualPath, "/") {
+				fullVirtualPath = "/" + fullVirtualPath
+			}
+
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+
+			fileInfo := FileInfo{
+				Name:    d.Name(),
+				IsDir:   d.IsDir(),
+				ModTime: info.ModTime(),
+				Size:    info.Size(),
+				Path:    fullVirtualPath,
+			}
+
+			encoder := json.NewEncoder(w)
+			if err := encoder.Encode(fileInfo); err != nil {
+				s.logger.Printf("Error encoding FileInfo for %s: %v", currentPath, err)
+				return fmt.Errorf("client write error: %w", err)
+			}
+
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return nil
+		})
+
+		if err != nil && strings.Contains(err.Error(), "client write error") {
+			s.logger.Printf("Recursive list stopped due to client disconnect.")
+		}
+	}
+
+	// Case 1: Single Root Mode
+	if s.singleRoot != "" {
+		fullPath := filepath.Join(s.singleRoot, requestedPath)
+		if _, err := os.Stat(fullPath); err != nil {
+			http.Error(w, "invalid path", http.StatusNotFound)
+			return
+		}
+		walkAndStream(fullPath, requestedPath) // Prefix is just the requested path (e.g. "/")
 		return
 	}
 
-	err = filepath.WalkDir(startWalkPath, func(currentPath string, d fs.DirEntry, err error) error {
-		if err != nil {
-			s.logger.Printf("Error walking path %s: %v (during recursive list for %s)", currentPath, err, r.RemoteAddr)
-			return nil
+	// Case 2: Multi Root Mode
+	// If requesting Root "/", walk ALL roots
+	if requestedPath == "/" || requestedPath == "." {
+		for _, m := range s.mounts {
+			// Virtual path prefix will be "/Alias"
+			walkAndStream(m.RealPath, "/"+m.Alias)
 		}
-
-		relativePath, err := filepath.Rel(s.config.RootDirectory, currentPath)
-		if err != nil {
-			s.logger.Printf("Error getting relative path for %s: %v (during recursive list for %s)", currentPath, err, r.RemoteAddr)
-			return nil
-		}
-
-		if relativePath == "." {
-			relativePath = "/"
-		} else {
-			relativePath = "/" + strings.ReplaceAll(relativePath, "\\", "/")
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			s.logger.Printf("Error getting file info for %s: %v (during recursive list for %s)", currentPath, err, r.RemoteAddr)
-			return nil
-		}
-
-		fileInfo := FileInfo{
-			Name:    d.Name(),
-			IsDir:   d.IsDir(),
-			ModTime: info.ModTime(),
-			Size:    info.Size(),
-			Path:    relativePath,
-		}
-
-		encoder := json.NewEncoder(w)
-		if err := encoder.Encode(fileInfo); err != nil {
-			s.logger.Printf("Error encoding FileInfo for %s: %v (during recursive list for %s)", currentPath, err, r.RemoteAddr)
-			return fmt.Errorf("client write error: %w", err)
-		}
-
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		if strings.Contains(err.Error(), "client write error") {
-			s.logger.Printf("Recursive list from '%s' stopped due to client disconnect.", startWalkPath)
-		} else {
-			s.logger.Printf("Failed to complete recursive walk from %s: %v", startWalkPath, err)
-		}
-	} else {
-		s.logger.Printf("Completed recursive NDJSON list from '%s' for %s", startWalkPath, r.RemoteAddr)
+		return
 	}
+
+	// If requesting a specific sub-path (e.g., /movies)
+	fullPath, _, err := s.resolvePath(requestedPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	// We need to keep the requested path as prefix so client sees "/movies/action/..."
+	walkAndStream(fullPath, requestedPath)
 }
 
 // handleFileDownload serves a single file.
 func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request, file fs.File, stat fs.FileInfo) {
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, stat.Name()))
+	if !s.config.WebMode {
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, stat.Name()))
+	}
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), file.(io.ReadSeeker))
 }
 

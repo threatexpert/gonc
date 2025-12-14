@@ -26,14 +26,14 @@ import (
 // ==========================================
 
 type AppPortRotateConfig struct {
-	Period               uint   //触发Rotate的条件，单位秒，表示数据通道建立的时间周期
 	RotationTrafficLimit uint64 //触发Rotate的条件，表示传输数据量达到多少字节后进行Rotate
+	isRotating           int32  // 0 = not rotating
+	Period               uint   //触发Rotate的条件，单位秒，表示数据通道建立的时间周期
 	HttpAddr             string // 本地HTTP管理接口地址
 	ncconfig             AppNetcatConfig
 	ncconfigCopied       bool
 	stats_in             *misc.ProgressStats
 	stats_out            *misc.ProgressStats
-	isRotating           int32 // 0 = not rotating
 }
 
 // AppPortRotateConfigByArgs 解析给定的 []string 参数，生成 AppPortRotateConfig
@@ -95,6 +95,10 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	logPR(ncconfig.LogWriter, "PortRotate Starts")
 
+	// 定义退出信号，用于清理监听错误的主协程
+	mainDone := make(chan struct{})
+	defer close(mainDone)
+
 	// 关闭控制通道的进度条信息，如果有需要，应该开启数据通道的进度条
 	ncconfig.sessionReady = false
 
@@ -125,6 +129,8 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 		controlConn.Close()
 		return
 	}
+	// 确保退出时释放 bridge 资源 (包括内部的 UDP 端口监听)
+	defer bridge.Close()
 
 	// 初始化数据 ID 和流量记录
 	// 使用 atomic 保证多协程访问安全
@@ -155,6 +161,8 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 		controlConn.Close()
 		return
 	}
+	// 确保退出时关闭上层连接
+	defer secureDataSess.Close()
 
 	logPR(ncconfig.LogWriter, "PortRotate data connection is ready")
 
@@ -186,6 +194,8 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 	// --- 启动 HTTP 服务 (如果配置了) ---
 	if config.HttpAddr != "" {
 		go handler.StartHTTPServer(config.HttpAddr)
+		// 重要：退出时必须停止 HTTP Server，释放端口
+		defer handler.StopHTTPServer()
 	}
 
 	// --- 错误监控 ---
@@ -205,6 +215,9 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 				secureDataSess.Close()
 				// ctrl 已经停止或正在停止
 			}
+		case <-mainDone:
+			// 重要：主程序退出时，清理此监控协程
+			return
 		}
 	}()
 
@@ -287,7 +300,7 @@ func makeP2PDataSession(config *AppPortRotateConfig, id int, networkOverride str
 	topicSalt := fmt.Sprintf("%d", id)
 
 	// 注意：这里我们将 networkOverride 传递给 Easy_P2P_MP
-	connInfo, err := easyp2p.Easy_P2P_MP(targetNetwork, config.ncconfig.localbind, config.ncconfig.p2pSessionKey+topicSalt, false, nil, config.ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P_MP(config.ncconfig.ctx, targetNetwork, config.ncconfig.localbind, config.ncconfig.p2pSessionKey+topicSalt, false, nil, config.ncconfig.LogWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -550,6 +563,9 @@ type rotateBusinessHandler struct {
 	// receiverPending 追踪作为接收方，已经建立但尚未 Commit 的连接
 	receiverPending map[int]net.Conn
 	recvMu          sync.Mutex
+
+	// 增加 httpServer 字段，用于清理
+	httpServer *http.Server
 }
 
 // Handler 内部日志方法，复用全局辅助函数
@@ -806,9 +822,22 @@ func (h *rotateBusinessHandler) StartHTTPServer(addr string) {
 	mux.HandleFunc("/info", h.ServeHTTP_Info)
 	mux.HandleFunc("/rotate", h.ServeHTTP_Rotate)
 
+	// 保存实例以便关闭
+	h.httpServer = &http.Server{Addr: addr, Handler: mux}
+
 	h.log("Starting HTTP Management Server at %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	// ListenAndServe 会阻塞，且正常关闭会返回 ErrServerClosed
+	if err := h.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		h.log("HTTP Server Error: %v", err)
+	}
+}
+
+// StopHTTPServer 关闭 HTTP 服务，释放端口
+func (h *rotateBusinessHandler) StopHTTPServer() {
+	if h.httpServer != nil {
+		h.log("Stopping HTTP Server...")
+		// Close 立即关闭监听器，释放端口
+		h.httpServer.Close()
 	}
 }
 

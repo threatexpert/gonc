@@ -289,6 +289,7 @@ type STUNResult struct {
 	Network string
 	Local   string // Local IP address and port used for the STUN request
 	Nat     string // NAT IP address and port returned by the STUN server
+	Remote  string // Stun Server address used
 	Err     error  // Error, if any, encountered during the STUN request
 }
 
@@ -447,6 +448,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 				Network: useNetwork,
 				Local:   conn.LocalAddr().String(),
 				Nat:     xorAddr.String(),
+				Remote:  conn.RemoteAddr().String(),
 				Err:     nil,
 			}
 
@@ -508,6 +510,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 						Network: r.Network,
 						Local:   r.Local,
 						Nat:     r.Nat,
+						Remote:  r.Remote,
 						Err:     nil, // No error for successful results
 					})
 				}
@@ -520,6 +523,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 						Network: r.Network,
 						Local:   r.Local,
 						Nat:     r.Nat, // Might be empty or partial if error occurred early
+						Remote:  r.Remote,
 						Err:     r.Err,
 					})
 				}

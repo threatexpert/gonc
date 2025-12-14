@@ -18,15 +18,16 @@ import (
 // A forwards packets between B and C.
 
 type BridgeConn struct {
+	TotalTraffic uint64
+
 	A net.Conn // internal pipe endpoint A
 	B net.Conn // internal pipe endpoint B (given to KCP)
 
 	mu sync.RWMutex
 	C  net.Conn // external forwarder, replaceable
 
-	TotalTraffic uint64
-	closed       chan struct{}
-	ErrCh        chan error
+	closed chan struct{}
+	ErrCh  chan error
 }
 
 // NewBridge creates A and B as connected UDP conns bound to random local addresses.

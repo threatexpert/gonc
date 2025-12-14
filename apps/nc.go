@@ -34,34 +34,40 @@ import (
 )
 
 var (
-	VERSION = "v2.4.0"
+	VERSION = "v2.4.1"
 )
 
 type AppNetcatConfig struct {
-	ConsoleMode bool
-	LogWriter   io.Writer
+	ConsoleMode                bool
+	LogWriter                  io.Writer
+	goroutineConnectionCounter int32
+
+	ctx                          context.Context
+	callback_OnConnectionDestroy func(localAddrStr, remoteAddrStr string)
 
 	network, host, port, p2pSessionKey string
+	connConfig                         *secure.NegotiationConfig
+	sessionReady                       bool
+	tlsVerifyCert                      bool
+	keepAlive                          int
 
-	connConfig                 *secure.NegotiationConfig
-	sessionReady               bool
-	goroutineConnectionCounter int32
-	tlsVerifyCert              bool
-	keepAlive                  int
-
-	app_mux_args      string
-	app_mux_Config    *AppMuxConfig
-	app_s5s_args      string
-	app_s5s_Config    *AppS5SConfig
-	arg_proxyc_Config *ProxyClientConfig
-	fallbackRelayMode bool
-	app_sh_args       string
-	app_sh_Config     *PtyShellConfig
-	app_nc_args       string
-	app_nc_Config     *AppNetcatConfig
-	app_tp_Config     *AppTPConfig
-	app_pr_args       string
-	app_pr_Config     *AppPortRotateConfig
+	app_mux_args          string
+	app_mux_Config        *AppMuxConfig
+	app_s5s_args          string
+	app_s5s_Config        *AppS5SConfig
+	arg_proxyc_Config     *ProxyClientConfig
+	fallbackRelayMode     bool
+	app_sh_args           string
+	app_sh_Config         *PtyShellConfig
+	app_nc_args           string
+	app_nc_Config         *AppNetcatConfig
+	app_tp_Config         *AppTPConfig
+	app_pr_args           string
+	app_pr_Config         *AppPortRotateConfig
+	app_br_args           string
+	app_br_Config         *AppBridgeConfig
+	app_httpserver_args   string
+	app_httpserver_Config *AppHttpServerConfig
 
 	accessControl *acl.ACL
 	term_oldstat  *term.State
@@ -106,6 +112,7 @@ type AppNetcatConfig struct {
 	useMutilPath      bool
 	useMQTTWait       bool
 	useMQTTHello      bool
+	MQTTHelloPayload  string
 	useIPv4           bool
 	useIPv6           bool
 	useDNS            string
@@ -115,21 +122,26 @@ type AppNetcatConfig struct {
 	appMuxListenMode  bool
 	appMuxListenOn    string
 	appMuxSocksMode   bool
+	appMuxLinkAgent   bool
+	runAppLink        string
 	fileACL           string
 	plainTransport    bool
 	framedStdio       bool
+	framedTCP         bool
 	p2pReportURL      string
 	featureModulesRun []string
 	Args              []string
 	natchecker        bool
 	httpdownload      bool
 	portRotate        bool
+	kcpBridgeMode     bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
 func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error) {
 	config := &AppNetcatConfig{
 		LogWriter: os.Stderr,
+		ctx:       context.Background(),
 	}
 
 	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
@@ -155,7 +167,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.StringVar(&config.tlsSNI, "sni", "", "specify TLS SNI")
 	fs.StringVar(&config.sslCertFile, "ssl-cert", "", "Specify SSL certificate file (PEM) for listening")
 	fs.StringVar(&config.sslKeyFile, "ssl-key", "", "Specify SSL private key (PEM) for listening")
-	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM); also key for TCP/KCP encryption")
+	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM) and for TCP/KCP encryption; when using -p2p, the P2P session key overrides this value.")
 	fs.BoolVar(&config.enableCRLF, "C", false, "enable CRLF")
 	fs.BoolVar(&config.listenMode, "l", false, "listen mode")
 	fs.BoolVar(&config.udpProtocol, "u", false, "use UDP protocol")
@@ -178,30 +190,36 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.BoolVar(&config.useIPv4, "4", false, "Forces to use IPv4 addresses only")
 	fs.BoolVar(&config.useIPv6, "6", false, "Forces to use IPv4 addresses only")
 	fs.StringVar(&config.useDNS, "dns", "", "set DNS Server")
-	fs.StringVar(&config.runAppFileServ, "httpserver", "", "http server root directory")
-	fs.StringVar(&config.runAppFileGet, "download", "", "Enable directory download; specifies the local path where the remote directory will be saved")
+	fs.StringVar(&config.runAppFileServ, "httpserver", "", "(mux tunnel mode)http server root directory")
+	fs.StringVar(&config.runAppFileGet, "download", "", "(mux tunnel mode)Enable directory download; specifies the local path where the remote directory will be saved")
 	fs.StringVar(&config.downloadSubPath, "download-subpath", "", "Remote directory to download (default: /); used together with -download")
-	fs.BoolVar(&config.appMuxListenMode, "httplocal", false, "local listen mode for remote httpserver")
-	fs.StringVar(&config.appMuxListenOn, "httplocal-port", "", "local listen port for remote httpserver")
-	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "for socks5 tunnel")
+	fs.BoolVar(&config.appMuxListenMode, "httplocal", false, "(mux tunnel mode)local listen mode for remote httpserver")
+	fs.StringVar(&config.appMuxListenOn, "httplocal-port", "", "(mux tunnel mode)local listen port for remote httpserver")
+	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "(mux tunnel mode)socks5 server")
+	fs.BoolVar(&config.appMuxLinkAgent, "linkagent", false, "(mux tunnel mode)dual proxy service")
+	fs.StringVar(&config.runAppLink, "link", "", "(mux tunnel mode)<L-Config>;<R-Config> (e.g. mux link 1080;1080)")
 	fs.BoolVar(&config.portRotate, "port-rotate", false, "enable port rotation feature")
+	fs.BoolVar(&config.kcpBridgeMode, "kcpbr", false, "kcp bridge mode")
 	fs.StringVar(&config.fileACL, "acl", "", "ACL file for inbound/outbound connections")
 	fs.BoolVar(&config.plainTransport, "plain", false, "use plain TCP/UDP without TLS/KCP/Encryption for P2P")
 	fs.BoolVar(&config.framedStdio, "framed", false, "stdin/stdout is framed stream (2 bytes length prefix for each frame)")
+	fs.BoolVar(&config.framedTCP, "framed-tcp", false, "tcp is framed stream (2 bytes length prefix for each frame)")
 	fs.BoolVar(&config.tlsVerifyCert, "verify", false, "verify TLS certificate (client mode only)")
 	fs.IntVar(&config.keepAlive, "keepalive", 0, "none 0 will enable keepalive feature")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
 	fs.BoolVar(&config.keepOpen, "k", false, "alias for -keep-open")
-	fs.BoolVar(&config.appMuxListenMode, "socks5local", false, "")
-	fs.StringVar(&config.appMuxListenOn, "socks5local-port", "", "")
+	fs.BoolVar(&config.appMuxListenMode, "socks5local", false, "(mux tunnel mode)local random port for remote socks5server")
+	fs.StringVar(&config.appMuxListenOn, "socks5local-port", "", "(mux tunnel mode)local listen port for remote socks5server")
 	fs.BoolVar(&config.appMuxListenMode, "browser", false, "alias for -httplocal")
 	fs.StringVar(&config.app_mux_args, ":mux", "-", "enable and config :mux for dynamic service")
 	fs.StringVar(&config.app_s5s_args, ":s5s", "-", "enable and config :s5s for dynamic service")
 	fs.StringVar(&config.app_sh_args, ":sh", "-", "enable and config :sh for dynamic service")
 	fs.StringVar(&config.app_nc_args, ":nc", "-", "enable and config :nc for dynamic service")
 	fs.StringVar(&config.app_pr_args, ":pr", "-", "enable and config :pr for dynamic service")
+	fs.StringVar(&config.app_br_args, ":br", "-", "enable and config :br for dynamic service")
+	fs.StringVar(&config.app_httpserver_args, ":httpserver", "-", "enable and config :httpserver for dynamic service")
 	fs.BoolVar(&config.natchecker, "nat-checker", false, "detect NAT type and public IP")
 	fs.BoolVar(&config.httpdownload, "http-download", false, "<localDir> <urlPath>; download from gonc's (-httplocal-port) HTTP service")
 
@@ -216,8 +234,11 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.IntVar(&easyp2p.PunchingRandomPortCount, "punch-random-count", easyp2p.PunchingRandomPortCount, "")
 	fs.IntVar(&secure.UdpOutputBlockSize, "udp-size", secure.UdpOutputBlockSize, "")
 	fs.IntVar(&secure.KcpWindowSize, "kcp-window-size", secure.KcpWindowSize, "")
+	fs.IntVar(&secure.KCPIdleTimeoutSecond, "kcp-timeout", secure.KCPIdleTimeoutSecond, "kcp idle timeout seconds (0 means no timeout)")
 	fs.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")
+	fs.IntVar(&secure.UDPIdleTimeoutSecond, "udp-timeout", secure.UDPIdleTimeoutSecond, "udp idle timeout seconds (0 means no timeout)")
 	fs.StringVar(&VarmuxEngine, "mux-engine", VarmuxEngine, "yamux | smux")
+	fs.IntVar(&VarMuxKeepAliveTimeout, "mux-timeout", VarMuxKeepAliveTimeout, "mux keepalive timeout seconds (0 means no timeout)")
 	//----->
 
 	fs.Usage = func() {
@@ -230,6 +251,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	if err != nil {
 		return nil, err // 解析错误直接返回
 	}
+	config.Args = fs.Args()
 
 	// 1. 初始化基本设置
 	firstInit(config)
@@ -248,8 +270,6 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 		usage_less(argv0)
 		os.Exit(1)
 	}
-
-	config.Args = fs.Args()
 
 	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
 	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(config)
@@ -315,8 +335,22 @@ func firstInit(ncconfig *AppNetcatConfig) {
 // configureAppMode 为内置应用程序设置命令参数
 func configureAppMode(ncconfig *AppNetcatConfig) {
 	if ncconfig.runAppFileServ != "" {
-		escapedPath := strings.ReplaceAll(ncconfig.runAppFileServ, "\\", "/")
-		ncconfig.runCmd = fmt.Sprintf(":mux httpserver \"%s\"", escapedPath)
+		//使用了-httpserver 的情况，获取多余的参数都当作根目录添加进去。
+		rootPaths := []string{ncconfig.runAppFileServ}
+		if len(ncconfig.Args) > 0 {
+			if ncconfig.autoP2P != "" || //P2P模式
+				(ncconfig.listenMode && ncconfig.localbind != "") || //监听模式，但使用了-local而不是使用多余参数作为监听地址
+				(!ncconfig.listenMode && ncconfig.remoteAddr != "") { //dial模式，但使用了-remote而不是使用多余参数作为dial目的地址
+				rootPaths = append(rootPaths, ncconfig.Args...)
+				ncconfig.Args = nil
+			}
+		}
+		ncconfig.runCmd = ":mux httpserver"
+		for _, p := range rootPaths {
+			escapedPath := strings.ReplaceAll(p, "\\", "/")
+			ncconfig.runCmd += fmt.Sprintf(" \"%s\"", escapedPath)
+		}
+
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
@@ -334,10 +368,17 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.keepOpen = true
 	} else if ncconfig.appMuxSocksMode {
 		ncconfig.runCmd = ":mux socks5"
-		if !ncconfig.useMQTTWait {
-			ncconfig.useMQTTWait = true
-		}
+		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
+		ncconfig.keepOpen = true
+	} else if ncconfig.appMuxLinkAgent {
+		ncconfig.runCmd = ":mux linkagent"
+		ncconfig.useMQTTWait = true
+		ncconfig.progressEnabled = true
+		ncconfig.keepOpen = true
+	} else if ncconfig.runAppLink != "" {
+		ncconfig.runCmd = ":mux link " + ncconfig.runAppLink
+		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
 	} else if ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "" {
 		if ncconfig.appMuxListenOn == "" {
@@ -357,7 +398,12 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 			ncconfig.app_mux_args = strings.TrimPrefix(ncconfig.runCmd, ":mux ")
 			ncconfig.runCmd = ":service"
 		} else {
-			fmt.Fprintf(os.Stderr, "-portrate and -e \":mux ...\"(socks5server/httpserver) must be used together\n")
+			fmt.Fprintf(os.Stderr, "-portrate and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
+			os.Exit(1)
+		}
+	} else if ncconfig.kcpBridgeMode {
+		if !strings.HasPrefix(ncconfig.runCmd, ":mux ") {
+			fmt.Fprintf(os.Stderr, "-kcpbr and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
 			os.Exit(1)
 		}
 	}
@@ -404,6 +450,20 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 				os.Exit(1)
 			}
 		}
+		if ncconfig.app_br_args != "-" {
+			err := preinitBuiltinAppConfig(ncconfig, ":br "+ncconfig.app_br_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
+		if ncconfig.app_httpserver_args != "-" {
+			err := preinitBuiltinAppConfig(ncconfig, ":httpserver "+ncconfig.app_br_args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				os.Exit(1)
+			}
+		}
 	}
 
 	xcommandline := ncconfig.proxyAddr
@@ -424,6 +484,9 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 	}
 	if ncconfig.httpdownload {
 		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "http-download")
+	}
+	if ncconfig.kcpBridgeMode {
+		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "kcp-bridge")
 	}
 }
 
@@ -931,6 +994,11 @@ func runFeatureModules(console net.Conn, ncconfig *AppNetcatConfig) int {
 			if ret != 0 {
 				return ret
 			}
+		case "kcp-bridge":
+			ret = runKCPBridge(console, ncconfig)
+			if ret != 0 {
+				return ret
+			}
 		default:
 			fmt.Fprintf(os.Stderr, "Unknown feature module: %s\n", module)
 			return 1
@@ -987,14 +1055,258 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 	networksToTryStun := []string{"tcp6", "tcp4", "udp6", "udp4"}
 
-	fmt.Fprintf(os.Stderr, "=== Checking NAT Address Info ===\n")
+	fmt.Fprintf(os.Stderr, "STUN Results (Local -> NAT -> STUNServer)\n")
+	fmt.Fprintf(os.Stderr, "-----------\n")
 
-	Addresses, allSTUNResults, _ := easyp2p.DetectNATAddressInfo(networksToTryStun, ncconfig.localbind, nil, ncconfig.LogWriter)
+	Addresses, allSTUNResults, err := easyp2p.DetectNATAddressInfo(networksToTryStun, ncconfig.localbind, nil, io.Discard)
 	if len(allSTUNResults) > 0 && len(Addresses) > 0 {
+		for _, r := range allSTUNResults {
+			srv := strings.TrimPrefix(easyp2p.STUNServers[r.Index], "udp://")
+			srv = strings.TrimPrefix(srv, "tcp://")
+			if r.Err != nil {
+				fmt.Fprintf(os.Stderr, "%s://%s\t(failed)\n", r.Network, srv)
+			}
+		}
+
+		succeeded := 0
+		for _, r := range allSTUNResults {
+			srv := strings.TrimPrefix(easyp2p.STUNServers[r.Index], "udp://")
+			srv = strings.TrimPrefix(srv, "tcp://")
+			if r.Err == nil {
+				succeeded += 1
+				fmt.Fprintf(os.Stderr, "%s://%s\n", r.Network, srv)
+				fmt.Fprintf(os.Stderr, "    %s -> %s -> %s\n", r.Local, r.Nat, r.Remote)
+			}
+		}
+
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "NAT Summary (%d STUN servers, %d answers)\n", len(easyp2p.STUNServers), succeeded)
+		fmt.Fprintf(os.Stderr, "-----------\n")
+
+		for _, info := range Addresses {
+			net := info.Network
+			nattype := info.NatType
+			lan := info.Lan
+			nat := info.Nat
+			if lan == nat {
+				fmt.Fprintf(os.Stderr, "%-5s: %s (%s)\n", net, nat, nattype)
+			} else {
+				fmt.Fprintf(os.Stderr, "%-5s: LAN=%s | NAT=%s (%s)\n", net, lan, nat, nattype)
+			}
+		}
+
 		return 0
+	} else {
+		fmt.Fprintf(os.Stderr, "failed: %v\n", err)
 	}
 
 	return 1
+}
+
+func getUDPFreePort(network, localip string) (string, string, error) {
+	udpAddr, _ := net.ResolveUDPAddr(network, net.JoinHostPort(localip, "0"))
+	udpConn, err := net.ListenUDP(network, udpAddr)
+	if err != nil {
+		return "", "", err
+	}
+	host, port, err := net.SplitHostPort(udpConn.LocalAddr().String())
+	defer udpConn.Close()
+	return host, port, err
+}
+
+func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
+
+	if ncconfig.p2pSessionKey == "" {
+		fmt.Fprintf(os.Stderr, "-kcpbr must be used with -p2p <sessionkey>\n")
+		return 1
+	}
+
+	MUX_timeout := 120
+	KCP_timeout := 120
+	UDP_timeout := 41
+	TCP_timeout := 30
+
+	if VarMuxKeepAliveTimeout == DefaultVarMuxKeepAliveTimeout {
+		VarMuxKeepAliveTimeout = MUX_timeout
+	}
+	if secure.KCPIdleTimeoutSecond == secure.DefaultKCPIdleTimeoutSecond {
+		secure.KCPIdleTimeoutSecond = KCP_timeout
+	}
+	if secure.UDPIdleTimeoutSecond == secure.DefaultUDPIdleTimeoutSecond {
+		secure.UDPIdleTimeoutSecond = UDP_timeout
+	}
+	if ncconfig.keepAlive == 0 {
+		ncconfig.keepAlive = TCP_timeout
+	}
+
+	ctx, cancel := context.WithCancel(ncconfig.ctx)
+	defer cancel()
+	done := make(chan int, 2)
+
+	if ncconfig.useMQTTWait {
+		//server(remote) side:
+		//       gonc -p2p xxxxxxxx -linkagent -kcpbr  ( -e ":mux linkagent" -mqtt-wait )
+		//nc1. runListenMode -kcp -e "{ncconfig.runCmd}" -l 127.0.0.1 port1
+		//nc2. runP2PMode -e ":br -u -framed local port1" -plain -tls -mqtt-wait -framed -framed-tcp
+		var err error
+		nc1 := *ncconfig
+		nc1.ctx = ctx
+		//nc1.runCmd 一样
+		nc1.listenMode = true
+		nc1.p2pSessionKey = ""
+		nc1.featureModulesRun = nil
+		nc1.kcpBridgeMode = false
+		nc1.kcpEnabled = true
+		nc1.kcpSEnabled = true
+		nc1.udpProtocol = true
+		nc1.framedStdio = false
+		nc1.framedTCP = false
+		nc1.keepAlive = 0
+		nc1.Args = nil
+		nc1.network = "udp4"
+		nc1.host, nc1.port, err = getUDPFreePort(nc1.network, "127.0.0.1")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting free udp port: %v\n", err)
+			return 1
+		}
+		disableTLS(&nc1)
+		nc1.presharedKey = ""
+		nc1.connConfig = preinitNegotiationConfig(&nc1)
+
+		nc1.callback_OnConnectionDestroy = func(localAddrStr, remoteAddrStr string) {
+			found := brDialSessKickByConnAddr(
+				remoteAddrStr, // 注意：反过来
+				localAddrStr,
+			)
+			fmt.Fprintf(os.Stderr, "Connection Destroying(%s-%s)..., kick bridge result=%v\n", localAddrStr, remoteAddrStr, found)
+		}
+
+		go func() {
+			done <- runListenMode(console, &nc1, nc1.network, nc1.host, nc1.port)
+		}()
+
+		time.Sleep(1 * time.Second)
+
+		nc2 := *ncconfig
+		nc2.ctx = ctx
+		nc2.listenMode = false
+		nc2.kcpBridgeMode = false
+		nc2.featureModulesRun = nil
+		nc2.runCmd = fmt.Sprintf(":br -u -framed 127.0.0.1 %s", nc1.port)
+		nc2.plainTransport = true
+		nc2.kcpEnabled = false
+		nc2.kcpSEnabled = false
+		nc2.framedStdio = true
+		nc2.framedTCP = true
+		nc2.keepAlive = ncconfig.keepAlive
+		err = preinitBuiltinAppConfig(&nc2, nc2.runCmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 1
+		}
+		nc2.connConfig = preinitNegotiationConfig(&nc2)
+		nc2.connConfig.UDPIdleTimeoutSecond = 41
+
+		go func() {
+			done <- runP2PMode(console, &nc2)
+		}()
+
+		ret := <-done
+		cancel()
+		return ret
+	} else if ncconfig.useMQTTHello {
+		//Local side:
+		//       gonc -p2p xxxxxxxx -link 1080,1081 -kcpbr  ( -e ":mux link 1080,1081" -mqtt-hello )
+		//nc2. runListenMode -e ":br -p2p xxxxx -mqtt-hello -keepalive 30 -framed -framed-tcp -plain -tls" -k -framed -u -l 127.0.0.1 port2
+		//nc1. runDialMode -kcp -e "{ncconfig.runCmd}" 127.0.0.1 port2
+
+		var err error
+		nc2 := *ncconfig
+		nc2.ctx = ctx
+		nc2.kcpBridgeMode = false
+		nc2.featureModulesRun = nil
+		nc2.runCmd = fmt.Sprintf(":br -p2p \"%s\" -mqtt-hello -keepalive %d -framed -framed-tcp -plain",
+			ncconfig.p2pSessionKey, ncconfig.keepAlive)
+		if isTLSEnabled(ncconfig) {
+			nc2.runCmd += " -tls"
+		}
+		if ncconfig.udpProtocol {
+			nc2.runCmd += " -u"
+		}
+		nc2.listenMode = true
+		nc2.udpProtocol = true
+		nc2.framedStdio = true
+		nc2.kcpEnabled = false
+		nc2.kcpSEnabled = false
+		nc2.autoP2P = ""
+		nc2.p2pSessionKey = ""
+		nc2.network = "udp4"
+		nc2.host, nc2.port, err = getUDPFreePort(nc2.network, "127.0.0.1")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting free udp port: %v\n", err)
+			return 1
+		}
+		disableTLS(&nc2)
+		nc2.presharedKey = ""
+		nc2.keepAlive = ncconfig.keepAlive
+		nc2.connConfig = preinitNegotiationConfig(&nc2)
+		err = preinitBuiltinAppConfig(&nc2, nc2.runCmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 1
+		}
+
+		go func() {
+			done <- runListenMode(console, &nc2, nc2.network, nc2.host, nc2.port)
+		}()
+		time.Sleep(1 * time.Second)
+
+		nc1 := nc2
+		nc1.listenMode = false
+		nc1.framedStdio = false
+		nc1.kcpEnabled = true
+		nc1.kcpSEnabled = false
+		nc1.keepAlive = ncconfig.keepAlive
+		nc1.connConfig = preinitNegotiationConfig(&nc1)
+		nc1.runCmd = ncconfig.runCmd
+		err = preinitBuiltinAppConfig(&nc2, nc1.runCmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 1
+		}
+		nc1.callback_OnConnectionDestroy = func(localAddrStr, remoteAddrStr string) {
+			brAcceptSessKickByConnAddr(
+				remoteAddrStr, // 注意：反过来
+				localAddrStr,
+			)
+		}
+
+		go func() {
+			for {
+				ret := runDialMode(console, &nc1, nc1.network, nc1.host, nc1.port)
+				if !nc1.keepOpen {
+					done <- ret
+					return
+				}
+
+				fmt.Fprintf(os.Stderr, "Will retry in 10 seconds...\n")
+				select {
+				case <-time.After(10 * time.Second):
+					// sleep 完成
+				case <-ctx.Done():
+					// 被提前取消
+					done <- 1
+				}
+			}
+		}()
+
+		ret := <-done
+		cancel()
+		return ret
+	} else {
+		fmt.Fprintf(os.Stderr, "-kcpbr must be used with -mqtt-hello or -mqtt-wait\n")
+		return 1
+	}
 }
 
 func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
@@ -1051,6 +1363,15 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 
 func isTLSEnabled(ncconfig *AppNetcatConfig) bool {
 	return ncconfig.tlsServerMode || ncconfig.tlsEnabled || ncconfig.tls10_forced || ncconfig.tls11_forced || ncconfig.tls12_forced || ncconfig.tls13_forced
+}
+
+func disableTLS(ncconfig *AppNetcatConfig) {
+	ncconfig.tlsEnabled = false
+	ncconfig.tlsServerMode = false
+	ncconfig.tls10_forced = false
+	ncconfig.tls11_forced = false
+	ncconfig.tls12_forced = false
+	ncconfig.tls13_forced = false
 }
 
 func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressStats, done chan bool, wg *sync.WaitGroup) {
@@ -1122,6 +1443,7 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":nc", "netcat")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":sh", "pseudo-terminal shell")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":tp", "transparent proxy")
+	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":httpserver", "HTTP file server")
 	fmt.Fprintf(os.Stderr, "  %-6s %s\n", ":service", "dynamic service mode, clients can use -call to invoke the above configured and enabled services.")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "To get help for a built-in command, run:")
@@ -1186,6 +1508,14 @@ func conflictCheck(ncconfig *AppNetcatConfig) {
 		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
 		os.Exit(1)
 	}
+	if ncconfig.kcpBridgeMode && ncconfig.portRotate {
+		fmt.Fprintf(os.Stderr, "-kcpbr and -port-rotate cannot be used together")
+		os.Exit(1)
+	}
+	if ncconfig.kcpBridgeMode && ncconfig.autoP2P == "" {
+		fmt.Fprintf(os.Stderr, "-kcpbr and -p2p must be used together")
+		os.Exit(1)
+	}
 }
 
 func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) error {
@@ -1224,6 +1554,10 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		ncconfig.app_tp_Config, err = AppTPConfigByArgs(args[1:])
 	case ":pr":
 		ncconfig.app_pr_Config, err = AppPortRotateConfigByArgs(args[1:])
+	case ":br":
+		ncconfig.app_br_Config, err = AppBridgeConfigByArgs(args[1:])
+	case ":httpserver":
+		ncconfig.app_httpserver_Config, err = AppHttpServerConfigByArgs(args[1:])
 	case ":service":
 	default:
 		if strings.HasPrefix(builtinApp, ":") {
@@ -1244,7 +1578,7 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 }
 
 // 用于在数据传输时显示进度
-func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64) {
+func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64) error {
 	bufsize := blocksize
 	if bufsize < 32*1024 {
 		bufsize = 32 * 1024 // reader 缓冲区更大，提高吞吐
@@ -1284,6 +1618,7 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 		_, err = dst.Write(buf[:n])
 		if err != nil {
 			//fmt.Fprintf(ncconfig.LogWriter, "Write error: %v\n", err)
+			err1 = err
 			break
 		}
 
@@ -1296,6 +1631,7 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 			break
 		}
 	}
+	return err1
 }
 
 func copyCharDeviceWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, stats *misc.ProgressStats) {
@@ -1385,6 +1721,8 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 		} else if config.Key != "" {
 			config.SecureLayer = "ss"
 		}
+
+		config.FramedTCP = ncconfig.framedTCP
 	}
 
 	return config
@@ -1395,6 +1733,14 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	atomic.AddInt32(&ncconfig.goroutineConnectionCounter, 1)
 
 	defer nconn.Close()
+
+	localAddrStr := nconn.LocalAddr().String()
+	remoteAddrStr := nconn.RemoteAddr().String()
+	defer func() {
+		if ncconfig.callback_OnConnectionDestroy != nil {
+			ncconfig.callback_OnConnectionDestroy(localAddrStr, remoteAddrStr)
+		}
+	}()
 
 	if !ncconfig.sessionReady {
 		stats_in.ResetStart()
@@ -1472,7 +1818,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	serviceCommand := strings.TrimSpace(ncconfig.runCmd)
 	if serviceCommand == ":service" {
 		nconn.SetDeadline(time.Now().Add(15 * time.Second))
-		line, err := ReadString(nconn, '\n')
+		line, err := netx.ReadString(nconn, '\n', 1024)
 		if err != nil {
 			fmt.Fprintf(ncconfig.LogWriter, "Error ReadString: %v\n", err)
 			return 1
@@ -1565,6 +1911,26 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_PortRotate_main_withconfig(pipeConn, nconn.Config, ncconfig, ncconfig.app_pr_Config)
+		} else if builtinApp == ":br" {
+			if ncconfig.app_br_Config == nil {
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go App_Bridge_main_withconfig(pipeConn, nconn.MQTTHelloPayload, ncconfig, ncconfig.app_br_Config)
+		} else if builtinApp == ":httpserver" {
+			if ncconfig.app_httpserver_Config == nil {
+				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
+				return 1
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go App_HttpServer_main_withconfig(pipeConn, ncconfig.app_httpserver_Config)
 		} else if strings.HasPrefix(builtinApp, ":") {
 			fmt.Fprintf(ncconfig.LogWriter, "Invalid service command: %s\n", builtinApp)
 			return 1
@@ -1741,7 +2107,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 	if ncconfig.useMQTTWait {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MqttWait(ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
+		salt, err = easyp2p.MqttWait(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-wait: %v", err)
 		}
@@ -1749,7 +2115,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MQTTHello(ncconfig.p2pSessionKey, ncconfig.localbindIP, 15*time.Second, ncconfig.LogWriter)
+		salt, err = easyp2p.MQTTHello(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-hello: %v", err)
 		}
@@ -1768,6 +2134,28 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 
 	ReportP2PStatus(ncconfig, topicSalt, "connecting", ncconfig.network, "", "")
 
+	helloPayload := ""
+	if ncconfig.useMQTTWait && !ncconfig.useMQTTHello {
+		//Wait模式，如果对方hello的载荷是bridge类型，则提前验证session是否接受，免得浪费资源建立连接
+		helloPrefix := ""
+		parts := strings.Split(topicSalt, "|")
+		if len(parts) >= 2 {
+			helloPayload = parts[1]
+			parts2 := strings.Split(helloPayload, "::")
+			if len(parts2) == 2 {
+				helloPrefix = parts2[0]
+			}
+		}
+
+		switch helloPrefix {
+		case "br":
+			if !Bridge_IsP2PHelloAllowed(helloPayload) {
+				ReportP2PStatus(ncconfig, topicSalt, "error:bridge session not found", ncconfig.network, "", "")
+				return nil, fmt.Errorf("bridge session not found: %s", helloPayload)
+			}
+		}
+	}
+
 	var relayConn *easyp2p.RelayPacketConn
 	socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
 	if err != nil {
@@ -1783,7 +2171,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 
 	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-	connInfo, err := easyp2p.Easy_P2P_MP(ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
 	if err != nil {
 		if relayConn != nil {
 			relayConn.Close()
@@ -1796,6 +2184,11 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	config := *ncconfig.connConfig
 	if ncconfig.plainTransport {
 		config.IsClient = connInfo.IsClient
+		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+			if strings.HasPrefix(config.SecureLayer, "tls") {
+				config.SecureLayer = "dtls"
+			}
+		}
 	} else {
 		config.Key = ncconfig.p2pSessionKey
 		config.KeyType = "PSK"
@@ -1844,6 +2237,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			preOnClose()
 		}
 	}
+	nconn.MQTTHelloPayload = helloPayload
 	return nconn, nil
 }
 

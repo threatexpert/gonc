@@ -3,11 +3,11 @@ package apps
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -346,7 +346,7 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, trans
 
 	tunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
 	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
-	responseLine, err := ReadString(tunnelStream, '\n')
+	responseLine, err := netx.ReadString(tunnelStream, '\n', 1024)
 	if err != nil {
 		log.Printf("%s->%s error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
 		if !transparent {
@@ -375,7 +375,115 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, trans
 	}
 	tunnelStream.SetReadDeadline(time.Time{})
 
-	handleProxy(clientConn, tunnelStream)
+	bidirectionalCopy(clientConn, tunnelStream)
+	return nil
+}
+
+func handleHTTPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int) error {
+	// 发送代理请求给远端: "tcp://target_host:target_port\n"
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
+	_, err := tunnelStream.Write([]byte(requestLine))
+	if err != nil {
+		// 发送失败，告诉 HTTP 客户端网关错误
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("write tunnel request error: %w", err)
+	}
+	log.Printf("HTTP-CONNECT: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+
+	tunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
+	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
+	responseLine, err := netx.ReadString(tunnelStream, '\n', 1024)
+	if err != nil {
+		log.Printf("%s->%s tunnel read error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("read tunnel response error: %w", err)
+	}
+	responseLine = strings.TrimSpace(responseLine)
+
+	if !strings.HasPrefix(responseLine, "OK") {
+		log.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("tunnel handshake failed: %s", responseLine)
+	}
+
+	// 4. 告诉 HTTP 客户端连接已建立 (关键步骤)
+	// 浏览器收到这个 200 后，就会开始发送 TLS 握手包或原始 TCP 数据
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		return fmt.Errorf("send 200 OK failed: %w", err)
+	}
+	tunnelStream.SetReadDeadline(time.Time{})
+
+	bidirectionalCopy(clientConn, tunnelStream)
+	return nil
+}
+
+func handleHTTPRequestViaTunnel(clientConn net.Conn, req *http.Request, tunnelConn net.Conn, targetHost string, targetPort int) error {
+
+	bufTunnelStream := netx.NewBufferedConn(tunnelConn)
+
+	// 发送代理请求给远端: "tcp://target_host:target_port\n"
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
+	_, err := bufTunnelStream.Write([]byte(requestLine))
+	if err != nil {
+		// 发送失败，告诉 HTTP 客户端网关错误
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("write tunnel request error: %w", err)
+	}
+	log.Printf("HTTP-REQ: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+
+	bufTunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
+	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
+	responseLine, err := bufTunnelStream.Reader.ReadString('\n')
+	if err != nil {
+		log.Printf("%s->%s tunnel read error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("read tunnel response error: %w", err)
+	}
+	responseLine = strings.TrimSpace(responseLine)
+
+	if !strings.HasPrefix(responseLine, "OK") {
+		log.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("tunnel handshake failed: %s", responseLine)
+	}
+
+	req.Close = true
+	req.Header.Set("Connection", "close")
+	req.Header.Set("Proxy-Connection", "close")
+
+	// 7. 删除逐跳头部
+	delHopHeaders(req.Header)
+
+	// req.Write 会处理 Method, URL, Headers 和 Body 的写入
+	if err := req.Write(bufTunnelStream); err != nil {
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("write request to tunnel failed: %w", err)
+	}
+
+	resp, err := http.ReadResponse(bufTunnelStream.Reader, req)
+	if err != nil {
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return fmt.Errorf("read response from tunnel failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 9. 响应回写给客户端
+	delHopHeaders(resp.Header)
+
+	// 强制告诉客户端关闭连接
+	resp.Header.Set("Connection", "close")
+	resp.Close = true
+
+	bufTunnelStream.SetReadDeadline(time.Time{})
+
+	err = resp.Write(clientConn)
+	if err != nil {
+		return fmt.Errorf("write response failed: %w", err)
+	}
+
 	return nil
 }
 
@@ -421,7 +529,7 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 	}
 
 	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
-	responseLine, err := ReadString(tunnelStream, '\n')
+	responseLine, err := netx.ReadString(tunnelStream, '\n', 1024)
 	if err != nil {
 		return fmt.Errorf("read tunnel response error: %w", err)
 	}
@@ -660,7 +768,7 @@ func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort i
 		return fmt.Errorf("tunnel TCP connect failed: %v", err)
 	}
 	sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
-	handleProxy(clientConn, targetConn)
+	bidirectionalCopy(clientConn, targetConn)
 	return nil
 }
 
@@ -751,108 +859,120 @@ func handleTCPListen(clientConn net.Conn, serverIP string, targetHost string, ta
 	if err != nil {
 		return fmt.Errorf("send response error: %w", err)
 	}
-	handleProxy(clientConn, conn)
+	bidirectionalCopy(clientConn, conn)
 	return nil
 }
 
-func handleSocks5uProxy(conn net.Conn, stream net.Conn, cmd string, targetHost string, targetPort int) {
+func ServeProxyOnTunnel(conn net.Conn, stream net.Conn, cmd string, targetHost string, targetPort int) {
+	/*
+		conn 是本地应用接入的客户端连接
+		stream 是通过mux申请下来的一个channel
+		1、先通过 conn 完成代理握手和请求，得到客户端要代理的目的地址和端口；支持socks5（TCP/UDP）和HTTP代理
+		2、将代理请求封装为自定义的代理协议格式 "tcp://target_host:target_port\n" 通过stream发送请求到远端
+		3、等待stream反馈连接结果，再将结果反馈给 conn
+	*/
 	log.Printf("New client connected from %s", conn.RemoteAddr())
 	var err error
+	var httpreq *http.Request
 
 	if cmd == "" {
 		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 
-		// 1. SOCKS5 握手
-		configNoAuth := Socks5ServerConfig{
-			AuthenticateUser: nil, // 不要求认证
-		}
-		err = handleSocks5Handshake(conn, configNoAuth)
+		bufConn := netx.NewBufferedConn(conn)
+		head, err := bufConn.Reader.Peek(1)
 		if err != nil {
-			log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+			log.Printf("Peek from %s error : %v", conn.RemoteAddr(), err)
+			return
+		} else if len(head) == 0 {
 			return
 		}
 
-		// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
-		req, err := handleSocks5Request(conn)
-		if err != nil {
-			log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
-			return
-		}
+		// 判断协议并分流
+		switch head[0] {
+		case 0x05:
+			// 1. SOCKS5 握手
+			configNoAuth := Socks5ServerConfig{
+				AuthenticateUser: nil, // 不要求认证
+			}
+			err = handleSocks5Handshake(bufConn, configNoAuth)
+			if err != nil {
+				log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+				return
+			}
 
+			// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
+			req, err := handleSocks5Request(bufConn)
+			if err != nil {
+				log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
+				return
+			}
+
+			cmd = req.Command
+			targetHost, targetPort = req.Host, req.Port
+			conn = bufConn
+		default:
+			req, err := handleHTTPProxyHandShake(bufConn, "", "")
+			if err != nil {
+				log.Printf("HTTP handshake failed for %s: %v", conn.RemoteAddr(), err)
+				return
+			}
+			if req.Method == http.MethodConnect {
+				cmd = "HTTP-CONNECT"
+				// 提取 Host 和 Port
+				host, portStr, err := net.SplitHostPort(req.Host)
+				if err != nil {
+					// 如果只有域名没有端口，默认 443
+					host = req.Host
+					portStr = "443"
+				}
+				targetHost = host
+				targetPort, _ = strconv.Atoi(portStr)
+			} else {
+				// 普通 HTTP 请求 (GET http://example.com/...)
+				cmd = "HTTP-REQ"
+
+				// 规范化 URL
+				if req.URL.Scheme == "" {
+					req.URL.Scheme = "http"
+				}
+				if req.URL.Host == "" {
+					req.URL.Host = req.Host
+				}
+
+				targetHost = req.URL.Hostname()
+				targetPortStr := req.URL.Port()
+				if targetPortStr == "" {
+					targetPortStr = "80"
+				}
+				targetPort, _ = strconv.Atoi(targetPortStr)
+				httpreq = req
+			}
+			conn = bufConn
+		}
 		conn.SetReadDeadline(time.Time{})
-		cmd = req.Command
-		targetHost, targetPort = req.Host, req.Port
 	}
 
 	switch cmd {
 	case "CONNECT", "T-CONNECT":
 		transparent := cmd == "T-CONNECT"
 		err = handleTCPConnectViaTunnel(conn, stream, transparent, targetHost, targetPort)
-		if err != nil {
-			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
-			return
-		}
+	case "HTTP-CONNECT":
+		err = handleHTTPConnectViaTunnel(conn, stream, targetHost, targetPort)
+	case "HTTP-REQ":
+		err = handleHTTPRequestViaTunnel(conn, httpreq, stream, targetHost, targetPort)
 	case "UDP":
 		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, "", targetHost, targetPort)
-		if err != nil {
-			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
-			return
-		}
+	default:
+		log.Printf("Unsupported command: %s, from client %s ", cmd, conn.RemoteAddr())
+		return
 	}
 
-	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), cmd)
-}
-
-func ReadString(conn io.Reader, delim byte) (string, error) {
-	var buf []byte
-	tmp := make([]byte, 1)
-
-	for {
-		n, err := conn.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[0])
-			if tmp[0] == delim {
-				return string(buf), nil
-			}
-		}
-
-		if err != nil {
-			if errors.Is(err, io.EOF) && len(buf) > 0 {
-				return string(buf), nil
-			}
-			return "", err
-		}
-	}
-}
-
-// handleSocks5uModeForRemote 是远端服务器的入口函数
-// 它将负责接收 MuxSession 连接，并接受和处理 Stream
-func handleSocks5uModeForRemote(cfg MuxSessionConfig) error {
-	// 假设 cfg.SessionConn 是远端服务器接受的原始连接
-	// 例如：rawConn, err := listener.Accept()
-	// session, err := smux.Server(rawConn, nil) // 创建服务器端的 smux 会话
-	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, true) // isServer=true
 	if err != nil {
-		return fmt.Errorf("create mux session failed: %v", err)
-	}
-
-	log.Printf("SOCKS5 tunnel server ready on mux session.")
-
-	listener := &muxListener{session}
-
-	// 循环接受新的 mux 流
-	for {
-		// Accept() 阻塞直到有新的客户端流到来
-		stream, err := listener.Accept()
-		if err != nil {
-			if err == io.EOF {
-				log.Println("Mux session closed. Exiting stream acceptance loop.")
-				return nil
-			}
-			log.Printf("Failed to accept mux stream: %v", err)
-			return err
-		}
-		go handleSocks5ClientOnStream(stream, "", cfg.AccessCtrl) // 为每个新流启动一个 goroutine 处理
+		log.Printf("Proxy session %s->%s (%s) finished with error: %v",
+			conn.RemoteAddr(), targetHost, cmd, err)
+	} else {
+		log.Printf("Proxy session %s->%s (%s) finished.",
+			conn.RemoteAddr(), targetHost, cmd)
 	}
 }
 
@@ -861,7 +981,7 @@ func handleSocks5ClientOnStream(tunnelStream net.Conn, localbind string, accessC
 	defer tunnelStream.Close()
 
 	// 读取流的第一个请求行
-	requestLine, err := ReadString(tunnelStream, '\n')
+	requestLine, err := netx.ReadString(tunnelStream, '\n', 1024)
 	if err != nil {
 		log.Printf("Failed to read request line from mux stream: %v", err)
 		return
@@ -932,7 +1052,7 @@ func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string, localbind 
 		return
 	}
 	// 双向数据转发：隧道流 <-> 目标连接
-	handleProxy(targetConn, tunnelStream)
+	bidirectionalCopy(targetConn, tunnelStream)
 	log.Printf("TCP relay for %s ended.", targetAddr)
 }
 

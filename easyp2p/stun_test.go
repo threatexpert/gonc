@@ -44,7 +44,11 @@ func TestStunN(t *testing.T) {
 	for _, r := range allResults {
 		srv := strings.TrimPrefix(STUNServers[r.Index], "udp://")
 		srv = strings.TrimPrefix(srv, "tcp://")
-		fmt.Printf("StunServer: %s://%s\n", r.Network, srv)
+		if r.Remote != "" {
+			fmt.Printf("StunServer: %s://%s (%s)\n", r.Network, srv, r.Remote)
+		} else {
+			fmt.Printf("StunServer: %s://%s\n", r.Network, srv)
+		}
 		if r.Err == nil {
 			fmt.Printf("    Local IP: %s, NAT IP: %s\n", r.Local, r.Nat)
 		}

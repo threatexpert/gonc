@@ -150,8 +150,8 @@ func dialUDPRace(ctx context.Context, network, host string, ports []string, dial
 
 // RaceConn 是 UDP 竞速专用包装器
 type RaceConn struct {
+	winnerIndex int32 // 原子操作: -1 未定, >=0 为赢家索引
 	conns       []net.Conn
-	winnerIndex int32           // 原子操作: -1 未定, >=0 为赢家索引
 	readCh      chan readResult // 读取数据汇聚通道
 	closeOnce   sync.Once
 	ctx         context.Context

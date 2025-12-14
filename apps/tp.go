@@ -101,7 +101,7 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 		return
 	}
 
-	handleProxy(conn, targetConn)
+	bidirectionalCopy(conn, targetConn)
 }
 
 func IsValidABC0IP(ipStr string) bool {

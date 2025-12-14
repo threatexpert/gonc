@@ -7,10 +7,10 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/threatexpert/gonc/v2/acl"
+	"github.com/threatexpert/gonc/v2/netx"
 )
 
 type AppS5SConfig struct {
@@ -22,6 +22,8 @@ type AppS5SConfig struct {
 	Localbind     string
 	ServerIP      string
 	AccessCtrl    *acl.ACL
+	EnableSocks5  bool
+	EnableHTTP    bool
 }
 
 // AppS5SConfigByArgs 解析给定的 []string 参数，生成 AppS5SConfig
@@ -36,6 +38,8 @@ func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 	fs.BoolVar(&config.EnableConnect, "c", true, "Allow SOCKS5 CONNECT command")
 	fs.BoolVar(&config.EnableBind, "b", false, "Allow SOCKS5 BIND command")
 	fs.BoolVar(&config.EnableUDP, "u", false, "Allow SOCKS5 UDP ASSOCIATE command")
+	fs.BoolVar(&config.EnableSocks5, "socks5", true, "Enable SOCKS5-PROXY")
+	fs.BoolVar(&config.EnableHTTP, "http", false, "Enable HTTP-PROXY")
 	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip)")
 	fs.StringVar(&config.ServerIP, "server-ip", "", "BIND/UDP ASSOCIATE uses this as server IP (format: ip)")
 
@@ -80,64 +84,29 @@ func App_s5s_usage_flagSet(fs *flag.FlagSet) {
 func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig) {
 	defer conn.Close()
 
-	s5config := Socks5ServerConfig{
-		AuthenticateUser: nil,
-	}
-	if config.Username != "" || config.Password != "" {
-		s5config.AuthenticateUser = func(username, password string) bool {
-			return username == config.Username && password == config.Password
-		}
-	}
-	log.Printf("New client connected from %s", conn.RemoteAddr())
+	conn.SetReadDeadline(time.Now().Add(25 * time.Second))
 
-	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-
-	// 1. SOCKS5 握手
-	err := handleSocks5Handshake(conn, s5config)
+	bufConn := netx.NewBufferedConn(conn)
+	head, err := bufConn.Reader.Peek(1)
 	if err != nil {
-		log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+		log.Printf("Peek from %s error : %v", conn.RemoteAddr(), err)
+		return
+	} else if len(head) == 0 {
 		return
 	}
 
-	// 2. SOCKS5 请求 (TCP CONNECT 、BIND 或 UDP ASSOCIATE)
-	req, err := handleSocks5Request(conn)
-	if err != nil {
-		log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-
-	conn.SetReadDeadline(time.Time{})
-
-	if req.Command == "CONNECT" && config.EnableConnect {
-		err = handleDirectTCPConnect(conn, req.Host, req.Port, config.Localbind, config.AccessCtrl)
-		if err != nil {
-			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
+	// 判断协议并分流
+	if head[0] == 0x05 {
+		if !config.EnableSocks5 {
+			log.Printf("Denied %s, SOCKS5 proxy is disabled.", conn.RemoteAddr())
+			return
 		}
-	} else if req.Command == "BIND" && config.EnableBind {
-		err = handleTCPListen(conn, config.ServerIP, req.Host, req.Port)
-		if err != nil {
-			log.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
-		}
-	} else if req.Command == "UDP" && config.EnableUDP {
-		fakeTunnelC, fakeTunnelS := net.Pipe()
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func(c net.Conn) {
-			defer wg.Done()
-			defer c.Close()
-			handleSocks5ClientOnStream(c, config.Localbind, config.AccessCtrl)
-		}(fakeTunnelS)
-
-		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, fakeTunnelC, config.ServerIP, req.Host, req.Port)
-		if err != nil {
-			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
-		}
-		fakeTunnelC.Close()
-		fakeTunnelS.Close()
-		wg.Wait()
+		handleSocks5Proxy(bufConn, keyingMaterial, config)
 	} else {
-		sendSocks5Response(conn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
+		if !config.EnableHTTP {
+			log.Printf("Denied %s, HTTP proxy is disabled.", conn.RemoteAddr())
+			return
+		}
+		handleHTTPProxy(bufConn, config)
 	}
-
-	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
 }

@@ -27,6 +27,7 @@ type NegotiationConfig struct {
 	InsecureSkipVerify        bool
 	KcpWithUDP                bool
 	KcpEncryption             bool //是否开启kcp加密
+	FramedTCP                 bool
 	Key                       string
 	KeyType                   string // ECDHE or PSK
 	ErrorOnFailKeyingMaterial bool   //如果keyingMaterial异常，协商要报错
@@ -38,12 +39,15 @@ type NegotiationConfig struct {
 	UDPIdleTimeoutSecond      int
 }
 
+const DefaultKCPIdleTimeoutSecond = 41
+const DefaultUDPIdleTimeoutSecond = 60 * 5
+
 var (
 	UdpOutputBlockSize   int    = 1320
 	KcpWindowSize        int    = 1500
 	UdpKeepAlivePayload  string = "ping\n"
-	KCPIdleTimeoutSecond int    = 41
-	UDPIdleTimeoutSecond int    = 60 * 5
+	KCPIdleTimeoutSecond int    = DefaultKCPIdleTimeoutSecond
+	UDPIdleTimeoutSecond int    = DefaultUDPIdleTimeoutSecond
 )
 
 func NewNegotiationConfig() *NegotiationConfig {
@@ -58,15 +62,17 @@ func NewNegotiationConfig() *NegotiationConfig {
 }
 
 type NegotiatedConn struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	Config         *NegotiationConfig
-	KeyingMaterial [32]byte
-	TopLayer       net.Conn
-	ConnStack      []string
-	ConnLayers     []net.Conn
-	IsUDP          bool
-	OnClose        func()
+	ctx              context.Context
+	cancel           context.CancelFunc
+	Config           *NegotiationConfig
+	KeyingMaterial   [32]byte
+	TopLayer         net.Conn
+	ConnStack        []string
+	ConnLayers       []net.Conn
+	IsUDP            bool
+	IsFramed         bool
+	MQTTHelloPayload string
+	OnClose          func()
 }
 
 func (nconn *NegotiatedConn) Close() error {
@@ -230,9 +236,18 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				}
 
 				buconn := netx.NewBoundUDPConn(pktconn, nconn.ConnLayers[0].RemoteAddr().String(), false)
-				buconn.SetIdleTimeout(time.Duration(cfg.UDPIdleTimeoutSecond) * time.Second)
+				if cfg.UDPIdleTimeoutSecond != 0 {
+					buconn.SetIdleTimeout(time.Duration(cfg.UDPIdleTimeoutSecond) * time.Second)
+				}
 				nconn.ConnLayers = append([]net.Conn{buconn}, nconn.ConnLayers...)
 			}
+		}
+	} else {
+		if cfg.FramedTCP {
+			framedConn := netx.NewFramedConn(nconn.ConnLayers[0], nconn.ConnLayers[0])
+			nconn.ConnLayers = append([]net.Conn{framedConn}, nconn.ConnLayers...)
+			connStack = append(connStack, "framed")
+			nconn.IsFramed = true
 		}
 	}
 
@@ -485,7 +500,9 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	pktconn := netx.NewPacketConnWrapper(conn, conn.RemoteAddr())
 	startUDPKeepAlive(ctx, pktconn, conn.RemoteAddr(), []byte(config.UdpKeepAlivePayload), 2*time.Second, intervalChange)
 	buconn := netx.NewBoundUDPConn(pktconn, conn.RemoteAddr().String(), false)
-	buconn.SetIdleTimeout(time.Duration(config.KCPIdleTimeoutSecond) * time.Second)
+	if config.KCPIdleTimeoutSecond > 0 {
+		buconn.SetIdleTimeout(time.Duration(config.KCPIdleTimeoutSecond) * time.Second)
+	}
 
 	if !config.IsClient {
 		if blockCrypt == nil {
@@ -555,11 +572,12 @@ func configTCPKeepalive(conn net.Conn, keepAlive int) {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			ka := net.KeepAliveConfig{
 				Enable:   true,
-				Idle:     time.Duration(keepAlive) * time.Second, // 空闲多久后开始探测
-				Count:    9,                                      // 最多发几次探测包
-				Interval: time.Duration(keepAlive) * time.Second, // 探测包之间的间隔
+				Idle:     time.Duration(1+keepAlive/2) * time.Second, // 空闲多久后开始探测
+				Count:    1 + (keepAlive / 2 / 5),                    // 最多发几次探测包
+				Interval: 5 * time.Second,                            // 探测包之间的间隔
 			}
 			tcpConn.SetKeepAliveConfig(ka)
+
 		}
 	}
 }
@@ -573,6 +591,7 @@ func configUDPConn(conn net.Conn) {
 }
 
 func startUDPKeepAlive(ctx context.Context, conn net.PacketConn, raddr net.Addr, data []byte, initInterval time.Duration, intervalChange <-chan time.Duration) {
+
 	go func() {
 		keepAliveInterval := initInterval
 		ticker := time.NewTicker(keepAliveInterval)

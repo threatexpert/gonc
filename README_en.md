@@ -34,9 +34,11 @@ README in [English](./README_en.md) and [中文](./README.md)
     ![hole-punching](./hole-punching.gif)
 
 ### P2P Tunnel and HTTP File Server
-- Both sides agree on the same passphrase. On the file-sending side, run the following command to start an HTTP file server. The last argument c:/RootDir is the directory containing the files to be sent:
+- Both sides agree on the same passphrase.
+On the sender side, start an HTTP file server to expose the files or directories to be shared. The -httpserver option accepts multiple paths, each of which can be either a single file or a directory:
+
     ```bash
-    gonc -p2p passphrase -httpserver c:/RootDir
+    gonc -p2p <passphrase> -httpserver c:/RootDir1 c:/RootDir2
     ```
 - On the receiving side, there are two options:
 
@@ -122,14 +124,16 @@ README in [English](./README_en.md) and [中文](./README.md)
     gonc -P -l 1234 > NUL
     ```
 
-### P2P Tunnel and Socks5 Proxy
+### P2P Tunnel and SOCKS5 / HTTP Proxy
 - Wait for the tunnel to be established:
     ```bash
-    gonc -p2p passphrase -socks5server
+    gonc -p2p passphrase -linkagent
     ```
-- On the other side, expose a local SOCKS5 service on port 3080:
+- On the other side, start a local SOCKS5 / HTTP proxy service on port 3080 to access the remote network:
     ```bash
-    gonc -p2p passphrase -socks5local-port 3080
+    # The link option controls how the local and remote proxy endpoints are created.
+    # Use none to indicate that no listening port is opened on that side:
+    gonc -p2p passphrase -link 3080;none
     ```
 
     Next, for example, if you want to connect to 10.0.0.1:3389 in the remote network, you can simply enter the following address in your local Remote Desktop client:
@@ -139,6 +143,27 @@ README in [English](./README_en.md) and [中文](./README.md)
     ```
 
     This domain will be resolved into an IP in the form of 127.b.c.d. As a result, the Remote Desktop client will connect to the local SOCKS5 proxy on port 3080, and then gonc will reverse-parse the 127.b.c.d address to extract the information 10.0.0.1-3389 from the domain name.
+
+- link Configuration Format
+    ```bash
+    # Based on the established tunnel, both local and remote sides listen on port 1080.
+    # The proxy supports both HTTP and SOCKS5 protocols, with transparent proxy capability enabled.
+    gonc -p2p <passphrase> -link 1080;1080
+
+    # The left side x://0.0.0.0:1080?tproxy=1 is equivalent to simply writing 1080.
+    # The right side enables port 1080 on the remote host, without transparent proxy support.
+    gonc -p2p <passphrase> -link x://0.0.0.0:1080?tproxy=1;x://127.0.0.1:1080
+
+    # The left side f://127.0.0.1:1080?to=1.2.3.4:80
+    # means listening locally on port 1080 and forwarding traffic to 1.2.3.4:80 on the remote side.
+    # The right side 'none' indicates that no port is opened remotely.
+    gonc -p2p <passphrase> -link f://127.0.0.1:1080?to=1.2.3.4:80;none
+
+    # The right side f://0.0.0.0:80?to=127.0.0.1:80
+    # means listening on port 80 on the remote side and forwarding traffic back to 127.0.0.1:80 locally.
+    gonc -p2p <passphrase> -link none;f://0.0.0.0:80?to=127.0.0.1:80
+    ```
+
 
 ### Flexible Service Configuration
 - Use `-exec` to flexibly configure the application to provide services for each connection. For example, instead of specifying `/bin/bash` for shell commands, it can also be used for port forwarding. However, the following example starts a new `gonc` process for each connection:
