@@ -863,7 +863,7 @@ func handleTCPListen(clientConn net.Conn, serverIP string, targetHost string, ta
 	return nil
 }
 
-func ServeProxyOnTunnel(conn net.Conn, stream net.Conn, cmd string, targetHost string, targetPort int) {
+func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn, cmd, username, password, targetHost string, targetPort int) {
 	/*
 		conn 是本地应用接入的客户端连接
 		stream 是通过mux申请下来的一个channel
@@ -891,10 +891,15 @@ func ServeProxyOnTunnel(conn net.Conn, stream net.Conn, cmd string, targetHost s
 		switch head[0] {
 		case 0x05:
 			// 1. SOCKS5 握手
-			configNoAuth := Socks5ServerConfig{
-				AuthenticateUser: nil, // 不要求认证
+			s5config := Socks5ServerConfig{
+				AuthenticateUser: nil,
 			}
-			err = handleSocks5Handshake(bufConn, configNoAuth)
+			if username != "" || password != "" {
+				s5config.AuthenticateUser = func(u, p string) bool {
+					return u == username && p == password
+				}
+			}
+			err = handleSocks5Handshake(bufConn, s5config)
 			if err != nil {
 				log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
 				return
@@ -911,7 +916,7 @@ func ServeProxyOnTunnel(conn net.Conn, stream net.Conn, cmd string, targetHost s
 			targetHost, targetPort = req.Host, req.Port
 			conn = bufConn
 		default:
-			req, err := handleHTTPProxyHandShake(bufConn, "", "")
+			req, err := handleHTTPProxyHandShake(bufConn, username, password)
 			if err != nil {
 				log.Printf("HTTP handshake failed for %s: %v", conn.RemoteAddr(), err)
 				return
@@ -961,7 +966,7 @@ func ServeProxyOnTunnel(conn net.Conn, stream net.Conn, cmd string, targetHost s
 	case "HTTP-REQ":
 		err = handleHTTPRequestViaTunnel(conn, httpreq, stream, targetHost, targetPort)
 	case "UDP":
-		err = handleUDPAssociateViaTunnel(conn, [32]byte{}, stream, "", targetHost, targetPort)
+		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, stream, "", targetHost, targetPort)
 	default:
 		log.Printf("Unsupported command: %s, from client %s ", cmd, conn.RemoteAddr())
 		return

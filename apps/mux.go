@@ -3,6 +3,7 @@ package apps
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/threatexpert/gonc/v2/httpfileshare"
 	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
+	"github.com/threatexpert/gonc/v2/secure"
 	"github.com/xtaci/smux"
 )
 
@@ -298,16 +300,51 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 	if conf == "none" {
 		return "none", "", nil, nil
 	}
+
 	u, err := url.Parse(conf)
 	if err != nil {
 		return "", "", nil, err
 	}
-	// "x" -> socks5/dynamic, "f" -> forward, "raw" -> raw bridge (internal use)
-	scheme := u.Scheme
-	if scheme != "x" && scheme != "f" && scheme != "raw" {
-		return "", "", nil, fmt.Errorf("unknown scheme '%s', use x:// or f://", scheme)
+
+	rawScheme := u.Scheme
+	baseScheme := rawScheme
+	useTLS := false
+
+	// 支持 x+tls / f+tls / raw+tls
+	if strings.Contains(rawScheme, "+") {
+		parts := strings.Split(rawScheme, "+")
+		baseScheme = parts[0]
+		for _, p := range parts[1:] {
+			if p == "tls" {
+				useTLS = true
+			} else {
+				return "", "", nil, fmt.Errorf("unknown scheme modifier '+%s'", p)
+			}
+		}
 	}
-	return scheme, u.Host, u.Query(), nil
+
+	// "x" -> socks5/dynamic
+	// "f" -> forward
+	// "raw" -> raw bridge (internal use)
+	if baseScheme != "x" && baseScheme != "f" && baseScheme != "raw" {
+		return "", "", nil, fmt.Errorf("unknown scheme '%s', use x:// or f://", baseScheme)
+	}
+
+	user := u.User.Username()
+	pass, _ := u.User.Password()
+	if pass == "" {
+		pass = ""
+	}
+
+	q := u.Query()
+	q.Set("_user", user)
+	q.Set("_password", pass)
+
+	if useTLS {
+		q.Set("_tls", "1")
+	}
+
+	return baseScheme, u.Host, q, nil
 }
 
 // runLinkListener 通用的监听器，用于 L 端和 R 端
@@ -319,16 +356,44 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, params
 	targetHost := ""
 	targetPort := 0
 	forwardTarget := ""
+	username := ""
+	password := ""
+	useTLS := false
+	var ntconfig *secure.NegotiationConfig
+	var cert *tls.Certificate
+	var err error
+	var keyingMaterial [32]byte
 
 	actualListenAddr := ln.Addr().String()
 	_, actualListenPort, _ := net.SplitHostPort(actualListenAddr)
-
+	if params.Get("_tls") == "1" {
+		useTLS = true
+		ntconfig = secure.NewNegotiationConfig()
+		ntconfig.Label = "[link-tls]"
+		ntconfig.IsClient = false
+		ntconfig.SecureLayer = "tls"
+		ntconfig.KeepAlive = 0
+		sslCertFile := params.Get("cert")
+		sslKeyFile := params.Get("key")
+		if len(sslCertFile) > 0 && len(sslKeyFile) > 0 {
+			cert, err = secure.LoadCertificate(sslCertFile, sslKeyFile)
+		} else {
+			cert, err = secure.GenerateECDSACertificate("link-tls", "")
+		}
+		if err != nil {
+			return fmt.Errorf("failed to load/generate TLS certificate: %v", err)
+		}
+		ntconfig.Certs = []tls.Certificate{*cert}
+	}
 	// 解析配置
 	switch scheme {
 	case "x":
 		if params.Get("tproxy") == "1" {
 			useTProxy = true
 		}
+		username = params.Get("_user")
+		password = params.Get("_password")
+
 		log.Printf("[link-x] Listening on %s (TProxy=%v)\n", ln.Addr().String(), useTProxy)
 		if useTProxy {
 			donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
@@ -390,6 +455,17 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, params
 			}
 		}
 
+		if useTLS {
+			nconn, err := secure.DoNegotiation(ntconfig, conn, io.Discard)
+			if err != nil {
+				log.Println("[link-x] TLS negotiation failed:", err)
+				conn.Close()
+				continue
+			}
+			copy(keyingMaterial[:], nconn.KeyingMaterial[:])
+			conn = nconn
+		}
+
 		go func(c net.Conn) {
 			defer c.Close()
 			stream, err := openMuxStream(session)
@@ -425,7 +501,7 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, params
 				}
 			}
 
-			ServeProxyOnTunnel(c, streamWithCloseWrite, cmd, tHost, tPort)
+			ServeProxyOnTunnel(c, keyingMaterial, streamWithCloseWrite, cmd, username, password, tHost, tPort)
 		}(conn)
 	}
 }
