@@ -150,18 +150,22 @@ On the sender side, start an HTTP file server to expose the files or directories
     # The proxy supports both HTTP and SOCKS5 protocols, with transparent proxy capability enabled.
     gonc -p2p <passphrase> -link 1080;1080
 
+    # Below is the configuration method for the URL format. The parameter value of -link must be enclosed in quotes; otherwise, parsing problems may occur.
     # The left side x://0.0.0.0:1080?tproxy=1 is equivalent to simply writing 1080.
     # The right side enables port 1080 on the remote host, without transparent proxy support.
-    gonc -p2p <passphrase> -link x://0.0.0.0:1080?tproxy=1;x://127.0.0.1:1080
+    gonc -p2p <passphrase> -link "x://0.0.0.0:1080?tproxy=1;x://127.0.0.1:1080"
 
     # The left side f://127.0.0.1:1080?to=1.2.3.4:80
     # means listening locally on port 1080 and forwarding traffic to 1.2.3.4:80 on the remote side.
     # The right side 'none' indicates that no port is opened remotely.
-    gonc -p2p <passphrase> -link f://127.0.0.1:1080?to=1.2.3.4:80;none
+    gonc -p2p <passphrase> -link "f://127.0.0.1:1080?to=1.2.3.4:80;none"
 
     # The right side f://0.0.0.0:80?to=127.0.0.1:80
     # means listening on port 80 on the remote side and forwarding traffic back to 127.0.0.1:80 locally.
-    gonc -p2p <passphrase> -link none;f://0.0.0.0:80?to=127.0.0.1:80
+    gonc -p2p <passphrase> -link "none;f://0.0.0.0:80?to=127.0.0.1:80"
+
+    # The left side x+tls means the proxy protocol with TLS encryption and allows for certificate configuration. The right side specifies the outbound IP address via `outbound_bind` (suitable for multi-IP environments).
+    gonc -p2p <口令> -link "x+tls://user:pass@0.0.0.0:1080?cert=ca.pem&key=key.pem;none?outbound_bind=10.0.0.5"
     ```
 
 
