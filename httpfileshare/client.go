@@ -501,7 +501,16 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	default:
 	}
 
-	proposedLocalPath := filepath.Join(c.config.LocalDir, filepath.FromSlash(fileInfo.Path))
+	proposedLocalPath := ""
+	if fileInfo.Path == "/" && !fileInfo.IsDir {
+		// Special case: server only serves a root file, other than directory
+		if fileInfo.Name == "" {
+			return fmt.Errorf("invalid file info: root path with empty name and not a directory")
+		}
+		proposedLocalPath = filepath.Join(c.config.LocalDir, filepath.FromSlash(fileInfo.Name))
+	} else {
+		proposedLocalPath = filepath.Join(c.config.LocalDir, filepath.FromSlash(fileInfo.Path))
+	}
 	cleanedLocalPath := filepath.Clean(proposedLocalPath)
 
 	if !strings.HasPrefix(cleanedLocalPath, c.absLocalDownloadRoot) {
