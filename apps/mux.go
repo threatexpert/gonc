@@ -296,9 +296,27 @@ func handleMuxSession(cfg MuxSessionConfig) error {
 // -----------------------------------------------------------------------------
 
 // parseLinkConfig 解析单个 Link 配置 (L 或 R)
+// 修改说明: 确保 params 始终不为 nil，支持 none?param=val 格式
 func parseLinkConfig(conf string) (string, string, url.Values, error) {
+	// 创建一个空的 Values，防止返回 nil 导致调用方 .Get() panic
+	safeParams := make(url.Values)
+
 	if conf == "none" {
-		return "none", "", nil, nil
+		return "none", "", safeParams, nil
+	}
+
+	// 支持 "none?outbound_bind=x.x.x.x" 这种写法
+	if strings.HasPrefix(conf, "none?") {
+		parts := strings.SplitN(conf, "?", 2)
+		if len(parts) == 2 {
+			q, err := url.ParseQuery(parts[1])
+			if err != nil {
+				return "", "", nil, fmt.Errorf("invalid none query: %v", err)
+			}
+			return "none", "", q, nil
+		}
+		// 只有 none? 但没有参数
+		return "none", "", safeParams, nil
 	}
 
 	u, err := url.Parse(conf)
@@ -326,7 +344,8 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 	// "x" -> socks5/dynamic
 	// "f" -> forward
 	// "raw" -> raw bridge (internal use)
-	if baseScheme != "x" && baseScheme != "f" && baseScheme != "raw" {
+	// "none" -> no operation (but might carry params)
+	if baseScheme != "x" && baseScheme != "f" && baseScheme != "raw" && baseScheme != "none" {
 		return "", "", nil, fmt.Errorf("unknown scheme '%s', use x:// or f://", baseScheme)
 	}
 
@@ -441,8 +460,22 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 		ln.Close()
 	}()
 
-	handleConn := func(c net.Conn, keying [32]byte, magicIP string) {
+	handleConn := func(c net.Conn, magicIP string) {
+		// tls处理
+		var keyingMaterial [32]byte
+		if rtConfig.UseTLS {
+			nconn, err := secure.DoNegotiation(rtConfig.NtConfig, c, io.Discard)
+			if err != nil {
+				log.Println("[link-x] TLS negotiation failed:", err)
+				c.Close()
+				return
+			}
+			copy(keyingMaterial[:], nconn.KeyingMaterial[:])
+			c = nconn
+		}
+
 		defer c.Close()
+
 		stream, err := openMuxStream(session)
 		if err != nil {
 			log.Println("mux Open failed:", err)
@@ -474,7 +507,7 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 			}
 		}
 
-		ServeProxyOnTunnel(c, keying, streamWithCloseWrite, cmd, rtConfig.Username, rtConfig.Password, tHost, tPort)
+		ServeProxyOnTunnel(c, keyingMaterial, streamWithCloseWrite, cmd, rtConfig.Username, rtConfig.Password, tHost, tPort)
 	}
 
 	for {
@@ -502,30 +535,24 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 			}
 		}
 
-		// 握手处理
-		var keyingMaterial [32]byte
-		if rtConfig.UseTLS {
-			nconn, err := secure.DoNegotiation(rtConfig.NtConfig, conn, io.Discard)
-			if err != nil {
-				log.Println("[link-x] TLS negotiation failed:", err)
-				conn.Close()
-				continue
-			}
-			copy(keyingMaterial[:], nconn.KeyingMaterial[:])
-			conn = nconn
-		}
-
-		go handleConn(conn, keyingMaterial, localMagicTargetIP)
+		go handleConn(conn, localMagicTargetIP)
 	}
 }
 
 // runLinkSessionWithHandshake 提取的公共逻辑：握手 -> 建Session -> 启动业务
 // 此函数假定 Hello 已经被读取并确认为 "linkagent"
 func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf string) error {
+	// 提前解析 Local Config，以便正确设置 localActive
+	lScheme, lHost, lParams, err := parseLinkConfig(lConf)
+	if err != nil {
+		return fmt.Errorf("local config parse error: %v", err)
+	}
+
 	// 1. 发送 R 配置给远端
 	// LocalActive 表示本地有业务，远端可以发送流过来
+	// 注意：如果 lConf 是 "none?outbound_bind=..."，Scheme 也是 "none"，
 	localActive := "0"
-	if lConf != "none" {
+	if lScheme != "none" {
 		localActive = "1"
 	}
 
@@ -568,19 +595,13 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 	}
 
 	// 4. 启动 Session 监控 (兼任 AcceptLoop)
-	remoteActive := (rConf != "none")
+	remoteActive := !strings.HasPrefix(rConf, "none")
 	sessionDone := make(chan struct{})
 	go func() {
 		// 如果 remoteActive 为 false，说明单向模式，这里设置为 drainOnly=true
-		startRemoteStreamAcceptLoop(session, cfg.AccessCtrl, !remoteActive)
+		startRemoteStreamAcceptLoop(session, lParams.Get("outbound_bind"), cfg.AccessCtrl, !remoteActive)
 		close(sessionDone)
 	}()
-
-	// Local 侧的逻辑
-	lScheme, lHost, lParams, err := parseLinkConfig(lConf)
-	if err != nil {
-		return fmt.Errorf("local config parse error: %v", err)
-	}
 
 	if lScheme != "none" {
 		enableTProxy := (lScheme == "x" && lParams.Get("tproxy") == "1")
@@ -674,7 +695,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	// 单向模式：drainOnly = true
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, cfg.AccessCtrl, true)
+		startRemoteStreamAcceptLoop(session, "", cfg.AccessCtrl, true)
 		close(sessionDone)
 	}()
 
@@ -742,7 +763,7 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		if strings.Contains(rConf, "peer_active=1") {
 			peerActive = true
 		}
-		rConf = "none"
+		// 这里不能直接设为 "none"，否则会丢失可能的参数(如 outbound_bind)
 	} else {
 		u, err := url.Parse(rConf)
 		if err == nil {
@@ -812,7 +833,7 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 	// 6. 启动 Session 监控
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, cfg.AccessCtrl, !peerActive)
+		startRemoteStreamAcceptLoop(session, rParams.Get("outbound_bind"), cfg.AccessCtrl, !peerActive)
 		close(sessionDone)
 	}()
 
@@ -873,7 +894,7 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 }
 
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
-func startRemoteStreamAcceptLoop(session interface{}, accessCtrl *acl.ACL, drainOnly bool) error {
+func startRemoteStreamAcceptLoop(session interface{}, localbind string, accessCtrl *acl.ACL, drainOnly bool) error {
 	listener := &muxListener{session}
 	for {
 		stream, err := listener.Accept()
@@ -889,7 +910,7 @@ func startRemoteStreamAcceptLoop(session interface{}, accessCtrl *acl.ACL, drain
 			continue
 		}
 
-		go handleSocks5ClientOnStream(stream, "", accessCtrl)
+		go handleSocks5ClientOnStream(stream, localbind, accessCtrl)
 	}
 }
 
@@ -959,7 +980,7 @@ func handleSocks5uMode(cfg MuxSessionConfig) error {
 	}
 
 	log.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
-	err = startRemoteStreamAcceptLoop(session, cfg.AccessCtrl, false)
+	err = startRemoteStreamAcceptLoop(session, "", cfg.AccessCtrl, false)
 	log.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
 	return err
 }
