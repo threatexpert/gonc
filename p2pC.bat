@@ -14,7 +14,7 @@ if "%~1"=="" (
 echo ________________________________
 echo Running command at %TIME%
 
-gonc.exe -p2p "@%~1" -socks5local-port 3888
+gonc.exe -p2p "@%~1" -link 3888
 
 timeout /t 10 >nul
 goto loop
