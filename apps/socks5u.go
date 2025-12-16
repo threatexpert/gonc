@@ -206,7 +206,7 @@ func handleSocks5Handshake(conn net.Conn, config Socks5ServerConfig) error {
 
 // handleSocks5Request 处理 SOCKS5 请求阶段
 func handleSocks5Request(clientConn net.Conn) (*Socks5Request, error) {
-	buf := make([]byte, 256)
+	buf := make([]byte, 300)
 
 	_, err := io.ReadFull(clientConn, buf[:4])
 	if err != nil {
@@ -1430,7 +1430,7 @@ func sendSocks5RequestHeader(conn net.Conn, cmd byte, host string, port int) ([]
 
 // readSocks5Response 读取并解析 SOCKS5 响应
 func readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
-	resp := make([]byte, 256)             // Sufficient for standard response
+	resp := make([]byte, 300)             // Sufficient for standard response
 	_, err := io.ReadFull(conn, resp[:4]) // Read VER, REP, RSV, ATYP
 	if err != nil {
 		return nil, fmt.Errorf("read SOCKS5 response header error: %w", err)
@@ -1455,12 +1455,23 @@ func readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
 		}
 		bndIP = net.IPv4(resp[offset], resp[offset+1], resp[offset+2], resp[offset+3])
 		offset += 4
+
 	case ATYP_DOMAINNAME: // For BND.ADDR, server typically returns IP, but protocol allows domain
 		_, err := io.ReadFull(conn, resp[offset:offset+1])
 		if err != nil {
 			return nil, fmt.Errorf("read BND.ADDR (domain length) error: %w", err)
 		}
 		domainLen := int(resp[offset])
+		if domainLen <= 0 || domainLen > 255 {
+			return nil, fmt.Errorf("invalid domain length: %d", domainLen)
+		}
+		// 检查剩余空间，如果不足则扩容
+		requiredSize := offset + 1 + domainLen + 2 // +2 是为了预留给后面的 Port
+		if requiredSize > len(resp) {
+			newResp := make([]byte, requiredSize)
+			copy(newResp, resp)
+			resp = newResp
+		}
 		_, err = io.ReadFull(conn, resp[offset+1:offset+1+domainLen])
 		if err != nil {
 			return nil, fmt.Errorf("read BND.ADDR (domain) error: %w", err)
@@ -1470,6 +1481,7 @@ func readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
 			log.Printf("Warning: SOCKS5 server returned domain for BND.ADDR: %s. Proceeding with best effort.", string(resp[offset+1:offset+1+domainLen]))
 		}
 		offset += 1 + domainLen
+
 	case ATYP_IPV6:
 		_, err := io.ReadFull(conn, resp[offset:offset+16])
 		if err != nil {

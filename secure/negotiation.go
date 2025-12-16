@@ -528,6 +528,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	_, err = sess.Write(handshake)
 	if err != nil {
 		fmt.Fprintf(logWriter, "send handshake failed: %v\n", err)
+		sess.Close()
 		return nil
 	}
 
@@ -538,6 +539,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	n, err := io.ReadFull(sess, buf)
 	if err != nil || n != len(handshake) || !bytes.Equal(buf, handshake) {
 		fmt.Fprintf(logWriter, "recv handshake failed: %v\n", err)
+		sess.Close()
 		return nil
 	}
 	fmt.Fprintf(logWriter, "completed.\n")
