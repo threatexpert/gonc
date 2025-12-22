@@ -306,7 +306,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 	netLower := strings.ToLower(network)
 	isIPv6 := strings.HasSuffix(netLower, "6")
 	netProto := "udp"
-	var UDPDialer *netx.UDPCustomDialer
+	var UDPDialer *netx.UDPSessionDialer
 	if strings.HasPrefix(netLower, "tcp") {
 		netProto = "tcp"
 	} else {
@@ -325,7 +325,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 		}
 
 		logDiscard := log.New(io.Discard, "", log.LstdFlags|log.Lshortfile)
-		UDPDialer, err = netx.NewUDPCustomDialer(basedUDPConn, false, 4096, logDiscard)
+		UDPDialer, err = netx.NewUDPSessionDialer(basedUDPConn, false, 4096, logDiscard)
 		if err != nil {
 			return nil, err
 		}

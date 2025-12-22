@@ -760,9 +760,9 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	fmt.Fprintf(ncconfig.LogWriter, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 	logDiscard := log.New(io.Discard, "", log.LstdFlags)
-	usessListener, err := netx.NewUDPCustomListener(uconn, 65535, logDiscard)
+	usessListener, err := netx.NewUDPSessionListener(uconn, 65535, logDiscard)
 	if err != nil {
-		fmt.Fprintf(ncconfig.LogWriter, "Error NewUDPCustomListener: %v\n", err)
+		fmt.Fprintf(ncconfig.LogWriter, "Error NewUDPSessionListener: %v\n", err)
 		return 1
 	}
 	defer usessListener.Close()
@@ -779,7 +779,7 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			newSess, err := usessListener.Accept()
 			if err != nil {
 				if err == net.ErrClosed {
-					fmt.Fprintf(ncconfig.LogWriter, "UDPCustomListener accept failed: %v\n", err)
+					fmt.Fprintf(ncconfig.LogWriter, "UDPSessionListener accept failed: %v\n", err)
 					return 1
 				}
 				continue
@@ -795,7 +795,7 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	} else {
 		newSess, err := usessListener.Accept()
 		if err != nil {
-			fmt.Fprintf(ncconfig.LogWriter, "UDPCustomListener accept failed: %v\n", err)
+			fmt.Fprintf(ncconfig.LogWriter, "UDPSessionListener accept failed: %v\n", err)
 			return 1
 		}
 		if !acl.ACL_inbound_allow(ncconfig.accessControl, newSess.RemoteAddr()) {
