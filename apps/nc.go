@@ -91,6 +91,7 @@ type AppNetcatConfig struct {
 	sslCertFile       string
 	sslKeyFile        string
 	presharedKey      string
+	autoPSK           bool
 	enableCRLF        bool
 	listenMode        bool
 	udpProtocol       bool
@@ -168,6 +169,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.StringVar(&config.sslCertFile, "ssl-cert", "", "Specify SSL certificate file (PEM) for listening")
 	fs.StringVar(&config.sslKeyFile, "ssl-key", "", "Specify SSL private key (PEM) for listening")
 	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM) and for TCP/KCP encryption; when using -p2p, the P2P session key overrides this value.")
+	fs.BoolVar(&config.autoPSK, "auto-psk", false, "Use MQTT/ECDHE to automatically derive shared encryption key")
 	fs.BoolVar(&config.enableCRLF, "C", false, "enable CRLF")
 	fs.BoolVar(&config.listenMode, "l", false, "listen mode")
 	fs.BoolVar(&config.udpProtocol, "u", false, "use UDP protocol")
@@ -1509,8 +1511,8 @@ func conflictCheck(ncconfig *AppNetcatConfig) {
 		fmt.Fprintf(os.Stderr, "-l and (-remote -p2p) cannot be used together\n")
 		os.Exit(1)
 	}
-	if ncconfig.presharedKey != "" && (ncconfig.tlsRSACertEnabled || (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "")) {
-		fmt.Fprintf(os.Stderr, "-psk and (-tlsrsa -ssl-cert -ssl-key) cannot be used together\n")
+	if ncconfig.presharedKey != "" && (ncconfig.tlsRSACertEnabled || (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") || ncconfig.autoPSK) {
+		fmt.Fprintf(os.Stderr, "-psk and (-tlsrsa -ssl-cert -ssl-key -auto-psk) cannot be used together\n")
 		os.Exit(1)
 	}
 	if ncconfig.useIPv4 && ncconfig.useIPv6 {
@@ -1543,6 +1545,10 @@ func conflictCheck(ncconfig *AppNetcatConfig) {
 	}
 	if ncconfig.kcpBridgeMode && ncconfig.autoP2P == "" {
 		fmt.Fprintf(os.Stderr, "-kcpbr and -p2p must be used together")
+		os.Exit(1)
+	}
+	if ncconfig.autoPSK && ncconfig.autoP2P == "" {
+		fmt.Fprintf(os.Stderr, "-auto-psk and -p2p must be used together")
 		os.Exit(1)
 	}
 }
@@ -1723,15 +1729,17 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 	if ncconfig.presharedKey != "" {
 		config.KeyType = "PSK"
 		config.Key = ncconfig.presharedKey
+	} else if ncconfig.autoPSK {
+		config.KeyType = "ECDHE"
 	}
 
 	if ncconfig.udpProtocol {
 		config.KcpWithUDP = isKCPEnabled(ncconfig)
 		if isTLSEnabled(ncconfig) {
 			config.SecureLayer = "dtls"
-		} else if config.KcpWithUDP && config.Key != "" {
+		} else if config.KcpWithUDP && (config.Key != "" || ncconfig.autoPSK) {
 			config.KcpEncryption = true
-		} else if config.Key != "" {
+		} else if config.Key != "" || ncconfig.autoPSK {
 			config.SecureLayer = "dss"
 		}
 	} else {
@@ -1747,7 +1755,7 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 			} else {
 				config.SecureLayer = "tls"
 			}
-		} else if config.Key != "" {
+		} else if config.Key != "" || ncconfig.autoPSK {
 			config.SecureLayer = "ss"
 		}
 
@@ -2217,6 +2225,10 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			if strings.HasPrefix(config.SecureLayer, "tls") {
 				config.SecureLayer = "dtls"
 			}
+		}
+		if ncconfig.autoPSK {
+			config.Key = string(connInfo.SharedKey[:])
+			config.KeyType = "ECDHE"
 		}
 	} else {
 		config.Key = ncconfig.p2pSessionKey
