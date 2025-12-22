@@ -1237,6 +1237,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		}
 		nc2.connConfig = preinitNegotiationConfig(&nc2)
 		nc2.connConfig.UDPIdleTimeoutSecond = 41
+		nc2.progressEnabled = false
 
 		go func() {
 			done <- runP2PMode(console, &nc2)
@@ -1286,6 +1287,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			return 1
 		}
+		nc2.progressEnabled = false
 
 		go func() {
 			done <- runListenMode(console, &nc2, nc2.network, nc2.host, nc2.port)
@@ -1311,6 +1313,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 				localAddrStr,
 			)
 		}
+		nc1.progressEnabled = ncconfig.progressEnabled
 
 		go func() {
 			for {
