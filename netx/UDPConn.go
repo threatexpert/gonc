@@ -16,6 +16,7 @@ import (
 type BoundUDPConn struct {
 	conn           net.PacketConn
 	connmu         sync.Mutex
+	supportRebuild bool
 	remoteAddr     net.Addr
 	keepOpen       bool
 	closeChan      chan struct{}
@@ -72,17 +73,30 @@ func (b *BoundUDPConn) GetLastPacketRemoteAddr() string {
 	return b.lastPacketAddr
 }
 
-func (b *BoundUDPConn) Rebuild() (*net.UDPConn, error) {
-	localAddr := b.LocalAddr().(*net.UDPAddr)
-	nw := localAddr.Network()
+func (b *BoundUDPConn) SetSupportRebuild(support bool) {
+	b.supportRebuild = support
+}
 
+func (b *BoundUDPConn) Rebuild() (*net.UDPConn, error) {
 	b.connmu.Lock()
 	defer b.connmu.Unlock()
 
+	if b.conn == nil {
+		return nil, fmt.Errorf("connection is nil, cannot rebuild")
+	}
+
+	localAddr := b.conn.LocalAddr().(*net.UDPAddr)
+	nw := localAddr.Network()
+
 	b.conn.Close()
+
 	c, e := net.ListenUDP(nw, localAddr)
+	if e != nil {
+		return nil, e
+	}
+
 	b.conn = c
-	return c, e
+	return c, nil
 }
 
 func isSameUDPAddress(addr1, addr2 net.Addr) bool {
@@ -123,15 +137,18 @@ func (b *BoundUDPConn) Read(p []byte) (int, error) {
 	}
 
 	for {
-		b.connmu.Lock()
-		if b.conn == nil {
-			b.connmu.Unlock()
-			return 0, fmt.Errorf("invalid conn object")
+		if b.supportRebuild {
+			b.connmu.Lock()
+			if b.conn == nil {
+				b.connmu.Unlock()
+				return 0, fmt.Errorf("invalid conn object")
+			}
 		}
 		b.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 		n, addr, err := b.conn.ReadFrom(p)
-		b.connmu.Unlock()
-
+		if b.supportRebuild {
+			b.connmu.Unlock()
+		}
 		switch {
 		case err == nil:
 			addrValid := false
@@ -222,6 +239,12 @@ func (b *BoundUDPConn) Close() error {
 
 // LocalAddr 返回本地地址
 func (b *BoundUDPConn) LocalAddr() net.Addr {
+	b.connmu.Lock()
+	defer b.connmu.Unlock()
+
+	if b.conn == nil {
+		return nil
+	}
 	return b.conn.LocalAddr()
 }
 
@@ -874,9 +897,9 @@ type UDPCustomListener struct {
 
 // NewUDPCustomListener 创建并返回一个 UDPCustomListener。
 // localAddr 是监听地址，例如 "udp://:8080"
-func NewUDPCustomListener(localUDPConn *net.UDPConn, logger *log.Logger) (*UDPCustomListener, error) {
+func NewUDPCustomListener(localUDPConn *net.UDPConn, maxPacketSize int, logger *log.Logger) (*UDPCustomListener, error) {
 
-	dialer, err := NewUDPCustomDialer(localUDPConn, false, 4096, logger)
+	dialer, err := NewUDPCustomDialer(localUDPConn, false, maxPacketSize, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create UDPCustomDialer: %w", err)
 	}

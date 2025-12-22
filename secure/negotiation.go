@@ -41,9 +41,10 @@ type NegotiationConfig struct {
 
 const DefaultKCPIdleTimeoutSecond = 41
 const DefaultUDPIdleTimeoutSecond = 60 * 5
+const DefaultUdpOutputBlockSize = 1320
 
 var (
-	UdpOutputBlockSize   int    = 1320
+	UdpOutputBlockSize   int    = DefaultUdpOutputBlockSize
 	KcpWindowSize        int    = 1500
 	UdpKeepAlivePayload  string = "ping\n"
 	KCPIdleTimeoutSecond int    = DefaultKCPIdleTimeoutSecond
@@ -71,6 +72,7 @@ type NegotiatedConn struct {
 	ConnLayers       []net.Conn
 	IsUDP            bool
 	IsFramed         bool
+	WithKCP          bool
 	MQTTHelloPayload string
 	OnClose          func()
 }
@@ -218,6 +220,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				copy(keyingMaterial[:], k)
 			}
 			nconn.ConnLayers = append([]net.Conn{sess_kcp}, nconn.ConnLayers...)
+			nconn.WithKCP = true
 			connStack = append(connStack, "kcp")
 		} else {
 			isWrappered := false
@@ -563,8 +566,8 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	if strings.Contains(config.SecureLayer, "tls") {
 		mtu -= 60
 	}
-	mtu -= 2 //KCPStreamConn: len header
-	sess.SetMtu(mtu)
+	mtu -= 2         //KCPStreamConn: len header
+	sess.SetMtu(mtu) //如果用户-udp-size设置的值比较大，超过KCP内部限制的1500，会设置失败。
 
 	return netx.NewFramedConn(sess, sess)
 }

@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	//_ "net/http/pprof"
+
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/easyp2p"
 	"github.com/threatexpert/gonc/v2/httpfileshare"
@@ -29,12 +31,10 @@ import (
 	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
 	"golang.org/x/term"
-	// "net/http"
-	// _ "net/http/pprof"
 )
 
 var (
-	VERSION = "v2.4.2"
+	VERSION = "v2.4.3"
 )
 
 type AppNetcatConfig struct {
@@ -310,7 +310,27 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	return App_Netcat_main_withconfig(console, config)
 }
 
+var pprofOnce sync.Once
+
+func startPprofFromEnv() {
+	// 真要开启pprof要去掉上面import里注释掉的 _ "net/http/pprof"
+	debugPort := os.Getenv("PPROF_DEBUG")
+	if debugPort != "" {
+		pprofOnce.Do(func() {
+			go func() {
+				addr := "127.0.0.1:" + debugPort
+				log.Printf("pprof enabled on http://%s/debug/pprof/", addr)
+				if err := http.ListenAndServe(addr, nil); err != nil {
+					log.Printf("pprof server stopped: %v", err)
+				}
+			}()
+			time.Sleep(1 * time.Second)
+		})
+	}
+}
+
 func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
+	startPprofFromEnv()
 	defer console.Close()
 	if len(config.featureModulesRun) != 0 {
 		return runFeatureModules(console, config)
@@ -328,6 +348,19 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 
 func firstInit(ncconfig *AppNetcatConfig) {
 	easyp2p.MQTTBrokerServers = parseMultiItems(ncconfig.mqttServers, true)
+
+	if ncconfig.stunSrv != "" {
+		if strings.HasPrefix(ncconfig.stunSrv, "@") {
+			data, err := os.ReadFile(strings.TrimPrefix(ncconfig.stunSrv, "@"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "read stun server file failed: %v\n", err)
+				os.Exit(1)
+			}
+			lines := strings.Split(string(data), "\n")
+			ncconfig.stunSrv = strings.Join(lines, ",")
+		}
+	}
+
 	easyp2p.STUNServers = parseMultiItems(ncconfig.stunSrv, true)
 	conflictCheck(ncconfig)
 }
@@ -725,7 +758,7 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	fmt.Fprintf(ncconfig.LogWriter, "Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 	logDiscard := log.New(io.Discard, "", log.LstdFlags)
-	usessListener, err := netx.NewUDPCustomListener(uconn, logDiscard)
+	usessListener, err := netx.NewUDPCustomListener(uconn, 65535, logDiscard)
 	if err != nil {
 		fmt.Fprintf(ncconfig.LogWriter, "Error NewUDPCustomListener: %v\n", err)
 		return 1
@@ -895,10 +928,6 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	var conn net.Conn
 	var err error
-
-	// go func() {
-	// 	log.Println(http.ListenAndServe("localhost:6060", nil))
-	// }()
 
 	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
 	if err != nil {
@@ -1762,7 +1791,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	if !ncconfig.ConsoleMode {
 		binaryInputMode = true
 	}
-	if nconn.IsUDP {
+	if nconn.IsUDP && !nconn.WithKCP { // KCP内部已经做了分片处理
 		//源如果是stdio或文件流，应该限制每次拷贝形成的udp包的大小
 		if ncconfig.ConsoleMode || ncconfig.sendfile != "" {
 			blocksize = nconn.Config.UdpOutputBlockSize

@@ -10,6 +10,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"io"
 	mathrand "math/rand"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -31,17 +33,18 @@ import (
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
+const DefaultPunchingShortTTL = 5
+
 var (
 	TopicExchange              = "nat-exchange/"
 	MQTTBrokerServers []string = []string{
 		"tcp://broker.hivemq.com:1883",
 		"tcp://broker.emqx.io:1883",
 		"tcp://test.mosquitto.org:1883",
-		"guest:guest@tcp://mqtt.gonc.cc:1883",
+		"tcp://guest:guest@mqtt.gonc.cc:1883",
 	}
 
-	DebugServerRole         string
-	PunchingShortTTL        int = 5
+	PunchingShortTTL        int = DefaultPunchingShortTTL
 	PunchingRandomPortCount int = 600
 
 	TopicDesc_WAIT            = "WT"
@@ -345,8 +348,8 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 	}
 
 	for i, server := range brokerServers {
-		username, password, serverURL := ParseMQTTServerV2(server)
-		go func(username, password, brokerAddr string, index int) {
+		serverURL, q, _ := ParseMQTTServerV3(server)
+		go func(brokerAddr string, qvals url.Values, index int) {
 			// ctx 已取消就不启动
 			select {
 			case <-ctx.Done():
@@ -364,9 +367,29 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 				SetConnectRetryInterval(3 * time.Second).
 				SetDialer(dialer)
 
-			if username != "" || password != "" {
-				opts.SetUsername(username)
-				opts.SetPassword(password)
+			var tlsConfig *tls.Config
+			insecure := false
+			if qvals.Get("insecure") == "1" || qvals.Get("insecure") == "true" {
+				insecure = true
+			}
+			if qvals.Get("_scheme") == "tls" || qvals.Get("_scheme") == "ssl" {
+				tlsConfig = &tls.Config{
+					InsecureSkipVerify: insecure,
+				}
+				// 只有在不 insecure 的情况下才设置 ServerName
+				if !insecure {
+					// 如果是 IP，不要设置 ServerName
+					if net.ParseIP(qvals.Get("_host")) == nil {
+						tlsConfig.ServerName = qvals.Get("_host")
+					}
+				}
+				serverName := qvals.Get("servername")
+				if serverName != "" {
+					tlsConfig.ServerName = serverName
+				}
+			}
+			if tlsConfig != nil {
+				opts.SetTLSConfig(tlsConfig)
 			}
 
 			// ---- OnConnect：每次连接成功都重新订阅 ----
@@ -411,7 +434,7 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 			case <-ctx.Done():
 			}
 
-		}(username, password, serverURL, i)
+		}(serverURL, q, i)
 	}
 
 	// 等待第一个成功连接或全部失败
@@ -605,7 +628,7 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		return nil, err
 	}
 
-	_, _, brokerServer := ParseMQTTServerV2(MQTTBrokerServers[srvIndex])
+	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
 	fmt.Fprintf(logWriter, "OK (via %s)\n", brokerServer)
 
 	addressesPrint(logWriter, remotePayload.Addresses)
@@ -825,9 +848,10 @@ func IsIPv6(addr string) bool {
 }
 
 func SelectRole(p2pInfo *P2PAddressInfo) bool {
-	// if DebugServerRole != "" {
-	// 	return DebugServerRole == "C"
-	// }
+	role := os.Getenv("ROLE_DEBUG")
+	if role == "C" || role == "S" {
+		return role == "C"
+	}
 
 	//easy  -  easy		go Compare
 	//easy  -  hard		S - C
@@ -1090,7 +1114,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		//只有先发包的，适合用小ttl值。
 		ttl = PunchingShortTTL
 		//多出口IP的环境，可能网络稍微复杂，nat的位置可能在更远的跳数
-		if ttl == 5 && strings.HasSuffix(p2pInfo.Network, "4") && p2pInfo.LocalPublicIPv4Count > 1 {
+		if ttl == DefaultPunchingShortTTL && strings.HasSuffix(p2pInfo.Network, "4") && p2pInfo.LocalPublicIPv4Count > 1 {
 			ttl = 10
 		}
 	}
@@ -1139,6 +1163,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 
 	buconn := netx.NewBoundUDPConn(uconn, "", isSharedUDPConn)
+	buconn.SetSupportRebuild(true)
+	var pickOnce sync.Once
+	var forceRebind bool
 
 	netx.SetUDPTTL(uconn, ttl)
 
@@ -1172,18 +1199,26 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		for {
 			n, err := buconn.Read(buf)
 			if err != nil {
-				errChan <- err
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 
 			if bytes.Equal(buf[:n], punchPayload) {
 				stopPunching()
-				buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
-				netx.SetUDPTTL(uconn, 64)
-				buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
-				time.Sleep(250 * time.Millisecond)
-				buconn.Write(punchPayload)
-				recvChan <- true
+				pickOnce.Do(func() {
+					buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
+					netx.SetUDPTTL(uconn, 64)
+					buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
+					time.Sleep(250 * time.Millisecond)
+					buconn.Write(punchPayload)
+					recvChan <- true
+				})
 				return
 			}
 		}
@@ -1194,14 +1229,28 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 		// 定义公共的PING发送函数
 		sendPing := func(i int) bool {
+			if os.Getenv("BIPA_DEBUG") == "1" {
+				//only test birthday paradox
+				return true
+			}
 			if _, err := uconn.WriteTo(punchPayload, remoteUDPAddr); err != nil {
 				if errors.Is(err, os.ErrPermission) {
 					if _, ok := uconn.(*net.UDPConn); ok {
-						//ErrPermission可能是对方先发过来包被macos防火墙拦住了，现在这个udp socket已经无法向对端地址发包了。
-						uconn, err = buconn.Rebuild() //关闭socket，重新创建，并立刻主动发包打通防火墙
+						//ErrPermission可能是对方先发过来打洞包被macos防火墙拦住了，现在防火墙限制这个udp socket主动向对端这个地址发包了。
+						var uconnR net.PacketConn
+						fmt.Fprintf(logWriter, "UDP sendto permission denied; try rebinding...\n")
+						uconnR, err = buconn.Rebuild() //尝试关闭socket，重新创建，并立刻主动发包打通防火墙
 						if err != nil {
-							err = os.ErrPermission
+							//无法重建socket，标志forceRebind，后续用dial+reuseport，本地地址用全零的方式重建
+							stopPunching()
+							pickOnce.Do(func() {
+								forceRebind = true
+								buconn.SetRemoteAddr(remoteUDPAddr.String())
+								recvChan <- true
+							})
+							return true
 						} else {
+							uconn = uconnR
 							_, err = uconn.WriteTo(punchPayload, remoteUDPAddr)
 							if err == nil {
 								//重建socket且发送成功了
@@ -1210,7 +1259,10 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 						}
 					}
 				}
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return false
 			}
 		SentPingOK:
@@ -1247,7 +1299,6 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			defer cancel()
 
 			var wg sync.WaitGroup
-			var once sync.Once
 
 			fmt.Fprintf(logWriter, "  ↑ Sending Random Src Ports hole-punching packets. TTL=%d; ", ttl)
 
@@ -1309,7 +1360,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 						// 避免回复多个成功打出的洞
 						// 只有第一个成功的协程会执行后续操作
-						once.Do(func() {
+						pickOnce.Do(func() {
 							// 标记成功并发送确认包
 							netx.SetUDPTTL(c, 64)
 							_, _ = c.WriteToUDP(punchPayload, raddr)
@@ -1398,7 +1449,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, addrPair.Remote.String())
 		} else {
-			uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote)
+			uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote, false)
 		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
@@ -1418,7 +1469,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, raddr.String())
 		} else {
-			uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr)
+			uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr, forceRebind)
 		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
@@ -1455,12 +1506,22 @@ func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPa
 	return netx.NewConnFromPacketConn(uconn, false, raddr)
 }
 
-func CreateUDPConnFromAddr(laddr, raddr net.Addr) (net.Conn, error) {
+func CreateUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind bool) (net.Conn, error) {
 	// 类型断言：必须是 *net.UDPAddr
 	la, ok1 := laddr.(*net.UDPAddr)
 	ra, ok2 := raddr.(*net.UDPAddr)
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("both laddr and raddr must be *net.UDPAddr, got %T and %T", laddr, raddr)
+	}
+
+	if forcelyBind {
+		//不能用laddr带IP的去Dial，因为可能地址被占用了，这里不指定IP
+		localAddr, _ := net.ResolveUDPAddr("udp", net.JoinHostPort("", fmt.Sprintf("%d", la.Port)))
+		d := &net.Dialer{
+			LocalAddr: localAddr,
+			Control:   netx.ControlUDP,
+		}
+		return d.Dial("udp", ra.String())
 	}
 
 	// 使用 net.DialUDP 绑定本地地址并连接远程地址
@@ -1933,7 +1994,7 @@ func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Dura
 	if err != nil {
 		return "", err
 	}
-	_, _, brokerServer := ParseMQTTServerV2(MQTTBrokerServers[srvIndex])
+	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
 	logwts(logWriter, "Received event: %s, (via %s)\n", string(recvData), brokerServer)
 	if !strings.HasPrefix(recvData, "SYN@") {
 		return "", fmt.Errorf("not the expected message")
@@ -1986,7 +2047,7 @@ func MQTTHello(ctx context.Context, sessionUid, localIP, helloPayload string, ti
 		return "", fmt.Errorf("not the expected message")
 	}
 
-	_, _, brokerServer := ParseMQTTServerV2(MQTTBrokerServers[srvIndex])
+	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
 	logwts(logWriter, "MQTT: Hello operation completed (via %s). tid: %s\n", brokerServer, tid)
 	return tid, nil
 }
@@ -2080,29 +2141,18 @@ func incPort(port, add int) int {
 	return port + add
 }
 
-func ParseMQTTServerV2(input string) (username string, password string, server string) {
-	schemeIndex := strings.Index(input, "://")
-	if schemeIndex == -1 {
-		return "", "", input
+func ParseMQTTServerV3(input string) (string, url.Values, error) {
+	safeParams := make(url.Values)
+	u, err := url.Parse(input)
+	if err != nil {
+		return input, safeParams, err
 	}
 
-	atIndex := strings.Index(input, "@")
-	if atIndex != -1 && atIndex < schemeIndex {
-		// 有用户信息
-		cred := input[:atIndex]
-		server = input[atIndex+1:]
-		if colon := strings.Index(cred, ":"); colon != -1 {
-			username = cred[:colon]
-			password = cred[colon+1:]
-		} else {
-			username = cred
-			password = ""
-		}
-	} else {
-		// 无用户信息
-		server = input
-		username = ""
-		password = ""
-	}
-	return
+	q := u.Query()
+	q.Set("_host", u.Hostname())
+	q.Set("_port", u.Port())
+	q.Set("_scheme", u.Scheme)
+	// 构造 paho 能理解的 broker
+	u.RawQuery = ""
+	return u.String(), q, nil
 }
