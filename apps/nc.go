@@ -224,7 +224,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.BoolVar(&config.httpdownload, "http-download", false, "<localDir> <urlPath>; download from gonc's (-httplocal-port) HTTP service")
 
 	//<----- Global flags
-	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "stun servers")
+	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "STUN server list, comma-separated (e.g. stun1,stun2) or '@<file>' with one server per line")
 	fs.StringVar(&config.mqttServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
 	fs.StringVar(&MagicDNServer, "magicdns", MagicDNServer, "MagicDNServer")
 	disableCompress := fs.Bool("no-compress", false, "disable compression for http download")
