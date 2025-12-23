@@ -3,6 +3,7 @@ package apps
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -31,6 +33,13 @@ var (
 	VarhttpDownloadNoCompress *bool = new(bool)
 	VarMuxKeepAliveTimeout    int   = DefaultVarMuxKeepAliveTimeout
 )
+
+var GlobalPortRegistry sync.Map
+
+type PortOwner struct {
+	OwnerID  string       // 客户端指纹
+	Listener net.Listener // 监听句柄
+}
 
 type AppMuxConfig struct {
 	Engine           string
@@ -539,36 +548,43 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 	}
 }
 
-// runLinkSessionWithHandshake 提取的公共逻辑：握手 -> 建Session -> 启动业务
-// 此函数假定 Hello 已经被读取并确认为 "linkagent"
+// runLinkSessionWithHandshake 客户端握手逻辑
 func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf string) error {
-	// 提前解析 Local Config，以便正确设置 localActive
+	// 提前解析 Local Config
 	lScheme, lHost, lParams, err := parseLinkConfig(lConf)
 	if err != nil {
 		return fmt.Errorf("local config parse error: %v", err)
 	}
 
-	// 1. 发送 R 配置给远端
-	// LocalActive 表示本地有业务，远端可以发送流过来
-	// 注意：如果 lConf 是 "none?outbound_bind=..."，Scheme 也是 "none"，
+	// -------------------------------------------------------------
+	// [STEP 1] 生成并注入指纹
+	// -------------------------------------------------------------
+
+	fingerprint := GenerateNetworkFingerprint(cfg.SessionConn.LocalAddr().String())
+
 	localActive := "0"
 	if lScheme != "none" {
 		localActive = "1"
 	}
 
 	sendConf := rConf
+	separator := "?"
 	if sendConf == "none" {
 		sendConf = fmt.Sprintf("none?peer_active=%s", localActive)
+		separator = "&"
 	} else {
 		if strings.Contains(sendConf, "?") {
-			sendConf += fmt.Sprintf("&peer_active=%s", localActive)
-		} else {
-			sendConf += fmt.Sprintf("?peer_active=%s", localActive)
+			separator = "&"
 		}
+		sendConf += fmt.Sprintf("%speer_active=%s", separator, localActive)
 	}
-	sendConf += "\n"
 
-	log.Printf("[link] Sending Remote Config: %s", strings.TrimSpace(sendConf))
+	// 强制追加 owner 参数
+	sendConf += fmt.Sprintf("%sowner=%s", separator, fingerprint)
+	sendConf += "\n"
+	// -------------------------------------------------------------
+
+	log.Printf("[link] Sending Config: %s", strings.TrimSpace(sendConf))
 	if _, err := cfg.SessionConn.Write([]byte(sendConf)); err != nil {
 		return fmt.Errorf("failed to send remote config: %v", err)
 	}
@@ -588,17 +604,14 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 
 	cfg.SessionConn.SetDeadline(time.Time{})
 
-	// 3. 创建 Session
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, true)
 	if err != nil {
 		return err
 	}
 
-	// 4. 启动 Session 监控 (兼任 AcceptLoop)
 	remoteActive := !strings.HasPrefix(rConf, "none")
 	sessionDone := make(chan struct{})
 	go func() {
-		// 如果 remoteActive 为 false，说明单向模式，这里设置为 drainOnly=true
 		startRemoteStreamAcceptLoop(session, lParams.Get("outbound_bind"), cfg.AccessCtrl, !remoteActive)
 		close(sessionDone)
 	}()
@@ -610,7 +623,6 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 			return fmt.Errorf("local bind failed: %v", err)
 		}
 
-		// 关键改动：先初始化 Config，再运行
 		rtConfig, err := setupLinkRuntimeConfig(lScheme, lParams, ln)
 		if err != nil {
 			ln.Close()
@@ -738,14 +750,10 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 
 // handleLinkAgentMode (Remote)
 func handleLinkAgentMode(cfg MuxSessionConfig) error {
-	// 1. 发送 Hello
 	if err := sendHello(cfg.SessionConn, "linkagent"); err != nil {
 		return err
 	}
 
-	log.Printf("[linkagent] Receiving config request...")
-
-	// 2. 读取配置
 	cfg.SessionConn.SetReadDeadline(time.Now().Add(25 * time.Second))
 	reqStr, err := netx.ReadString(cfg.SessionConn, '\n', 1024)
 	if err != nil {
@@ -754,24 +762,8 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 	cfg.SessionConn.SetReadDeadline(time.Time{})
 
 	reqStr = strings.TrimSpace(reqStr)
-	log.Printf("[linkagent] Received config request: %s", reqStr)
-
 	rConf := reqStr
-	peerActive := false
-
-	if strings.HasPrefix(rConf, "none") {
-		if strings.Contains(rConf, "peer_active=1") {
-			peerActive = true
-		}
-		// 这里不能直接设为 "none"，否则会丢失可能的参数(如 outbound_bind)
-	} else {
-		u, err := url.Parse(rConf)
-		if err == nil {
-			if u.Query().Get("peer_active") == "1" {
-				peerActive = true
-			}
-		}
-	}
+	peerActive := strings.Contains(rConf, "peer_active=1")
 
 	rScheme, rHost, rParams, err := parseLinkConfig(rConf)
 	if err != nil {
@@ -779,12 +771,63 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	// 3. 准备环境 (Bind + Config Setup)
 	var ln net.Listener
 	var rtConfig *linkRuntimeConfig
 	ackMsg := "OK"
 
 	if rScheme != "none" {
+		// -------------------------------------------------------------
+		// [STEP 2] 严格的端口抢占安全检查
+		// -------------------------------------------------------------
+		ownerID := rParams.Get("owner") // 新请求带来的指纹
+
+		bindKey := rHost
+		if !strings.Contains(bindKey, ":") {
+			bindKey = ":" + bindKey
+		}
+
+		if val, loaded := GlobalPortRegistry.Load(bindKey); loaded {
+			oldOwner := val.(*PortOwner)
+
+			// 默认拒绝
+			canPreempt := false
+
+			if oldOwner.OwnerID == "" {
+				// 情况 A: 旧连接是 Legacy 版 (没有指纹)
+				// 逻辑: "旧版无法被踢"。即便是新版也不允许踢旧版。
+				// 必须等旧版自己断开。
+				log.Printf("[mux] Port %s is held by Legacy client. Preemption DENIED.", bindKey)
+				canPreempt = false
+			} else {
+				// 情况 B: 旧连接是 New 版 (有指纹)
+				// 逻辑: "新版有owner，按照认证匹配才能踢"
+				// 必须两个指纹都存在且相等
+				if ownerID != "" && ownerID == oldOwner.OwnerID {
+					log.Printf("[mux] Port %s owner match (%s). Allowing preemption.", bindKey, ownerID)
+					canPreempt = true
+				} else {
+					// 指纹不匹配，或者新请求没带指纹
+					log.Printf("[mux] Port %s locked by %s. Rejecting %s.", bindKey, oldOwner.OwnerID, ownerID)
+					canPreempt = false
+				}
+			}
+
+			if !canPreempt {
+				errMsg := fmt.Sprintf("ERROR: Port %s is locked. Preemption denied.\n", bindKey)
+				cfg.SessionConn.Write([]byte(errMsg))
+				return fmt.Errorf("port conflict: permission denied")
+			}
+
+			// 验证通过，执行踢人
+			log.Printf("[mux] Preempting port %s...", bindKey)
+			if oldOwner.Listener != nil {
+				oldOwner.Listener.Close() // 这会强制旧 Session 退出
+			}
+			GlobalPortRegistry.Delete(bindKey)
+			time.Sleep(1 * time.Second)
+		}
+		// -------------------------------------------------------------
+
 		// 3.1 绑定端口
 		enableTProxy := (rScheme == "x" && rParams.Get("tproxy") == "1")
 		ln, err = prepareLocalListener(rHost, enableTProxy)
@@ -793,34 +836,47 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 			return err
 		}
 
-		// 3.2 优化点：在发送 OK 之前，进行 Config 分析 (TLS加载, Scheme检查等)
+		// 3.2 配置分析
 		rtConfig, err = setupLinkRuntimeConfig(rScheme, rParams, ln)
 		if err != nil {
-			// 如果 Setup 失败（比如证书加载失败），关闭 Listener 并回复 ERROR
 			ln.Close()
 			errMsg := fmt.Sprintf("ERROR: config setup failed: %v\n", err)
 			cfg.SessionConn.Write([]byte(errMsg))
 			return err
 		}
 
-		// 绑定且配置成功，准备回复 OK
-		ackMsg = fmt.Sprintf("OK:%s", ln.Addr().String())
+		// 3.3 注册当前客户端
+		actualAddr := ln.Addr().String()
+		newOwnerEntry := &PortOwner{
+			OwnerID:  ownerID,
+			Listener: ln,
+		}
+		GlobalPortRegistry.Store(bindKey, newOwnerEntry)
+
+		// 退出时清理 Map (防止僵尸条目)
+		// 只有当 Map 里的还是我自己时才删
+		defer func() {
+			if v, ok := GlobalPortRegistry.Load(bindKey); ok {
+				if v.(*PortOwner) == newOwnerEntry {
+					GlobalPortRegistry.Delete(bindKey)
+				}
+			}
+		}()
+
+		ackMsg = fmt.Sprintf("OK:%s", actualAddr)
 	} else {
 		ackMsg = "OK:none"
 	}
 
-	// 4. 创建 Session
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
 	if err != nil {
 		if ln != nil {
 			ln.Close()
 		}
-		errMsg := fmt.Sprintf("ERROR: createMuxSession failed: %v\n", err)
-		cfg.SessionConn.Write([]byte(errMsg))
+		cfg.SessionConn.Write([]byte(fmt.Sprintf("ERROR: createMuxSession failed: %v\n", err)))
 		return err
 	}
 
-	// 5. 发送 ACK
 	if _, err := cfg.SessionConn.Write([]byte(ackMsg + "\n")); err != nil {
 		if ln != nil {
 			ln.Close()
@@ -828,9 +884,8 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	log.Printf("[linkagent] Session established.")
+	log.Printf("[linkagent] Session established. OwnerID=%s", rParams.Get("owner"))
 
-	// 6. 启动 Session 监控
 	sessionDone := make(chan struct{})
 	go func() {
 		startRemoteStreamAcceptLoop(session, rParams.Get("outbound_bind"), cfg.AccessCtrl, !peerActive)
@@ -838,7 +893,6 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 	}()
 
 	if rScheme != "none" && ln != nil {
-		// 这里传入预处理好的 rtConfig
 		return runLinkListener(session, ln, rScheme, rtConfig, sessionDone)
 	}
 
@@ -1067,4 +1121,64 @@ func openMuxStream(session interface{}) (net.Conn, error) {
 	default:
 		return nil, fmt.Errorf("unknown session type")
 	}
+}
+
+// GenerateNetworkFingerprint 生成纯网络特征指纹 (无 Hostname/Username)
+func GenerateNetworkFingerprint(localAddr string) string {
+	// 1. 获取出口网卡特征 (MAC 或 接口名)
+	netIdentity := getOutboundInterfaceIdentity(localAddr)
+
+	// 2. 生成 SHA256 哈希 (仅依赖网络身份)
+	// 加一个固定的盐值 (Salt) 防止彩虹表，虽然这里没传密码，但好习惯
+	raw := fmt.Sprintf("mux_salt_v1|%s", netIdentity)
+	hash := sha256.Sum256([]byte(raw))
+
+	// 返回前 16 位 Hex
+	return fmt.Sprintf("%x", hash)[:16]
+}
+
+// getOutboundInterfaceIdentity 获取出口网卡的唯一标识 (MAC 或 Name+Index)
+func getOutboundInterfaceIdentity(localAddr string) string {
+	localIP, _, err := net.SplitHostPort(localAddr)
+	if err != nil {
+		return getFallbackIdentity("")
+	}
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip.String() == localIP {
+				// 优先返回 MAC
+				if len(iface.HardwareAddr) > 0 {
+					return fmt.Sprintf("%s|%s|a", localIP, iface.HardwareAddr.String())
+				}
+				// VPN/Tun 接口无 MAC，返回 "Name"
+				return fmt.Sprintf("%s|%s|b", localIP, iface.Name)
+			}
+		}
+	}
+	return getFallbackIdentity(localIP)
+}
+
+// getFallbackIdentity 兜底方案
+func getFallbackIdentity(localIP string) string {
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if i.Flags&net.FlagLoopback == 0 && len(i.HardwareAddr) > 0 {
+			return fmt.Sprintf("%s|%s|c", localIP, i.HardwareAddr.String())
+		}
+	}
+	if len(ifaces) > 0 {
+		return fmt.Sprintf("%s|%s|d", localIP, ifaces[0].Name)
+	}
+	return fmt.Sprintf("%s||e", localIP)
 }
