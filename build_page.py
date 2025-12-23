@@ -52,7 +52,7 @@ body {
 }
 /* 默认显示中文，隐藏英文 */
 .lang-zh {
-    display: block;
+    display: none;
     flex: 1;            /* 让内容块可伸缩 */
     min-width: 200px;   /* 手机屏幕时防止太窄 */
     font-size: 16px;    /* 默认字体大小，可适配手机 */
@@ -60,7 +60,7 @@ body {
 }
 
 .lang-en {
-    display: none;
+    display: block;
     flex: 1;
     min-width: 200px;
     font-size: 16px;
@@ -69,10 +69,10 @@ body {
 
 /* 切换状态 */
 #lang-toggle:checked ~ .content-wrapper .lang-zh {
-    display: none;
+    display: block;
 }
 #lang-toggle:checked ~ .content-wrapper .lang-en {
-    display: block;
+    display: none;
 }
 
 /* 手机屏幕适配 */
