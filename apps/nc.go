@@ -2227,6 +2227,8 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			if strings.HasPrefix(config.SecureLayer, "tls") {
 				config.SecureLayer = "dtls"
+			} else if strings.HasPrefix(config.SecureLayer, "ss") {
+				config.SecureLayer = "dss"
 			}
 		}
 		if ncconfig.autoPSK {

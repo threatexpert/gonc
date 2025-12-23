@@ -181,7 +181,6 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 		switch cfg.KeyType {
 		case "ECDHE":
 			copy(keyingMaterial[:], []byte(cfg.Key))
-			fmt.Fprintf(logWriter, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.Label)
 		case "PSK":
 			k, err := DerivePSK(cfg.Key)
 			if err != nil {
@@ -189,17 +188,19 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				return nil, err
 			}
 			copy(keyingMaterial[:], k)
-			fmt.Fprintf(logWriter, "%sCommunication is encrypted(PSK) with AES.\n", cfg.Label)
 		default:
 			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.Label)
 			return nil, fmt.Errorf("missing key type for secure stream")
 		}
+
 		if cfg.SecureLayer == "dss" {
 			connss := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
+			fmt.Fprintf(logWriter, "%sCommunication(Datagram) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		} else {
 			connss := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
+			fmt.Fprintf(logWriter, "%sCommunication(Stream) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		}
 		connStack = append(connStack, cfg.SecureLayer)
 	default:
