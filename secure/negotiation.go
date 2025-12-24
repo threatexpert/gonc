@@ -194,11 +194,17 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 		}
 
 		if cfg.SecureLayer == "dss" {
-			connss := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
+			connss, err := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
+			if err != nil {
+				return nil, err
+			}
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 			fmt.Fprintf(logWriter, "%sCommunication(Datagram) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		} else {
-			connss := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
+			connss, err := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
+			if err != nil {
+				return nil, err
+			}
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 			fmt.Fprintf(logWriter, "%sCommunication(Stream) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		}

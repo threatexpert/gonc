@@ -574,7 +574,7 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 	if keyingMaterial == [32]byte{} {
 		handleLocalUDPToTunnel(localUDPConn, tunnelStream, clientIP)
 	} else {
-		localUDPConnSS := secure.NewSecureUDPConn(localUDPConn, keyingMaterial)
+		localUDPConnSS, _ := secure.NewSecureUDPConn(localUDPConn, keyingMaterial)
 		handleLocalUDPToTunnel(localUDPConnSS, tunnelStream, clientIP)
 	}
 
@@ -1624,7 +1624,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 
 		if keyingMaterial == [32]byte{} {
 		} else {
-			localUDPConn = secure.NewSecurePacketConn(localUDPConn, keyingMaterial)
+			localUDPConn, _ = secure.NewSecurePacketConn(localUDPConn, keyingMaterial)
 		}
 
 		s5uPacketConn := &Socks5UDPPacketConn{

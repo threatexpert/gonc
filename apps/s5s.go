@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/threatexpert/gonc/v2/acl"
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 )
 
@@ -81,7 +82,7 @@ func App_s5s_usage_flagSet(fs *flag.FlagSet) {
 	fmt.Fprintln(os.Stderr, "  :s5s -auth user:password")
 }
 
-func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig) {
+func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig, stats_in, stats_out *misc.ProgressStats) {
 	defer conn.Close()
 
 	conn.SetReadDeadline(time.Now().Add(25 * time.Second))
@@ -101,7 +102,7 @@ func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *App
 			log.Printf("Denied %s, SOCKS5 proxy is disabled.", conn.RemoteAddr())
 			return
 		}
-		handleSocks5Proxy(bufConn, keyingMaterial, config)
+		handleSocks5Proxy(bufConn, keyingMaterial, config, stats_in, stats_out)
 	} else {
 		if !config.EnableHTTP {
 			log.Printf("Denied %s, HTTP proxy is disabled.", conn.RemoteAddr())

@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
 type ProgressStats struct {
-	startTime  time.Time
 	totalBytes int64
 	lastBytes  int64
+	startTime  time.Time
 	lastTime   time.Time
 	lastSpeed  float64
 }
@@ -35,19 +36,24 @@ func (p *ProgressStats) ResetStart() {
 }
 
 func (p *ProgressStats) Update(n int64) {
-	p.totalBytes += n
+	// 2. 使用原子操作累加，这是线程安全的
+	atomic.AddInt64(&p.totalBytes, n)
 }
 
 func (p *ProgressStats) Stats(now time.Time, final bool) StatResult {
+	// 3. 安全读取当前的总字节数
+	// 即使 Update 正在并发写入，这里也能读到完整的最新值
+	currentTotal := atomic.LoadInt64(&p.totalBytes)
+
 	var timeDiff float64
 	var bytesDiff int64
 
 	if final {
 		timeDiff = now.Sub(p.startTime).Seconds()
-		bytesDiff = p.totalBytes
+		bytesDiff = currentTotal // 使用读取到的原子值
 	} else {
 		timeDiff = now.Sub(p.lastTime).Seconds()
-		bytesDiff = p.totalBytes - p.lastBytes
+		bytesDiff = currentTotal - p.lastBytes // 使用读取到的原子值
 	}
 
 	var speed float64
@@ -59,16 +65,48 @@ func (p *ProgressStats) Stats(now time.Time, final bool) StatResult {
 	}
 
 	p.lastTime = now
-	p.lastBytes = p.totalBytes
+	p.lastBytes = currentTotal // 更新 lastBytes
 
 	return StatResult{
-		TotalBytes: p.totalBytes,
+		TotalBytes: currentTotal,
 		SpeedBps:   speed,
 	}
 }
 
 func (p *ProgressStats) StartTime() time.Time {
 	return p.startTime
+}
+
+type StatConn struct {
+	net.Conn                // 嵌入接口，自动继承 Close, LocalAddr, SetDeadline 等方法
+	Rx       *ProgressStats // 接收统计 (Read)
+	Tx       *ProgressStats // 发送统计 (Write)
+}
+
+// 2. 拦截 Read 方法
+func (sc *StatConn) Read(b []byte) (n int, err error) {
+	n, err = sc.Conn.Read(b) // 调用原始连接的 Read
+	if n > 0 {
+		sc.Rx.Update(int64(n)) // 统计接收流量
+	}
+	return
+}
+
+// 3. 拦截 Write 方法
+func (sc *StatConn) Write(b []byte) (n int, err error) {
+	n, err = sc.Conn.Write(b) // 调用原始连接的 Write
+	if n > 0 {
+		sc.Tx.Update(int64(n)) // 统计发送流量
+	}
+	return
+}
+
+func NewStatConn(c net.Conn, stats_in, stats_out *ProgressStats) *StatConn {
+	return &StatConn{
+		Conn: c,
+		Rx:   stats_in,
+		Tx:   stats_out,
+	}
 }
 
 func FormatBytes(bytes int64) string {

@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/threatexpert/gonc/v2/acl"
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 )
 
-func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig) {
+func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig, stats_in, stats_out *misc.ProgressStats) {
 	defer conn.Close()
 
 	s5config := Socks5ServerConfig{
@@ -56,7 +57,8 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 			log.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
 		}
 	} else if req.Command == "UDP" && config.EnableUDP {
-		fakeTunnelC, fakeTunnelS := net.Pipe()
+		fakeTunnelC, rawS := net.Pipe()
+		fakeTunnelS := misc.NewStatConn(rawS, stats_in, stats_out)
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func(c net.Conn) {

@@ -92,6 +92,7 @@ type AppNetcatConfig struct {
 	sslKeyFile        string
 	presharedKey      string
 	autoPSK           bool
+	shadowStream      bool
 	enableCRLF        bool
 	listenMode        bool
 	udpProtocol       bool
@@ -170,6 +171,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	fs.StringVar(&config.sslKeyFile, "ssl-key", "", "Specify SSL private key (PEM) for listening")
 	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM) and for TCP/KCP encryption; when using -p2p, the P2P session key overrides this value.")
 	fs.BoolVar(&config.autoPSK, "auto-psk", false, "Use MQTT/ECDHE to automatically derive shared encryption key")
+	fs.BoolVar(&config.shadowStream, "ss", false, "TLS-free, lightweight, low-signature encrypted transport in P2P mode")
 	fs.BoolVar(&config.enableCRLF, "C", false, "enable CRLF")
 	fs.BoolVar(&config.listenMode, "l", false, "listen mode")
 	fs.BoolVar(&config.udpProtocol, "u", false, "use UDP protocol")
@@ -364,7 +366,9 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	}
 
 	easyp2p.STUNServers = parseMultiItems(ncconfig.stunSrv, true)
-	conflictCheck(ncconfig)
+	if conflictCheck(ncconfig) != 0 {
+		os.Exit(1)
+	}
 }
 
 // configureAppMode 为内置应用程序设置命令参数
@@ -1493,67 +1497,76 @@ func usage_less(argv0 string) {
 	fmt.Fprintln(os.Stderr, "         [-h] for full help")
 }
 
-func conflictCheck(ncconfig *AppNetcatConfig) {
+func conflictCheck(ncconfig *AppNetcatConfig) int {
 	if ncconfig.sendfile != "" && ncconfig.runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-send and -exec cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.enablePty && ncconfig.enableCRLF {
 		fmt.Fprintf(os.Stderr, "-pty and -C cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.proxyAddr != "" && ncconfig.useSTUN {
 		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.proxyProt == "connect" && (ncconfig.udpProtocol || ncconfig.kcpEnabled || ncconfig.kcpSEnabled) {
 		fmt.Fprintf(os.Stderr, "http proxy and udp cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.listenMode && (ncconfig.remoteAddr != "" || ncconfig.autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "-l and (-remote -p2p) cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.presharedKey != "" && (ncconfig.tlsRSACertEnabled || (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") || ncconfig.autoPSK) {
 		fmt.Fprintf(os.Stderr, "-psk and (-tlsrsa -ssl-cert -ssl-key -auto-psk) cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.useIPv4 && ncconfig.useIPv6 {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.useUNIXdomain && (ncconfig.useIPv6 || ncconfig.useIPv4 || ncconfig.useSTUN || ncconfig.udpProtocol || ncconfig.kcpEnabled || ncconfig.kcpSEnabled || ncconfig.localbind != "" || ncconfig.proxyAddr != "") {
 		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -bind -x) cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.runAppFileServ != "" && (ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "") {
 		fmt.Fprintf(os.Stderr, "-httpserver and (-httplocal -download) cannot be used together\n")
-		os.Exit(1)
+		return 1
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile == "") || (ncconfig.sslCertFile == "" && ncconfig.sslKeyFile != "") {
 		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key both must be set, only one given")
-		os.Exit(1)
+		return 1
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") && !isTLSEnabled(ncconfig) {
 		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key set without -tls ?")
-		os.Exit(1)
+		return 1
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") && (ncconfig.autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.kcpBridgeMode && ncconfig.portRotate {
 		fmt.Fprintf(os.Stderr, "-kcpbr and -port-rotate cannot be used together")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.kcpBridgeMode && ncconfig.autoP2P == "" {
 		fmt.Fprintf(os.Stderr, "-kcpbr and -p2p must be used together")
-		os.Exit(1)
+		return 1
 	}
 	if ncconfig.autoPSK && ncconfig.autoP2P == "" {
 		fmt.Fprintf(os.Stderr, "-auto-psk and -p2p must be used together")
-		os.Exit(1)
+		return 1
 	}
+	if ncconfig.shadowStream && ncconfig.autoP2P == "" {
+		fmt.Fprintf(os.Stderr, "-ss and -p2p must be used together")
+		return 1
+	}
+	if ncconfig.shadowStream && ncconfig.plainTransport {
+		fmt.Fprintf(os.Stderr, "-ss and -plain cannot be used together")
+		return 1
+	}
+	return 0
 }
 
 func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) error {
@@ -1906,7 +1919,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
-			go App_s5s_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5s_Config)
+			go App_s5s_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5s_Config, stats_in, stats_out)
 		} else if builtinApp == ":nc" {
 			if ncconfig.app_nc_Config == nil {
 				fmt.Fprintf(ncconfig.LogWriter, "Not initialized %s config\n", builtinApp)
@@ -2222,8 +2235,8 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 
 	conn := connInfo.Conns[0]
 	config := *ncconfig.connConfig
+	config.IsClient = connInfo.IsClient
 	if ncconfig.plainTransport {
-		config.IsClient = connInfo.IsClient
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			if strings.HasPrefix(config.SecureLayer, "tls") {
 				config.SecureLayer = "dtls"
@@ -2235,10 +2248,20 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			config.Key = string(connInfo.SharedKey[:])
 			config.KeyType = "ECDHE"
 		}
+	} else if ncconfig.shadowStream {
+		config.Key = string(connInfo.SharedKey[:])
+		config.KeyType = "ECDHE"
+
+		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
+			config.KcpWithUDP = true
+			config.SecureLayer = "dss"
+		} else {
+			config.KcpWithUDP = false
+			config.SecureLayer = "ss"
+		}
 	} else {
 		config.Key = ncconfig.p2pSessionKey
 		config.KeyType = "PSK"
-		config.IsClient = connInfo.IsClient
 
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			config.KcpWithUDP = true
