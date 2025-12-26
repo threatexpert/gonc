@@ -138,13 +138,15 @@ type AppNetcatConfig struct {
 	httpdownload      bool
 	portRotate        bool
 	kcpBridgeMode     bool
+	verbose           bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
 func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*AppNetcatConfig, error) {
+	swriter := misc.NewSwitchableWriter(logWriter, true)
 	config := &AppNetcatConfig{
-		LogWriter: logWriter,
-		Logger:    log.New(logWriter, "", 0),
+		LogWriter: swriter,
+		Logger:    log.New(swriter, "", 0),
 		ctx:       context.Background(),
 	}
 
@@ -213,6 +215,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.framedTCP, "framed-tcp", false, "tcp is framed stream (2 bytes length prefix for each frame)")
 	fs.BoolVar(&config.tlsVerifyCert, "verify", false, "verify TLS certificate (client mode only)")
 	fs.IntVar(&config.keepAlive, "keepalive", 0, "none 0 will enable keepalive feature")
+	fs.BoolVar(&config.verbose, "v", true, "verbose output")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
@@ -259,6 +262,15 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		return nil, err // 解析错误直接返回
 	}
 	config.Args = fs.Args()
+	if config.verbose {
+		if config.keepOpen || argv0 == ":nc" {
+			prefix := ""
+			if argv0 != "" {
+				prefix = fmt.Sprintf("[%s] ", argv0)
+			}
+			config.Logger = misc.NewLog(swriter, prefix, log.LstdFlags|log.Lmsgprefix)
+		}
+	}
 
 	// 1. 初始化基本设置
 	firstInit(config)
@@ -276,14 +288,6 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	if fs.NFlag() == 0 && fs.NArg() == 0 {
 		usage_less(logWriter, argv0)
 		os.Exit(1)
-	}
-
-	if config.keepOpen || argv0 == ":nc" {
-		prefix := ""
-		if argv0 != "" {
-			prefix = fmt.Sprintf("[%s] ", argv0)
-		}
-		config.Logger = misc.NewLog(config.LogWriter, prefix, log.LstdFlags|log.Lmsgprefix)
 	}
 
 	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
@@ -310,7 +314,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	configureDNS(config)
 
 	config.connConfig = preinitNegotiationConfig(config)
-
+	swriter.Enable(config.verbose)
 	return config, nil
 }
 

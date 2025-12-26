@@ -7,6 +7,29 @@ import (
 	"time"
 )
 
+type SwitchableWriter struct {
+	w       io.Writer
+	enabled bool
+}
+
+func NewSwitchableWriter(w io.Writer, enabled bool) *SwitchableWriter {
+	return &SwitchableWriter{
+		w:       w,
+		enabled: enabled,
+	}
+}
+
+func (tw *SwitchableWriter) Enable(b bool) {
+	tw.enabled = b
+}
+
+func (tw *SwitchableWriter) Write(p []byte) (int, error) {
+	if tw.enabled {
+		return tw.w.Write(p)
+	}
+	return len(p), nil
+}
+
 // ShortTimeWriter 在每行日志前追加短时间戳
 // 格式：YYYYMMDD-HHMMSS(.mmm)
 type ShortTimeWriter struct {
