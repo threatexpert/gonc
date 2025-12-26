@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/stun"
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 )
 
@@ -94,13 +95,13 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 
 			// 检查 context 是否已经被取消，避免不必要的拨号
 			if ctx.Err() != nil {
-				//fmt.Fprintf(os.Stderr, "Err: %s ...\n", stunAddr)
+				//logSTUN("Err: %s ...\n", stunAddr)
 				return
 			}
 
 			useNetwork, laddr, err := resolveAddr(netProto)
 			if err != nil {
-				//fmt.Fprintf(os.Stderr, "stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
+				//logSTUN("stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				results <- result{err: fmt.Errorf("resolve local addr: %v", err)}
 				return
 			}
@@ -113,7 +114,7 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 				dialer.Control = netx.ControlUDP
 			}
 
-			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s ...\n", useNetwork, stunAddr)
+			//logSTUN("stun dial: %s://%s ...\n", useNetwork, stunAddr)
 			var conn net.Conn
 			if strings.Contains(stunAddr, "?") {
 				conn, err = netx.DialRace(ctx, useNetwork, stunAddr, dialer.DialContext)
@@ -121,12 +122,12 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 				conn, err = dialer.DialContext(ctx, useNetwork, stunAddr)
 			}
 			if err != nil {
-				//fmt.Fprintf(os.Stderr, "STUN dial failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
+				//logSTUN("STUN dial failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				// 如果 context 被取消，错误会是 "context canceled"
 				results <- result{err: fmt.Errorf("STUN dial failed: %v", err)}
 				return
 			}
-			//fmt.Fprintf(os.Stderr, "stun dial: %s://%s OK\n", useNetwork, stunAddr)
+			//logSTUN("stun dial: %s://%s OK\n", useNetwork, stunAddr)
 
 			//这个conn不能defer Close，后面它可能是要保活的tcp。
 			//为了打洞的TCP在程序结束后该端口不出现TIME_WAIT，方便再次复用端口。使用策略：
@@ -137,7 +138,7 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 
 			client, err := stun.NewClient(conn)
 			if err != nil {
-				//fmt.Fprintf(os.Stderr, "STUN NewClient failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
+				//logSTUN("STUN NewClient failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				conn.Close()
 				results <- result{err: fmt.Errorf("STUN NewClient failed: %v", err)}
 				return
@@ -148,7 +149,7 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 
 			req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
-			//fmt.Fprintf(os.Stderr, "stun do request: %s://%s\n", useNetwork, stunAddr)
+			//logSTUN("stun do request: %s://%s\n", useNetwork, stunAddr)
 
 			// client.Do 不直接支持 context，但拨号阶段已经支持了。
 			// STUN 请求通常很快，超时主要由外层 context 控制。
@@ -161,19 +162,19 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 			})
 
 			if err != nil {
-				//fmt.Fprintf(os.Stderr, "STUN Do failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
+				//logSTUN("STUN Do failed: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				client.Close() //前面不能用defer Close，要自己Close
 				results <- result{err: fmt.Errorf("STUN Do failed: %v", err)}
 				return
 			}
 			if callErr != nil {
-				//fmt.Fprintf(os.Stderr, "STUN response error: %s://%s err: %v\n", useNetwork, stunAddr, callErr)
+				//logSTUN("STUN response error: %s://%s err: %v\n", useNetwork, stunAddr, callErr)
 				client.Close()
 				results <- result{err: fmt.Errorf("STUN response error: %v", callErr)}
 				return
 			}
 
-			//fmt.Fprintf(os.Stderr, "stun result: %s://%s(%s) %s\n", useNetwork, stunAddr, conn.RemoteAddr().String(), xorAddr.String())
+			//logSTUN("stun result: %s://%s(%s) %s\n", useNetwork, stunAddr, conn.RemoteAddr().String(), xorAddr.String())
 
 			// 2. 将成功的结果（包括连接和客户端）发送到 channel
 			// 注意：UDP连接是无状态的，不需要保留。TCP连接需要保留用于打洞。
@@ -214,7 +215,7 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 								tcpConn.SetLinger(0) // 立即关闭，发送 RST
 							}
 						}
-						//fmt.Fprintf(os.Stderr, "stun close: %s\n", r.conn.RemoteAddr().String())
+						//logSTUN("stun close: %s\n", r.conn.RemoteAddr().String())
 						r.client.Close()
 					}
 				}
@@ -268,7 +269,7 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 									tcpConn.SetLinger(0) // 立即关闭，发送 RST
 								}
 							}
-							//fmt.Fprintf(os.Stderr, "stun close: %s\n", otherResult.conn.RemoteAddr().String())
+							//logSTUN("stun close: %s\n", otherResult.conn.RemoteAddr().String())
 							otherResult.client.Close()
 						}
 					}
@@ -324,7 +325,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			basedUDPConn = sharedUDPConn
 		}
 
-		logDiscard := log.New(io.Discard, "", log.LstdFlags|log.Lshortfile)
+		logDiscard := misc.NewLog(io.Discard, "[UDPSession] ", log.LstdFlags|log.Lmsgprefix|log.Lshortfile)
 		UDPDialer, err = netx.NewUDPSessionDialer(basedUDPConn, false, 4096, logDiscard)
 		if err != nil {
 			return nil, err
@@ -381,7 +382,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			// Get the network type (e.g., "udp4", "tcp6")
 			useNetwork, laddr, err := resolveAddr(netProto)
 			if err != nil {
-				//fmt.Fprintf(os.Stderr, "stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
+				//logSTUN("stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
 				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("resolveAddr failed: %v", err)}
 				return
 			}
@@ -745,3 +746,10 @@ func analyzeSTUNResults(allResults []*STUNResult) []*AnalyzedStunResult {
 
 	return analyzedOutputs
 }
+
+// func logSTUN(format string, v ...interface{}) {
+// 	now := time.Now()
+// 	ts := now.Format("15:04:05.000")
+// 	args := append([]interface{}{ts}, v...)
+// 	fmt.Fprintf(os.Stderr, "[%s] [STUN] "+format+"\n", args...)
+// }

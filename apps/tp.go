@@ -3,12 +3,14 @@ package apps
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/threatexpert/gonc/v2/misc"
 )
 
 var (
@@ -16,15 +18,19 @@ var (
 )
 
 type AppTPConfig struct {
+	Logger      *log.Logger
 	proxyConfig *ProxyClientConfig
 	dialer      *ProxyClient
 }
 
-func AppTPConfigByArgs(args []string) (*AppTPConfig, error) {
-	config := &AppTPConfig{}
+func AppTPConfigByArgs(logWriter io.Writer, args []string) (*AppTPConfig, error) {
+	config := &AppTPConfig{
+		Logger: misc.NewLog(logWriter, "[:tp] ", log.LstdFlags|log.Lmsgprefix),
+	}
 
 	// 创建一个新的 FlagSet 实例
 	fs := flag.NewFlagSet("AppTPConfig", flag.ContinueOnError)
+	fs.SetOutput(logWriter)
 
 	var protocol, proxyAddr, authString string
 
@@ -47,7 +53,7 @@ func AppTPConfigByArgs(args []string) (*AppTPConfig, error) {
 		return nil, fmt.Errorf("unknown proxy address, please use -x ip:port")
 	}
 
-	config.proxyConfig, err = ProxyClientConfigByCommandline(protocol, authString, proxyAddr)
+	config.proxyConfig, err = ProxyClientConfigByCommandline(logWriter, protocol, authString, proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("ProxyClientConfigByCommandline failed: %v", err)
 	}
@@ -61,11 +67,11 @@ func AppTPConfigByArgs(args []string) (*AppTPConfig, error) {
 }
 
 func App_tp_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, ":tp Usage: [options]")
-	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fmt.Fprintln(fs.Output(), ":tp Usage: [options]")
+	fmt.Fprintln(fs.Output(), "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
-	fmt.Fprintln(os.Stderr, "\nExample:")
-	fmt.Fprintln(os.Stderr, "  :tp x.x.x.x:1080")
+	fmt.Fprintln(fs.Output(), "\nExample:")
+	fmt.Fprintln(fs.Output(), "  :tp x.x.x.x:1080")
 }
 
 func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
@@ -77,7 +83,7 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 		return
 	}
 	if !strings.HasPrefix(rhost, "127.") {
-		fmt.Fprintf(os.Stderr, "Only accept from 127.0.0.0/8, client(%s) closed.\n", conn.RemoteAddr().String())
+		config.Logger.Printf("Only accept from 127.0.0.0/8, client(%s) closed.\n", conn.RemoteAddr().String())
 		return
 	}
 	magicTarget, _, err := net.SplitHostPort(conn.LocalAddr().String())
@@ -89,15 +95,15 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 	}
 	targetHost, targetPort, err := DNSLookupMagicIP(magicTarget, true)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "DNSLookupMagicIP failed:", err)
+		config.Logger.Println("DNSLookupMagicIP failed:", err)
 		return
 	}
 
-	log.Printf("connecting %s:%d\n", targetHost, targetPort)
+	config.Logger.Printf("connecting %s:%d\n", targetHost, targetPort)
 
 	targetConn, err := config.dialer.Dialer.DialTimeout("tcp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)), 20*time.Second)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "DialTimeout failed:", err)
+		config.Logger.Println("DialTimeout failed:", err)
 		return
 	}
 

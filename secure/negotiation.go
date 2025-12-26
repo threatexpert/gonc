@@ -619,7 +619,6 @@ func startUDPKeepAlive(ctx context.Context, conn net.PacketConn, raddr net.Addr,
 				ticker = time.NewTicker(keepAliveInterval)
 			case <-ticker.C:
 				if _, err := conn.WriteTo(data, raddr); err != nil {
-					//fmt.Fprintf(os.Stderr, "keepAlive send failed: %v\n", err)
 					// 不退出，继续重试
 				}
 			}

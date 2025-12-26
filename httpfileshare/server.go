@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/threatexpert/gonc/v2/misc"
 )
 
 // FileInfo represents a file or directory for JSON listing.
@@ -62,7 +63,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.LoggerOutput == nil {
 		cfg.LoggerOutput = io.Discard
 	}
-	serverLogger := log.New(cfg.LoggerOutput, "[HTTP_SERVER] ", log.Ldate|log.Ltime)
+	serverLogger := misc.NewLog(cfg.LoggerOutput, "[HTTPSRV] ", log.LstdFlags|log.Lmsgprefix)
 
 	s := &Server{
 		config: cfg,

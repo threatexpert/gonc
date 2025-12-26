@@ -5,12 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/threatexpert/gonc/v2/httpfileshare"
+	"github.com/threatexpert/gonc/v2/misc"
 )
 
 // ==========================================
@@ -76,6 +77,7 @@ func (l *ChannelListener) InjectConn(c net.Conn) error {
 // ==========================================
 
 type AppHttpServerConfig struct {
+	Logger    *log.Logger
 	RootPaths []string
 	WebMode   bool
 
@@ -87,10 +89,12 @@ type AppHttpServerConfig struct {
 	startOnce sync.Once
 }
 
-func AppHttpServerConfigByArgs(args []string) (*AppHttpServerConfig, error) {
-	config := &AppHttpServerConfig{}
-
+func AppHttpServerConfigByArgs(logWriter io.Writer, args []string) (*AppHttpServerConfig, error) {
+	config := &AppHttpServerConfig{
+		Logger: misc.NewLog(logWriter, "[:httpserver] ", log.LstdFlags|log.Lmsgprefix),
+	}
 	fs := flag.NewFlagSet("AppHttpServerConfig", flag.ContinueOnError)
+	fs.SetOutput(logWriter)
 
 	// 支持的选项
 	fs.BoolVar(&config.WebMode, "webmode", true, "Enable web mode")
@@ -122,7 +126,7 @@ func AppHttpServerConfigByArgs(args []string) (*AppHttpServerConfig, error) {
 
 	srvcfg := httpfileshare.ServerConfig{
 		RootPaths:    config.RootPaths,
-		LoggerOutput: os.Stderr,
+		LoggerOutput: logWriter,
 		EnableZstd:   true,
 		Listener:     ln,
 		WebMode:      config.WebMode,
@@ -138,11 +142,11 @@ func AppHttpServerConfigByArgs(args []string) (*AppHttpServerConfig, error) {
 }
 
 func App_HttpServer_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, ":httpserver Usage: [options]")
-	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fmt.Fprintln(fs.Output(), ":httpserver Usage: [options]")
+	fmt.Fprintln(fs.Output(), "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
-	fmt.Fprintln(os.Stderr, "\nExample:")
-	fmt.Fprintln(os.Stderr, "  :httpserver ./site ./assets")
+	fmt.Fprintln(fs.Output(), "\nExample:")
+	fmt.Fprintln(fs.Output(), "  :httpserver ./site ./assets")
 }
 
 // ==========================================
@@ -153,10 +157,10 @@ func App_HttpServer_main_withconfig(conn net.Conn, config *AppHttpServerConfig) 
 	// 1. 确保 Server 已经启动 (只执行一次)
 	config.startOnce.Do(func() {
 		go func() {
-			logHS(os.Stderr, "Starting HTTP file server on virtual listener...")
+			config.Logger.Printf("Starting HTTP file server on virtual listener...")
 			err := config.server.Start()
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				logHS(os.Stderr, "Server error: %v", err)
+				config.Logger.Printf("Server error: %v", err)
 			}
 		}()
 	})
@@ -166,13 +170,13 @@ func App_HttpServer_main_withconfig(conn net.Conn, config *AppHttpServerConfig) 
 	if config.listener != nil {
 		err := config.listener.InjectConn(conn)
 		if err != nil {
-			logHS(os.Stderr, "Failed to inject connection: %v", err)
+			config.Logger.Printf("Failed to inject connection: %v", err)
 			conn.Close() // 如果注入失败，确保关闭连接
 		} else {
-			// logHS(os.Stderr, "Connection injected successfully")
+			// config.Logger.Printf("Connection injected successfully")
 		}
 	} else {
-		logHS(os.Stderr, "Error: Listener is not initialized")
+		config.Logger.Printf("Error: Listener is not initialized")
 		conn.Close()
 	}
 }
@@ -203,12 +207,4 @@ func validateRootPaths(rootPaths []string) error {
 	}
 
 	return nil
-}
-
-// 统一日志辅助函数
-func logHS(w io.Writer, format string, v ...interface{}) {
-	now := time.Now()
-	ts := now.Format("15:04:05.000")
-	args := append([]interface{}{ts}, v...)
-	fmt.Fprintf(w, "[%s] [:httpserver] "+format+"\n", args...)
 }

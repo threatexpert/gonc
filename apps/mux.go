@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +41,7 @@ type PortOwner struct {
 }
 
 type AppMuxConfig struct {
+	Logger           *log.Logger
 	Engine           string
 	AppMode          string
 	Port             string   // listen port
@@ -150,18 +150,19 @@ func bidirectionalCopy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 	}
 }
 
-func App_mux_usage() {
-	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "   :mux socks5")
-	fmt.Fprintln(os.Stderr, "   :mux linkagent")
-	fmt.Fprintln(os.Stderr, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
-	fmt.Fprintln(os.Stderr, "   :mux httpserver <rootDir1> <rootDir2>...")
-	fmt.Fprintln(os.Stderr, "   :mux httpclient <saveDir> <remotePath>")
-	fmt.Fprintln(os.Stderr, "   :mux -l listen_port")
+func App_mux_usage(logWriter io.Writer) {
+	fmt.Fprintln(logWriter, "Usage:")
+	fmt.Fprintln(logWriter, "   :mux socks5")
+	fmt.Fprintln(logWriter, "   :mux linkagent")
+	fmt.Fprintln(logWriter, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
+	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>...")
+	fmt.Fprintln(logWriter, "   :mux httpclient <saveDir> <remotePath>")
+	fmt.Fprintln(logWriter, "   :mux -l listen_port")
 }
 
-func AppMuxConfigByArgs(args []string) (*AppMuxConfig, error) {
+func AppMuxConfigByArgs(logWriter io.Writer, args []string) (*AppMuxConfig, error) {
 	config := &AppMuxConfig{
+		Logger:           misc.NewLog(logWriter, "[:mux] ", log.LstdFlags|log.Lmsgprefix),
 		Engine:           VarmuxEngine,
 		KeepAliveTimeout: VarMuxKeepAliveTimeout,
 	}
@@ -275,13 +276,13 @@ func App_mux_main_withconfig(conn net.Conn, config *AppMuxConfig) {
 		SessionConn:  conn,
 	}
 
-	err := handleMuxSession(cfg)
+	err := handleMuxSession(&cfg)
 	if err != nil {
-		log.Printf(":mux: %v\n", err)
+		config.Logger.Printf(":mux: %v\n", err)
 	}
 }
 
-func handleMuxSession(cfg MuxSessionConfig) error {
+func handleMuxSession(cfg *MuxSessionConfig) error {
 	switch cfg.AppMode {
 	case "listen":
 		return handleListenMode(cfg, nil, nil)
@@ -388,7 +389,7 @@ type linkRuntimeConfig struct {
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
 // 如果这一步返回 nil error，说明配置完全可用，可以放心地回复 OK
-func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (*linkRuntimeConfig, error) {
+func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.Values, ln net.Listener) (*linkRuntimeConfig, error) {
 	cfg := &linkRuntimeConfig{}
 	var err error
 	var cert *tls.Certificate
@@ -426,14 +427,14 @@ func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (
 		cfg.Username = params.Get("_user")
 		cfg.Password = params.Get("_password")
 
-		log.Printf("[link-x] Listening on %s (TProxy=%v)\n", ln.Addr().String(), cfg.UseTProxy)
+		muxcfg.Logger.Printf("[link-x] Listening on %s (TProxy=%v)\n", ln.Addr().String(), cfg.UseTProxy)
 		if cfg.UseTProxy {
 			donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
 			if donotUsePublicMagicDNS {
 				targetIpPref := strings.TrimRight(MagicDNServer, ".0")
-				log.Printf("   TProxy Format: 127.1.13.61:%s -> %s.1:3389\n", actualListenPort, targetIpPref)
+				muxcfg.Logger.Printf("   TProxy Format: 127.1.13.61:%s -> %s.1:3389\n", actualListenPort, targetIpPref)
 			} else {
-				log.Printf("   TProxy Format: 10.0.0.1-3389.%s:%s -> 10.0.0.1:3389\n", MagicDNServer, actualListenPort)
+				muxcfg.Logger.Printf("   TProxy Format: 10.0.0.1-3389.%s:%s -> 10.0.0.1:3389\n", MagicDNServer, actualListenPort)
 			}
 		}
 	case "f":
@@ -447,11 +448,11 @@ func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (
 			return nil, fmt.Errorf("invalid target address '%s': %v", cfg.ForwardTarget, err)
 		}
 		cfg.TargetPort, _ = strconv.Atoi(pStr)
-		log.Printf("[link-f] Listening on %s -> Forward to %s\n", ln.Addr().String(), cfg.ForwardTarget)
+		muxcfg.Logger.Printf("[link-f] Listening on %s -> Forward to %s\n", ln.Addr().String(), cfg.ForwardTarget)
 	case "raw":
-		log.Printf("[listen] Listening on %s\n", ln.Addr().String())
+		muxcfg.Logger.Printf("[listen] Listening on %s\n", ln.Addr().String())
 		if params.Get("mode") == "httpserver" {
-			log.Printf("You can open http://127.0.0.1:%s in your browser\n", actualListenPort)
+			muxcfg.Logger.Printf("You can open http://127.0.0.1:%s in your browser\n", actualListenPort)
 		}
 	}
 
@@ -460,8 +461,15 @@ func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (
 
 // runLinkListener 核心运行循环
 // 注意：现在它接收预处理好的 *linkRuntimeConfig，不再进行配置解析
-func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConfig *linkRuntimeConfig, doneChan <-chan struct{}) error {
+func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Listener, scheme string, rtConfig *linkRuntimeConfig, doneChan <-chan struct{}) error {
 	defer ln.Close()
+
+	s5config := Socks5uConfig{
+		Logger:     muxcfg.Logger,
+		Username:   rtConfig.Username,
+		Password:   rtConfig.Password,
+		AccessCtrl: muxcfg.AccessCtrl,
+	}
 
 	// 监听 doneChan (Session 死则 Listener 死)
 	go func() {
@@ -475,7 +483,7 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 		if rtConfig.UseTLS {
 			nconn, err := secure.DoNegotiation(rtConfig.NtConfig, c, io.Discard)
 			if err != nil {
-				log.Println("[link-x] TLS negotiation failed:", err)
+				muxcfg.Logger.Println("[link-x] TLS negotiation failed:", err)
 				c.Close()
 				return
 			}
@@ -487,7 +495,7 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 
 		stream, err := openMuxStream(session)
 		if err != nil {
-			log.Println("mux Open failed:", err)
+			muxcfg.Logger.Println("mux Open failed:", err)
 			return
 		}
 		streamWithCloseWrite := &streamWrapper{Conn: stream}
@@ -510,13 +518,13 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 				cmd = "T-CONNECT"
 				tHost, tPort, err = DNSLookupMagicIP(magicIP, false)
 				if err != nil {
-					log.Println("MagicIP lookup failed:", err)
+					muxcfg.Logger.Println("MagicIP lookup failed:", err)
 					return
 				}
 			}
 		}
 
-		ServeProxyOnTunnel(c, keyingMaterial, streamWithCloseWrite, cmd, rtConfig.Username, rtConfig.Password, tHost, tPort)
+		ServeProxyOnTunnel(&s5config, c, keyingMaterial, streamWithCloseWrite, cmd, tHost, tPort)
 	}
 
 	for {
@@ -549,18 +557,12 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 }
 
 // runLinkSessionWithHandshake 客户端握手逻辑
-func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf string) error {
+func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf string) error {
 	// 提前解析 Local Config
 	lScheme, lHost, lParams, err := parseLinkConfig(lConf)
 	if err != nil {
 		return fmt.Errorf("local config parse error: %v", err)
 	}
-
-	// -------------------------------------------------------------
-	// [STEP 1] 生成并注入指纹
-	// -------------------------------------------------------------
-
-	fingerprint := GenerateNetworkFingerprint(cfg.SessionConn.LocalAddr().String())
 
 	localActive := "0"
 	if lScheme != "none" {
@@ -569,27 +571,26 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 
 	sendConf := rConf
 	separator := "?"
-	if sendConf == "none" {
-		sendConf = fmt.Sprintf("none?peer_active=%s", localActive)
+	if strings.Contains(sendConf, "?") {
 		separator = "&"
-	} else {
-		if strings.Contains(sendConf, "?") {
-			separator = "&"
-		}
-		sendConf += fmt.Sprintf("%speer_active=%s", separator, localActive)
 	}
+	sendConf += fmt.Sprintf("%speer_active=%s", separator, localActive)
+	separator = "&"
 
-	// 强制追加 owner 参数
-	sendConf += fmt.Sprintf("%sowner=%s", separator, fingerprint)
+	if !strings.HasPrefix(rConf, "none") {
+		// 追加 owner 参数
+		fingerprint := GenerateNetworkFingerprint(cfg.SessionConn.LocalAddr().String())
+		sendConf += fmt.Sprintf("%sowner=%s", separator, fingerprint)
+	}
 	sendConf += "\n"
 	// -------------------------------------------------------------
 
-	log.Printf("[link] Sending Config: %s", strings.TrimSpace(sendConf))
+	cfg.Logger.Printf("[link] Sending R-Config: %s", strings.TrimSpace(sendConf))
 	if _, err := cfg.SessionConn.Write([]byte(sendConf)); err != nil {
 		return fmt.Errorf("failed to send remote config: %v", err)
 	}
 
-	log.Printf("[link] Waiting for Remote ACK...")
+	cfg.Logger.Printf("[link] Waiting for Remote ACK...")
 
 	// 2. 等待 ACK
 	ack, err := netx.ReadString(cfg.SessionConn, '\n', 1024)
@@ -600,7 +601,7 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 	if !strings.HasPrefix(ack, "OK") {
 		return fmt.Errorf("remote link failed: %s", ack)
 	}
-	log.Printf("[link] Remote ready (%s).", ack)
+	cfg.Logger.Printf("[link] Remote ready (%s).", ack)
 
 	cfg.SessionConn.SetDeadline(time.Time{})
 
@@ -612,7 +613,7 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 	remoteActive := !strings.HasPrefix(rConf, "none")
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, lParams.Get("outbound_bind"), cfg.AccessCtrl, !remoteActive)
+		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive)
 		close(sessionDone)
 	}()
 
@@ -623,14 +624,14 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 			return fmt.Errorf("local bind failed: %v", err)
 		}
 
-		rtConfig, err := setupLinkRuntimeConfig(lScheme, lParams, ln)
+		rtConfig, err := setupLinkRuntimeConfig(cfg, lScheme, lParams, ln)
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("local config setup failed: %v", err)
 		}
 
-		log.Printf("[link] Local service started.")
-		return runLinkListener(session, ln, lScheme, rtConfig, sessionDone)
+		cfg.Logger.Printf("[link] Local service started.")
+		return runLinkListener(cfg, session, ln, lScheme, rtConfig, sessionDone)
 	}
 
 	<-sessionDone
@@ -638,8 +639,8 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 }
 
 // handleLinkMode (Local)
-func handleLinkMode(cfg MuxSessionConfig) error {
-	log.Println("Waiting for linkagent handshake...")
+func handleLinkMode(cfg *MuxSessionConfig) error {
+	cfg.Logger.Println("Waiting for linkagent handshake...")
 	cfg.SessionConn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	// 1. 读取 Hello
@@ -659,11 +660,11 @@ func handleLinkMode(cfg MuxSessionConfig) error {
 
 // handleListenMode 仅用于 -l 模式
 // 已增强：自动探测 peer 类型。如果是 linkagent，则构造虚拟配置复用 Link 流程。
-func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done context.CancelFunc) error {
+func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done context.CancelFunc) error {
 	if done != nil {
 		defer done()
 	}
-	log.Println("Waiting for :mux handshake...")
+	cfg.Logger.Println("Waiting for :mux handshake...")
 	cfg.SessionConn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	hello := make([]byte, 16)
@@ -689,7 +690,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 		}
 		rConf := "none"
 
-		log.Printf("[listen] Detected linkagent peer. Upgrading to link mode (L=%s, R=%s)", lConf, rConf)
+		cfg.Logger.Printf("[listen] Detected linkagent peer. Upgrading to link mode (L=%s, R=%s)", lConf, rConf)
 
 		return runLinkSessionWithHandshake(cfg, lConf, rConf)
 	}
@@ -707,7 +708,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	// 单向模式：drainOnly = true
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, "", cfg.AccessCtrl, true)
+		startRemoteStreamAcceptLoop(cfg, session, "", true)
 		close(sessionDone)
 	}()
 
@@ -738,18 +739,18 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	}
 
 	// 关键改动：调用 setupLinkRuntimeConfig
-	rtConfig, err := setupLinkRuntimeConfig(scheme, params, ln)
+	rtConfig, err := setupLinkRuntimeConfig(cfg, scheme, params, ln)
 	if err != nil {
 		ln.Close()
 		return fmt.Errorf("legacy setup failed: %v", err)
 	}
 
-	log.Printf("[listen] Service started (Legacy). PeerMode=%s", peerModeStr)
-	return runLinkListener(session, ln, scheme, rtConfig, sessionDone)
+	cfg.Logger.Printf("[listen] Service started (Legacy). PeerMode=%s", peerModeStr)
+	return runLinkListener(cfg, session, ln, scheme, rtConfig, sessionDone)
 }
 
 // handleLinkAgentMode (Remote)
-func handleLinkAgentMode(cfg MuxSessionConfig) error {
+func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, "linkagent"); err != nil {
 		return err
 	}
@@ -796,18 +797,18 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 				// 情况 A: 旧连接是 Legacy 版 (没有指纹)
 				// 逻辑: "旧版无法被踢"。即便是新版也不允许踢旧版。
 				// 必须等旧版自己断开。
-				log.Printf("[mux] Port %s is held by Legacy client. Preemption DENIED.", bindKey)
+				cfg.Logger.Printf("[mux] Port %s is held by Legacy client. Preemption DENIED.", bindKey)
 				canPreempt = false
 			} else {
 				// 情况 B: 旧连接是 New 版 (有指纹)
 				// 逻辑: "新版有owner，按照认证匹配才能踢"
 				// 必须两个指纹都存在且相等
 				if ownerID != "" && ownerID == oldOwner.OwnerID {
-					log.Printf("[mux] Port %s owner match (%s). Allowing preemption.", bindKey, ownerID)
+					cfg.Logger.Printf("[mux] Port %s owner match (%s). Allowing preemption.", bindKey, ownerID)
 					canPreempt = true
 				} else {
 					// 指纹不匹配，或者新请求没带指纹
-					log.Printf("[mux] Port %s locked by %s. Rejecting %s.", bindKey, oldOwner.OwnerID, ownerID)
+					cfg.Logger.Printf("[mux] Port %s locked by %s. Rejecting %s.", bindKey, oldOwner.OwnerID, ownerID)
 					canPreempt = false
 				}
 			}
@@ -819,7 +820,7 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 			}
 
 			// 验证通过，执行踢人
-			log.Printf("[mux] Preempting port %s...", bindKey)
+			cfg.Logger.Printf("[mux] Preempting port %s...", bindKey)
 			if oldOwner.Listener != nil {
 				oldOwner.Listener.Close() // 这会强制旧 Session 退出
 			}
@@ -837,7 +838,7 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		}
 
 		// 3.2 配置分析
-		rtConfig, err = setupLinkRuntimeConfig(rScheme, rParams, ln)
+		rtConfig, err = setupLinkRuntimeConfig(cfg, rScheme, rParams, ln)
 		if err != nil {
 			ln.Close()
 			errMsg := fmt.Sprintf("ERROR: config setup failed: %v\n", err)
@@ -884,16 +885,16 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	log.Printf("[linkagent] Session established. OwnerID=%s", rParams.Get("owner"))
+	cfg.Logger.Printf("[linkagent] Session established. OwnerID=%s", rParams.Get("owner"))
 
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, rParams.Get("outbound_bind"), cfg.AccessCtrl, !peerActive)
+		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive)
 		close(sessionDone)
 	}()
 
 	if rScheme != "none" && ln != nil {
-		return runLinkListener(session, ln, rScheme, rtConfig, sessionDone)
+		return runLinkListener(cfg, session, ln, rScheme, rtConfig, sessionDone)
 	}
 
 	<-sessionDone
@@ -904,7 +905,7 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 // Legacy & Common Handlers
 // -----------------------------------------------------------------------------
 
-func handleHTTPClientMode(cfg MuxSessionConfig) error {
+func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 	cfg.Port = "0"
 	serverURL := ""
 	listenAddrChan := make(chan string, 1)
@@ -927,19 +928,19 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 			DryRun:                 false,
 			Verbose:                false,
 			LogLevel:               httpfileshare.LogLevelError,
-			LoggerOutput:           os.Stderr,
-			ProgressOutput:         os.Stderr,
+			LoggerOutput:           cfg.Logger.Writer(),
+			ProgressOutput:         cfg.Logger.Writer(),
 			ProgressUpdateInterval: 1 * time.Second,
 			NoCompress:             *VarhttpDownloadNoCompress,
 		}
 
 		c, err := httpfileshare.NewClient(httpcfg)
 		if err != nil {
-			log.Printf("Failed to create HTTP client: %v\n", err)
+			cfg.Logger.Printf("Failed to create HTTP client: %v\n", err)
 			return err
 		}
 		if err := c.Start(ctx); err != nil {
-			log.Printf("Client operation failed: %v\n", err)
+			cfg.Logger.Printf("Client operation failed: %v\n", err)
 			return err
 		}
 		<-ctx.Done()
@@ -948,8 +949,13 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 }
 
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
-func startRemoteStreamAcceptLoop(session interface{}, localbind string, accessCtrl *acl.ACL, drainOnly bool) error {
+func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool) error {
 	listener := &muxListener{session}
+	s5config := Socks5uConfig{
+		Logger:     cfg.Logger,
+		AccessCtrl: cfg.AccessCtrl,
+		Localbind:  localbind,
+	}
 	for {
 		stream, err := listener.Accept()
 		if err != nil {
@@ -964,7 +970,7 @@ func startRemoteStreamAcceptLoop(session interface{}, localbind string, accessCt
 			continue
 		}
 
-		go handleSocks5ClientOnStream(stream, localbind, accessCtrl)
+		go handleSocks5ClientOnStream(&s5config, stream)
 	}
 }
 
@@ -1023,7 +1029,7 @@ func prepareLocalListener(listenAddrConf string, enableTProxy bool) (net.Listene
 	return ln, nil
 }
 
-func handleSocks5uMode(cfg MuxSessionConfig) error {
+func handleSocks5uMode(cfg *MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
 		return err
 	}
@@ -1033,13 +1039,13 @@ func handleSocks5uMode(cfg MuxSessionConfig) error {
 		return fmt.Errorf("create mux session failed: %v", err)
 	}
 
-	log.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
-	err = startRemoteStreamAcceptLoop(session, "", cfg.AccessCtrl, false)
-	log.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
+	cfg.Logger.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
+	err = startRemoteStreamAcceptLoop(cfg, session, "", false)
+	cfg.Logger.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
 	return err
 }
 
-func handleHTTPServerMode(cfg MuxSessionConfig) error {
+func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
 		return err
 	}
@@ -1054,17 +1060,17 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 
 	srvcfg := httpfileshare.ServerConfig{
 		RootPaths:    cfg.HttpServerVDirs,
-		LoggerOutput: os.Stderr,
+		LoggerOutput: cfg.Logger.Writer(),
 		EnableZstd:   enableZstd,
 		Listener:     ln,
 	}
 
 	server, err := httpfileshare.NewServer(srvcfg)
 	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
+		cfg.Logger.Fatalf("Failed to create server: %v", err)
 	}
 
-	log.Println("httpserver ready on mux")
+	cfg.Logger.Println("httpserver ready on mux")
 
 	return server.Start()
 }

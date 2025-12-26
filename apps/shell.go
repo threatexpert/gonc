@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -22,17 +23,20 @@ func NewPtyShell(config *PtyShellConfig) (*PtyShell, error) {
 }
 
 type PtyShellConfig struct {
+	Logger                 *log.Logger
 	EnablePty, MergeStderr bool
 	Args                   []string
 }
 
 // PtyShellConfigByArgs 从命令行参数构造 config
-func PtyShellConfigByArgs(args []string) (*PtyShellConfig, error) {
+func PtyShellConfigByArgs(logWriter io.Writer, args []string) (*PtyShellConfig, error) {
 	config := &PtyShellConfig{
-		Args: []string{"/bin/sh"},
+		Logger: misc.NewLog(logWriter, "[:sh] ", log.LstdFlags|log.Lmsgprefix),
+		Args:   []string{"/bin/sh"},
 	}
 
 	fs := flag.NewFlagSet("PtyShellConfig", flag.ContinueOnError)
+	fs.SetOutput(logWriter)
 
 	fs.BoolVar(&config.EnablePty, "pty", true, "")
 	fs.BoolVar(&config.MergeStderr, "stderr", true, "Merge stderr into stdout")
@@ -55,12 +59,12 @@ func PtyShellConfigByArgs(args []string) (*PtyShellConfig, error) {
 }
 
 func PtyShell_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, "-sh Usage: [options] shell-path <args>")
-	fmt.Fprintln(os.Stderr, "Options:")
+	fmt.Fprintln(fs.Output(), "-sh Usage: [options] shell-path <args>")
+	fmt.Fprintln(fs.Output(), "Options:")
 	fs.PrintDefaults()
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "Examples:")
-	fmt.Fprintln(os.Stderr, "  -sh /bin/bash")
+	fmt.Fprintln(fs.Output(), "")
+	fmt.Fprintln(fs.Output(), "Examples:")
+	fmt.Fprintln(fs.Output(), "  -sh /bin/bash")
 }
 
 // App_shell_main_withconfig 启动 shell 并绑定到 conn
@@ -75,7 +79,7 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	if config.EnablePty {
 		ptmx, err := misc.PtyStart(cmd)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to start pty: %v\n", err)
+			config.Logger.Printf("Failed to start pty: %v\n", err)
 			return
 		}
 		input = ptmx
@@ -84,13 +88,13 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 		// 创建管道
 		stdinPipe, err := cmd.StdinPipe()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating stdin pipe: %v\n", err)
+			config.Logger.Printf("Error creating stdin pipe: %v\n", err)
 			return
 		}
 
 		stdoutPipe, err := cmd.StdoutPipe()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating stdout pipe: %v\n", err)
+			config.Logger.Printf("Error creating stdout pipe: %v\n", err)
 			return
 		}
 
@@ -105,7 +109,7 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 
 		// 启动命令
 		if err := cmd.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Command start error: %v\n", err)
+			config.Logger.Printf("Command start error: %v\n", err)
 			return
 		}
 	}
@@ -126,5 +130,5 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	}
 
 	<-done
-	//fmt.Fprintf(os.Stderr, "App_shell_main_withconfig done\n")
+	//config.Logger.Printf("App_shell_main_withconfig done\n")
 }

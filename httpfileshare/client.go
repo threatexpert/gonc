@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd" // For Zstd decompression
+	"github.com/threatexpert/gonc/v2/misc"
 )
 
 // LogLevel defines the verbosity of logging.
@@ -243,8 +244,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		errorWriter = cfg.LoggerOutput
 	}
 
-	infoLogger := log.New(infoWriter, "[INFO] ", log.Ldate|log.Ltime)
-	errorLogger := log.New(errorWriter, "[ERROR] ", log.Ldate|log.Ltime|log.Lshortfile) // Add Lshortfile for error origin
+	infoLogger := misc.NewLog(infoWriter, "[HTTPCLI] ", log.LstdFlags|log.Lmsgprefix)
+	errorLogger := misc.NewLog(errorWriter, "[HTTP_ERROR] ", log.LstdFlags|log.Lmsgprefix|log.Lshortfile) // Add Lshortfile for error origin
 
 	if cfg.ProgressOutput == nil {
 		cfg.ProgressOutput = io.Discard

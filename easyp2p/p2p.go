@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	mathrand "math/rand"
 	"net"
 	"net/url"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
 )
@@ -404,7 +406,6 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 			opts.OnConnectionLost = func(_ mqtt.Client, err error) {
 				// 这里只记录，不做逻辑判断
 				// 自动重连 + OnConnect 会负责恢复
-				// log.Printf("mqtt lost (%d): %v", index, err)
 			}
 
 			client := mqtt.NewClient(opts)
@@ -1969,18 +1970,13 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 }
 
-func logwts(logWriter io.Writer, msg string, args ...interface{}) {
-	timestamp := time.Now().Format("20060102-150405")
-	fmt.Fprintf(logWriter, "%s ", timestamp)
-	fmt.Fprintf(logWriter, msg, args...)
-}
-
 func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Duration, logWriter io.Writer) (string, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	topicCID := MQTT_GenerateClientID(TopicDesc_WAIT, sessionUid, 0)
-	logwts(logWriter, "Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
+	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
+	logger.Printf("Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
 
 	expectMsgPrefix := "SYN@"
 	filterSYN := func(data string) (bool, error) {
@@ -1995,14 +1991,14 @@ func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Dura
 		return "", err
 	}
 	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
-	logwts(logWriter, "Received event: %s, (via %s)\n", string(recvData), brokerServer)
+	logger.Printf("Received event: %s, (via %s)\n", string(recvData), brokerServer)
 	if !strings.HasPrefix(recvData, "SYN@") {
 		return "", fmt.Errorf("not the expected message")
 	}
 	tid := strings.TrimPrefix(recvData, "SYN@")
 	msgACK := "ACK@" + tid
 
-	logwts(logWriter, "Waiting for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
+	logger.Printf("Waiting for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
 	expectMsgPrefix = recvData
 	recvData2, _, err := MQTT_SecureExchange(ctx, EXMODE_reply, msgACK, topicCID, topicSalt, sessionUid, localIP, 15*time.Second, filterSYN)
 	if err != nil {
@@ -2015,20 +2011,122 @@ func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Dura
 	return tid, err
 }
 
-func MQTTHello(ctx context.Context, sessionUid, localIP, helloPayload string, timeout time.Duration, logWriter io.Writer) (string, error) {
+type HelloPayload struct {
+	Control []string
+	App     string
+	Param   string
+}
+
+func (h HelloPayload) String() string {
+	a := h.AppString()
+	if len(h.Control) == 0 && len(a) == 0 {
+		return ""
+	}
+	c := ""
+	if len(h.Control) != 0 {
+		c = ";" + strings.Join(h.Control, ";")
+	}
+	if len(a) == 0 {
+		return c
+	} else {
+		return c + "|" + a
+	}
+}
+
+func (h HelloPayload) AppString() string {
+	if h.App == "" {
+		return ""
+	}
+	return h.App + "::" + h.Param
+}
+
+func (h *HelloPayload) SetControlValue(key, val string) {
+	h.Control = append(h.Control, key+"="+val)
+}
+
+func (h HelloPayload) GetControlValue(key string) (string, bool) {
+	key = strings.ToLower(key)
+
+	for _, c := range h.Control {
+		kv := strings.SplitN(c, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		if strings.ToLower(kv[0]) == key {
+			return kv[1], true
+		}
+	}
+	return "", false
+}
+
+func HelloPayloadFromString(topicSalt string) HelloPayload {
+	var hp HelloPayload
+
+	if topicSalt == "" {
+		return hp
+	}
+
+	// 拆 Control | App
+	parts := strings.SplitN(topicSalt, "|", 2)
+	if len(parts) != 2 && len(parts) != 1 {
+		return hp
+	}
+
+	controlPart := parts[0]
+	appPart := ""
+	if len(parts) == 2 {
+		appPart = parts[1]
+	}
+
+	// 解析 Control：以 ; 开头，按 ; 分割
+	ctrls := strings.Split(controlPart, ";")
+	for i, c := range ctrls {
+		// skip first item which is the real topicSalt
+		if i >= 1 && c != "" {
+			hp.Control = append(hp.Control, c)
+		}
+	}
+
+	// 解析 App::Param
+	if appPart != "" {
+		ap := strings.SplitN(appPart, "::", 2)
+		hp.App = ap[0]
+		if len(ap) == 2 {
+			hp.Param = ap[1]
+		}
+	}
+
+	return hp
+}
+
+func ParseMQTTHelloPayload(topicSalt string) (control, app, prefix string) {
+	parts := strings.SplitN(topicSalt, "|", 2)
+	if len(parts) != 2 {
+		return
+	}
+
+	control = parts[0]
+	app = parts[1]
+
+	if p := strings.SplitN(app, "::", 2); len(p) == 2 {
+		prefix = p[0]
+	}
+	return
+}
+
+func MQTTHello(ctx context.Context, sessionUid, localIP string, helloPayload HelloPayload, timeout time.Duration, logWriter io.Writer) (string, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	topicCID := MQTT_GenerateClientID(TopicDesc_HELLO, sessionUid, 0)
-	logwts(logWriter, "MQTT: Pushing Hello to topic %s across %d servers\n", topic, len(MQTTBrokerServers))
+	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
+	logger.Printf("Pushing Hello to topic %s across %d servers\n", topic, len(MQTTBrokerServers))
 
 	tid, err := secure.GenerateSecureRandomString(10)
 	if err != nil {
 		return "", fmt.Errorf("generate salt failed: %v", err)
 	}
-	if helloPayload != "" {
-		tid += "|" + helloPayload
-	}
+	tid += helloPayload.String()
 	msgSYN := "SYN@" + tid
 	msgACK := "ACK@" + tid
 
@@ -2048,7 +2146,7 @@ func MQTTHello(ctx context.Context, sessionUid, localIP, helloPayload string, ti
 	}
 
 	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
-	logwts(logWriter, "MQTT: Hello operation completed (via %s). tid: %s\n", brokerServer, tid)
+	logger.Printf("Hello operation completed (via %s). tid: %s\n", brokerServer, tid)
 	return tid, nil
 }
 

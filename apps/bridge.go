@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/threatexpert/gonc/v2/easyp2p"
+	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
 )
@@ -27,15 +29,15 @@ type AppBridgeConfig struct {
 }
 
 // AppBridgeConfigByArgs 解析给定的 []string 参数，生成 AppBridgeConfig
-func AppBridgeConfigByArgs(args []string) (*AppBridgeConfig, error) {
+func AppBridgeConfigByArgs(logWriter io.Writer, args []string) (*AppBridgeConfig, error) {
 	// 由于bridge的功能都可以调用nc的功能实现，所以这里直接调用AppNetcatConfigByArgs进行解析
 	config := &AppBridgeConfig{}
 	var err error
-	config.ncconfig, err = AppNetcatConfigByArgs(":br", args)
+	config.ncconfig, err = AppNetcatConfigByArgs(logWriter, ":br", args)
 	if err != nil {
 		return nil, err // 解析错误直接返回
 	}
-
+	config.ncconfig.Logger = misc.NewLog(logWriter, "[:br] ", log.LstdFlags|log.Lmsgprefix)
 	config.ncconfig.ConsoleMode = false
 	config.ncconfig.progressEnabled = false
 
@@ -275,7 +277,7 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 			if err != nil {
 				log.Fatal(err)
 			}
-			log.Println("conn debug http listening on", addr)
+			config.ncconfig.Logger.Println("conn debug http listening on", addr)
 		}
 	})
 
@@ -306,12 +308,12 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 
 		for {
 			if times_tried >= max_errors {
-				logBR(ncconfig.LogWriter, "Bridge(%s) failed after %d attempts.", sessid_L8, max_errors)
+				ncconfig.Logger.Printf("Bridge(%s) failed after %d attempts.", sessid_L8, max_errors)
 				return
 			}
 
 			if _, ok := brAcceptSessCache.Load(sessid_L8); !ok {
-				logBR(ncconfig.LogWriter, "Bridge(%s) aborted.", sessid_L8)
+				ncconfig.Logger.Printf("Bridge(%s) aborted.", sessid_L8)
 				return
 			}
 
@@ -321,17 +323,20 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 				//未激活sessid前，一直发送1，表示首次建立
 				sessidround = fmt.Sprintf("%s#1", sessid_L8)
 			}
-			config.ncconfig.MQTTHelloPayload = "br::" + sessidround
+			config.ncconfig.MQTTHelloPayload = easyp2p.HelloPayload{
+				App:   "br",
+				Param: sessidround,
+			}
 
 			round += 1
 
-			logBR(ncconfig.LogWriter, "Establishing Bridge(%s) ...", sessidround)
+			ncconfig.Logger.Printf("Establishing Bridge(%s) ...", sessidround)
 
 			// 1. 建立 P2P 连接
 			nconn, err := do_P2P(config.ncconfig)
 			if err != nil {
-				logBR(ncconfig.LogWriter, "P2P connection failed: %v", err)
-				logBR(ncconfig.LogWriter, "Will retry in 10 seconds...")
+				ncconfig.Logger.Printf("P2P connection failed: %v", err)
+				ncconfig.Logger.Printf("Will retry in 10 seconds...")
 				time.Sleep(10 * time.Second)
 				times_tried += 1
 				continue
@@ -342,7 +347,7 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 			sessid_actived = true
 			times_tried = 1 // reset on success
 
-			logBR(ncconfig.LogWriter, "Bridge(%s) established via P2P. Forwarding...", sessidround)
+			ncconfig.Logger.Printf("Bridge(%s) established via P2P. Forwarding...", sessidround)
 
 			// 记录开始时间，用于判断是否是闪断
 			start := time.Now()
@@ -353,11 +358,11 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 			duration := time.Since(start)
 
 			if duration < 2*time.Second {
-				logBR(ncconfig.LogWriter, "Bridge(%s) closed too quickly (%v). Stopping bridge.", sessidround, duration)
+				ncconfig.Logger.Printf("Bridge(%s) closed too quickly (%v). Stopping bridge.", sessidround, duration)
 				return
 			}
 
-			logBR(ncconfig.LogWriter, "Bridge(%s) Connection lost after %v. Retrying in 1 second...", sessidround, duration)
+			ncconfig.Logger.Printf("Bridge(%s) Connection lost after %v. Retrying in 1 second...", sessidround, duration)
 			time.Sleep(1 * time.Second)
 		}
 	} else {
@@ -368,18 +373,18 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 		defer brConnCache.Delete(cid)
 
 		bridgeinfo := MQTTHelloPayload
-		logBR(ncconfig.LogWriter, "Received bridge info: %s", bridgeinfo)
+		ncconfig.Logger.Printf("Received bridge info: %s", bridgeinfo)
 
 		// 2. 解析 sessid 和 序号
 		parts := strings.Split(bridgeinfo, "#")
 		if len(parts) != 2 {
-			logBR(ncconfig.LogWriter, "Invalid handshake format")
+			ncconfig.Logger.Printf("Invalid handshake format")
 			return
 		}
 		sessid := parts[0]
 		count, err := strconv.Atoi(parts[1])
 		if err != nil {
-			logBR(ncconfig.LogWriter, "Invalid retry count: %v", err)
+			ncconfig.Logger.Printf("Invalid retry count: %v", err)
 			return
 		}
 
@@ -394,7 +399,7 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 				// --- Resume Logic ---
 				// 尝试复用 active connection (支持 TCP/UDP)
 				if oldSess.conn != nil {
-					logBR(ncconfig.LogWriter, "Resuming session %s, Kicking old handler...", sessid)
+					ncconfig.Logger.Printf("Resuming session %s, Kicking old handler...", sessid)
 					// 踢出会话：设置 ReadDeadline 让旧的 bidirectionalCopy2 退出
 					oldSess.conn.SetReadDeadline(time.Now())
 
@@ -402,9 +407,9 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 					if oldSess.done != nil {
 						select {
 						case <-oldSess.done:
-							logBR(ncconfig.LogWriter, "Previous session(%s) detached.", sessid)
+							ncconfig.Logger.Printf("Previous session(%s) detached.", sessid)
 						case <-time.After(5 * time.Second):
-							logBR(ncconfig.LogWriter, "Warning: Timeout waiting for previous session(%s) detach..", sessid)
+							ncconfig.Logger.Printf("Warning: Timeout waiting for previous session(%s) detach..", sessid)
 							return
 						}
 					}
@@ -414,12 +419,12 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 					targetConn = oldSess.conn
 				} else {
 					// 缓存里没有 conn 对象
-					logBR(ncconfig.LogWriter, "Session %s not found for resume. rejected", sessid)
+					ncconfig.Logger.Printf("Session %s not found for resume. rejected", sessid)
 					return
 				}
 			} else {
 				// --- Collision Logic (Count <= 1 but cache exists) ---
-				logBR(ncconfig.LogWriter, "New session %s collision, closing old session...", sessid)
+				ncconfig.Logger.Printf("New session %s collision, closing old session...", sessid)
 				if oldSess.conn != nil {
 					oldSess.conn.SetReadDeadline(time.Now())
 					oldSess.conn.Close() // 强制关闭旧连接
@@ -433,7 +438,7 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 				}
 			}
 		} else if count > 1 {
-			logBR(ncconfig.LogWriter, "Session %s not found for resume. rejected", sessid)
+			ncconfig.Logger.Printf("Session %s not found for resume. rejected", sessid)
 			return
 		}
 
@@ -442,12 +447,12 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 			var err error
 			targetConn, err = dialWithLocalBind(config.ncconfig.network, config.ncconfig.host, config.ncconfig.port, localbind)
 			if err != nil {
-				logBR(ncconfig.LogWriter, "Dial target failed: %v", err)
+				ncconfig.Logger.Printf("Dial target failed: %v", err)
 				return
 			}
-			logBR(ncconfig.LogWriter, "Dialed new target: %s -> %s", targetConn.LocalAddr(), targetConn.RemoteAddr())
+			ncconfig.Logger.Printf("Dialed new target: %s -> %s", targetConn.LocalAddr(), targetConn.RemoteAddr())
 		} else {
-			logBR(ncconfig.LogWriter, "Reusing existing target connection(%s): %s-> %s", sessid, targetConn.LocalAddr(), targetConn.RemoteAddr())
+			ncconfig.Logger.Printf("Reusing existing target connection(%s): %s-> %s", sessid, targetConn.LocalAddr(), targetConn.RemoteAddr())
 		}
 
 		// 创建当前会话的结束信号
@@ -464,11 +469,11 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 		// 确保函数退出时关闭 done channel，通知等待者
 		defer close(sessionDone)
 
-		logBR(ncconfig.LogWriter, "Bridge(%s) connected to target. Forwarding...", bridgeinfo)
+		ncconfig.Logger.Printf("Bridge(%s) connected to target. Forwarding...", bridgeinfo)
 
 		// 执行转发
 		bidirectionalCopy2(config.ncconfig, targetConn, sess)
-		logBR(ncconfig.LogWriter, "Bridge(%s) finished.", bridgeinfo)
+		ncconfig.Logger.Printf("Bridge(%s) finished.", bridgeinfo)
 
 		brDialSessCache.Store(sessid, cachedSession{
 			localBind: targetConn.LocalAddr().String(),
@@ -532,7 +537,7 @@ func bidirectionalCopy2(ncconfig *AppNetcatConfig, local net.Conn, stream net.Co
 		defer wg.Done()
 		IsUDP := strings.HasPrefix(local.LocalAddr().Network(), "udp")
 		err := copyWithProgress(ncconfig, stream, local, blocksize, !IsUDP, nil, 0)
-		logBR(ncconfig.LogWriter, "Bridge direction local -> stream closed: %v", err)
+		ncconfig.Logger.Printf("Bridge direction local -> stream closed: %v", err)
 		stream.Close()
 	}()
 	// 2: stream -> local
@@ -540,19 +545,9 @@ func bidirectionalCopy2(ncconfig *AppNetcatConfig, local net.Conn, stream net.Co
 		defer wg.Done()
 		IsUDP := strings.HasPrefix(stream.LocalAddr().Network(), "udp")
 		err := copyWithProgress(ncconfig, local, stream, bufsize, !IsUDP, nil, 0)
-		logBR(ncconfig.LogWriter, "Bridge direction stream -> local closed: %v", err)
+		ncconfig.Logger.Printf("Bridge direction stream -> local closed: %v", err)
 		local.SetReadDeadline(time.Now())
 	}()
 	wg.Wait()
 	stream.Close()
-}
-
-// --- Utils ---
-
-// 统一日志辅助函数
-func logBR(w io.Writer, format string, v ...interface{}) {
-	now := time.Now()
-	ts := now.Format("15:04:05.000")
-	args := append([]interface{}{ts}, v...)
-	fmt.Fprintf(w, "[%s] [:br] "+format+"\n", args...)
 }

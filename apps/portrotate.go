@@ -7,9 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,14 +34,18 @@ type AppPortRotateConfig struct {
 	ncconfigCopied       bool
 	stats_in             *misc.ProgressStats
 	stats_out            *misc.ProgressStats
+	Logger               *log.Logger
 }
 
 // AppPortRotateConfigByArgs 解析给定的 []string 参数，生成 AppPortRotateConfig
-func AppPortRotateConfigByArgs(args []string) (*AppPortRotateConfig, error) {
-	config := &AppPortRotateConfig{}
+func AppPortRotateConfigByArgs(logWriter io.Writer, args []string) (*AppPortRotateConfig, error) {
+	config := &AppPortRotateConfig{
+		Logger: misc.NewLog(logWriter, "[:pr] ", log.LstdFlags|log.Lmsgprefix),
+	}
 
 	// 创建一个新的 FlagSet 实例
 	fs := flag.NewFlagSet("AppPortRotateConfig", flag.ContinueOnError)
+	fs.SetOutput(logWriter)
 	fs.UintVar(&config.Period, "period", 0, "Rotation interval in seconds")
 	fs.StringVar(&config.HttpAddr, "http", "", "Local HTTP server address for management (e.g. :8080)")
 	strRotationTrafficLimit := ""
@@ -79,11 +83,11 @@ func AppPortRotateConfigByArgs(args []string) (*AppPortRotateConfig, error) {
 
 // App_PortRotate_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
 func App_PortRotate_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, ":pr Usage: [options]")
-	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fmt.Fprintln(fs.Output(), ":pr Usage: [options]")
+	fmt.Fprintln(fs.Output(), "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
-	fmt.Fprintln(os.Stderr, "\nExample:")
-	fmt.Fprintln(os.Stderr, "  :pr -period 300 -rotate-bytes 500MB -http 8080")
+	fmt.Fprintln(fs.Output(), "\nExample:")
+	fmt.Fprintln(fs.Output(), "  :pr -period 300 -rotate-bytes 500MB -http 8080")
 }
 
 // ==========================================
@@ -93,7 +97,7 @@ func App_PortRotate_usage_flagSet(fs *flag.FlagSet) {
 func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.NegotiationConfig, ncconfig *AppNetcatConfig, config *AppPortRotateConfig) {
 	// 注意：controlConn 的关闭操作已移交给 RotateController 管理，这里不再直接 defer close
 
-	logPR(ncconfig.LogWriter, "PortRotate Starts")
+	config.Logger.Printf("PortRotate Starts")
 
 	// 定义退出信号，用于清理监听错误的主协程
 	mainDone := make(chan struct{})
@@ -125,7 +129,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	bridge, err := netx.NewBridge()
 	if err != nil {
-		logPR(ncconfig.LogWriter, "NewBridge failed: %v", err)
+		config.Logger.Printf("NewBridge failed: %v", err)
 		controlConn.Close()
 		return
 	}
@@ -141,7 +145,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 	// 初始连接使用配置中的默认网络类型 (空字符串表示不覆盖)
 	connC, err := makeP2PDataSession(config, int(dataSessId), "")
 	if err != nil {
-		logPR(ncconfig.LogWriter, "makeP2PDataSession failed: %v", err)
+		config.Logger.Printf("makeP2PDataSession failed: %v", err)
 		controlConn.Close()
 		return
 	}
@@ -149,22 +153,26 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 	bridge.SetForwarder(connC)
 
 	secureConfig := *ncconfig.connConfig
-	secureConfig.Key = ncconfig.p2pSessionKey
-	secureConfig.KeyType = "PSK"
 	secureConfig.IsClient = nconnConfig.IsClient
 	secureConfig.KcpWithUDP = true
-	secureConfig.SecureLayer = "dtls"
+	secureConfig.Key = nconnConfig.Key
+	secureConfig.KeyType = nconnConfig.KeyType
+	if secureConfig.KeyType == "ECDHE" {
+		secureConfig.SecureLayer = "dss"
+	} else {
+		secureConfig.SecureLayer = "dtls"
+	}
 
 	secureDataSess, err := secure.DoNegotiation(&secureConfig, bridge.B, ncconfig.LogWriter)
 	if err != nil {
-		logPR(ncconfig.LogWriter, "DoNegotiation failed: %v", err)
+		config.Logger.Printf("DoNegotiation failed: %v", err)
 		controlConn.Close()
 		return
 	}
 	// 确保退出时关闭上层连接
 	defer secureDataSess.Close()
 
-	logPR(ncconfig.LogWriter, "PortRotate data connection is ready")
+	config.Logger.Printf("PortRotate data connection is ready")
 
 	// --- 控制器与事件处理器初始化 ---
 
@@ -204,14 +212,14 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 		select {
 		case err := <-bridge.ErrCh:
 			if err != nil {
-				logPR(ncconfig.LogWriter, "BridgeConn fatal error received: %v. Shutting down.", err)
+				config.Logger.Printf("BridgeConn fatal error received: %v. Shutting down.", err)
 				secureDataSess.Close()
 				ctrl.Stop()
 			}
 		case err := <-handler.errCh:
 			// 监听 Controller 错误
 			if err != nil {
-				logPR(ncconfig.LogWriter, "ControlConn fatal error: %v. Shutting down.", err)
+				config.Logger.Printf("ControlConn fatal error: %v. Shutting down.", err)
 				secureDataSess.Close()
 				// ctrl 已经停止或正在停止
 			}
@@ -252,7 +260,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 				// 1. 检查时间周期
 				if currentPeriod > 0 && time.Since(lastRotateTime).Seconds() > float64(currentPeriod) {
-					logPR(ncconfig.LogWriter, "[Trigger] Period limit reached (%ds).", currentPeriod)
+					config.Logger.Printf("[Trigger] Period limit reached (%ds).", currentPeriod)
 					shouldRotate = true
 				}
 
@@ -264,7 +272,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 					delta := currentTotal - last
 					if currentLimit > 0 && delta > currentLimit {
 						// 使用 formatBytes 使日志更易读
-						logPR(ncconfig.LogWriter, "[Trigger] Traffic limit reached: %s > %s",
+						config.Logger.Printf("[Trigger] Traffic limit reached: %s > %s",
 							formatBytes(delta), formatBytes(currentLimit))
 						shouldRotate = true
 					}
@@ -282,7 +290,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	config.ncconfig.sessionReady = true
 	handleNegotiatedConnection(&misc.ConsoleIO{}, &config.ncconfig, secureDataSess, config.stats_in, config.stats_out)
-	logPR(ncconfig.LogWriter, "PortRotate ends")
+	config.Logger.Printf("PortRotate ends")
 }
 
 func makeP2PDataSession(config *AppPortRotateConfig, id int, networkOverride string) (net.Conn, error) {
@@ -296,7 +304,7 @@ func makeP2PDataSession(config *AppPortRotateConfig, id int, networkOverride str
 		targetNetwork = networkOverride
 	}
 
-	logPR(config.ncconfig.LogWriter, "Making P2P data session with id %d (Network: %s)", id, targetNetwork)
+	config.Logger.Printf("Making P2P data session with id %d (Network: %s)", id, targetNetwork)
 	topicSalt := fmt.Sprintf("%d", id)
 
 	// 注意：这里我们将 networkOverride 传递给 Easy_P2P_MP
@@ -570,7 +578,7 @@ type rotateBusinessHandler struct {
 
 // Handler 内部日志方法，复用全局辅助函数
 func (h *rotateBusinessHandler) log(format string, v ...interface{}) {
-	logPR(h.ncconfig.LogWriter, format, v...)
+	h.config.Logger.Printf(format, v...)
 }
 
 func (h *rotateBusinessHandler) OnConfigSynced(remoteConfig AppPortRotateConfig) {
@@ -904,12 +912,4 @@ func formatBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-// 统一日志辅助函数
-func logPR(w io.Writer, format string, v ...interface{}) {
-	now := time.Now()
-	ts := now.Format("15:04:05.000")
-	args := append([]interface{}{ts}, v...)
-	fmt.Fprintf(w, "[%s] [:pr] "+format+"\n", args...)
 }

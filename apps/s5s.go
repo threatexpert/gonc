@@ -3,9 +3,9 @@ package apps
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -15,6 +15,7 @@ import (
 )
 
 type AppS5SConfig struct {
+	Logger        *log.Logger
 	Username      string
 	Password      string
 	EnableConnect bool
@@ -28,11 +29,14 @@ type AppS5SConfig struct {
 }
 
 // AppS5SConfigByArgs 解析给定的 []string 参数，生成 AppS5SConfig
-func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
-	config := &AppS5SConfig{}
+func AppS5SConfigByArgs(logWriter io.Writer, args []string) (*AppS5SConfig, error) {
+	config := &AppS5SConfig{
+		Logger: misc.NewLog(logWriter, "[:s5s] ", log.LstdFlags|log.Lmsgprefix),
+	}
 
 	// 创建一个新的 FlagSet 实例
 	fs := flag.NewFlagSet("AppS5SConfig", flag.ContinueOnError)
+	fs.SetOutput(logWriter)
 
 	var authString string // 用于接收 -auth 的值
 	fs.StringVar(&authString, "auth", "", "Username and password for SOCKS5 authentication (format: user:pass)")
@@ -75,11 +79,11 @@ func AppS5SConfigByArgs(args []string) (*AppS5SConfig, error) {
 
 // App_s5s_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
 func App_s5s_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, ":s5s Usage: [options]")
-	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fmt.Fprintln(fs.Output(), ":s5s Usage: [options]")
+	fmt.Fprintln(fs.Output(), "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
-	fmt.Fprintln(os.Stderr, "\nExample:")
-	fmt.Fprintln(os.Stderr, "  :s5s -auth user:password")
+	fmt.Fprintln(fs.Output(), "\nExample:")
+	fmt.Fprintln(fs.Output(), "  :s5s -auth user:password")
 }
 
 func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig, stats_in, stats_out *misc.ProgressStats) {
@@ -90,7 +94,7 @@ func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *App
 	bufConn := netx.NewBufferedConn(conn)
 	head, err := bufConn.Reader.Peek(1)
 	if err != nil {
-		log.Printf("Peek from %s error : %v", conn.RemoteAddr(), err)
+		config.Logger.Printf("Peek from %s error : %v", conn.RemoteAddr(), err)
 		return
 	} else if len(head) == 0 {
 		return
@@ -99,13 +103,13 @@ func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *App
 	// 判断协议并分流
 	if head[0] == 0x05 {
 		if !config.EnableSocks5 {
-			log.Printf("Denied %s, SOCKS5 proxy is disabled.", conn.RemoteAddr())
+			config.Logger.Printf("Denied %s, SOCKS5 proxy is disabled.", conn.RemoteAddr())
 			return
 		}
 		handleSocks5Proxy(bufConn, keyingMaterial, config, stats_in, stats_out)
 	} else {
 		if !config.EnableHTTP {
-			log.Printf("Denied %s, HTTP proxy is disabled.", conn.RemoteAddr())
+			config.Logger.Printf("Denied %s, HTTP proxy is disabled.", conn.RemoteAddr())
 			return
 		}
 		handleHTTPProxy(bufConn, config)

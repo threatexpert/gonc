@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -19,11 +18,19 @@ import (
 func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig, stats_in, stats_out *misc.ProgressStats) {
 	defer conn.Close()
 
-	s5config := Socks5ServerConfig{
+	s5config := Socks5uConfig{
+		Logger:     config.Logger,
+		Username:   config.Username,
+		Password:   config.Password,
+		ServerIP:   config.ServerIP,
+		Localbind:  config.Localbind,
+		AccessCtrl: config.AccessCtrl,
+	}
+	s5auth := &Socks5AuthConfig{
 		AuthenticateUser: nil,
 	}
 	if config.Username != "" || config.Password != "" {
-		s5config.AuthenticateUser = func(username, password string) bool {
+		s5auth.AuthenticateUser = func(username, password string) bool {
 			return username == config.Username && password == config.Password
 		}
 	}
@@ -31,30 +38,30 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 
 	// 1. SOCKS5 握手
-	err := handleSocks5Handshake(conn, s5config)
+	err := handleSocks5Handshake(conn, s5auth)
 	if err != nil {
-		log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+		config.Logger.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
 	// 2. SOCKS5 请求 (TCP CONNECT 、BIND 或 UDP ASSOCIATE)
 	req, err := handleSocks5Request(conn)
 	if err != nil {
-		log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
+		config.Logger.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
 	conn.SetReadDeadline(time.Time{})
 
 	if req.Command == "CONNECT" && config.EnableConnect {
-		err = handleDirectTCPConnect(conn, req.Host, req.Port, config.Localbind, config.AccessCtrl)
+		err = handleDirectTCPConnect(&s5config, conn, req.Host, req.Port)
 		if err != nil {
-			log.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
+			config.Logger.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 		}
 	} else if req.Command == "BIND" && config.EnableBind {
 		err = handleTCPListen(conn, config.ServerIP, req.Host, req.Port)
 		if err != nil {
-			log.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
+			config.Logger.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
 		}
 	} else if req.Command == "UDP" && config.EnableUDP {
 		fakeTunnelC, rawS := net.Pipe()
@@ -64,12 +71,12 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
-			handleSocks5ClientOnStream(c, config.Localbind, config.AccessCtrl)
+			handleSocks5ClientOnStream(&s5config, c)
 		}(fakeTunnelS)
 
-		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, fakeTunnelC, config.ServerIP, req.Host, req.Port)
+		err = handleUDPAssociateViaTunnel(&s5config, conn, keyingMaterial, fakeTunnelC, req.Host, req.Port)
 		if err != nil {
-			log.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
+			config.Logger.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 		}
 		fakeTunnelC.Close()
 		fakeTunnelS.Close()
@@ -78,7 +85,7 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 		sendSocks5Response(conn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
 	}
 
-	log.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
+	config.Logger.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
 }
 
 func handleHTTPProxy(conn *netx.BufferedConn, config *AppS5SConfig) error {
@@ -89,11 +96,11 @@ func handleHTTPProxy(conn *netx.BufferedConn, config *AppS5SConfig) error {
 
 	if req.Method == http.MethodConnect {
 		// HTTPS 隧道：建立连接后必须保持长连接进行双向转发
-		return handleHTTPConnect(conn, req, config.Localbind, config.AccessCtrl)
+		return handleHTTPConnect(conn, req, config)
 	}
 
 	// 普通 HTTP
-	return handleHTTPForwardSimple(conn, req, config.Localbind, config.AccessCtrl)
+	return handleHTTPForwardSimple(conn, req, config)
 }
 
 func handleHTTPProxyHandShake(conn *netx.BufferedConn, username, password string) (*http.Request, error) {
@@ -149,7 +156,7 @@ func handleHTTPProxyHandShake(conn *netx.BufferedConn, username, password string
 }
 
 // handleHTTPForwardSimple 处理普通 HTTP 请求，不支持 Keep-Alive，并包含 ACL 和 Localbind 支持
-func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, localBind string, accessCtrl *acl.ACL) error {
+func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *AppS5SConfig) error {
 	// 1. URL 修正
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"
@@ -167,15 +174,15 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, localBind s
 	}
 	targetAddrStr := net.JoinHostPort(targetHost, targetPort)
 
-	log.Printf("HTTP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddrStr)
-	defer log.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
+	config.Logger.Printf("HTTP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddrStr)
+	defer config.Logger.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
 
 	// 3. ACL 检查与地址解析 (逻辑复用自 handleHTTPConnect)
 	// 使用 context 控制解析超时
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, accessCtrl, "tcp", targetAddrStr)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddrStr)
 	if err != nil {
 		if isDenied {
 			// 被 ACL 拒绝：返回 403 Forbidden
@@ -193,8 +200,8 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, localBind s
 		KeepAlive: 30 * time.Second,
 	}
 	// 如果配置了本地出口 IP，进行绑定
-	if localBind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localBind, "0"))
+	if config.Localbind != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
 		if err != nil {
 			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			return fmt.Errorf("resolve local bind address failed: %w", err)
@@ -264,13 +271,13 @@ func delHopHeaders(header http.Header) {
 	}
 }
 
-func handleHTTPConnect(clientConn net.Conn, req *http.Request, localBind string, accessCtrl *acl.ACL) error {
-	log.Printf("HTTP-CONNECT: %s->%s connecting...", clientConn.RemoteAddr().String(), req.Host)
-	defer log.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
+func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SConfig) error {
+	config.Logger.Printf("HTTP-CONNECT: %s->%s connecting...", clientConn.RemoteAddr().String(), req.Host)
+	defer config.Logger.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
 
 	dialer := &net.Dialer{}
-	if localBind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localBind, "0"))
+	if config.Localbind != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
 		if err != nil {
 			return err
 		}
@@ -280,7 +287,7 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, localBind string,
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, accessCtrl, "tcp", req.Host)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", req.Host)
 	if err != nil {
 		if isDenied {
 			clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))

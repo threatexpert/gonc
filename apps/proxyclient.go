@@ -6,10 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -167,6 +167,7 @@ func (c *ProxyClient) SupportBIND() bool {
 }
 
 type ProxyClientConfig struct {
+	Logger           *log.Logger
 	Prot, User, Pass string           //代理协议类型："socks5" 或 "http"
 	TlsEnabled       bool             // -tls (bool)
 	Cert             *tls.Certificate // 如果tlsEnabled是true，这个就需要用到
@@ -214,7 +215,7 @@ func IsSecureNegotiationNeeded(config *ProxyClientConfig) bool {
 	return config.TlsEnabled || config.KcpWithUDP || config.PresharedKey != ""
 }
 
-func ProxyClientConfigByCommandline(proxyProt, auth, commandline string) (*ProxyClientConfig, error) {
+func ProxyClientConfigByCommandline(logWriter io.Writer, proxyProt, auth, commandline string) (*ProxyClientConfig, error) {
 	args, err := misc.ParseCommandLine(commandline)
 	if err != nil {
 		return nil, fmt.Errorf("parse command line failed: %v", err)
@@ -223,7 +224,7 @@ func ProxyClientConfigByCommandline(proxyProt, auth, commandline string) (*Proxy
 		return nil, fmt.Errorf("empty proxy args")
 	}
 
-	config, err := ProxyClientConfigByArgs(args)
+	config, err := ProxyClientConfigByArgs(logWriter, args)
 	if err != nil {
 		return nil, err
 	}
@@ -248,14 +249,16 @@ func ProxyClientConfigByCommandline(proxyProt, auth, commandline string) (*Proxy
 	return config, nil
 }
 
-func ProxyClientConfigByArgs(args []string) (*ProxyClientConfig, error) {
+func ProxyClientConfigByArgs(logWriter io.Writer, args []string) (*ProxyClientConfig, error) {
 	config := &ProxyClientConfig{
+		Logger:  misc.NewLog(logWriter, "[:x] ", log.LstdFlags|log.Lmsgprefix),
 		Network: "tcp", // 默认值
 	}
 
 	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
 	// 设置 ContinueOnError 允许我们捕获错误而不是直接退出
 	fs := flag.NewFlagSet("ProxyClientConfig", flag.ContinueOnError)
+	fs.SetOutput(logWriter)
 
 	fs.BoolVar(&config.TlsEnabled, "tls", false, "Enable TLS encryption")
 	var is4, is6 bool
@@ -331,12 +334,12 @@ func ProxyClientConfigByArgs(args []string) (*ProxyClientConfig, error) {
 }
 
 func Proxy_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(os.Stderr, "-x Usage: [options] <host:port>")
-	fmt.Fprintln(os.Stderr, "Or:    [options]  <host> <port>")
-	fmt.Fprintln(os.Stderr, "\nOptions:")
+	fmt.Fprintln(fs.Output(), "-x Usage: [options] <host:port>")
+	fmt.Fprintln(fs.Output(), "Or:    [options]  <host> <port>")
+	fmt.Fprintln(fs.Output(), "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
-	fmt.Fprintln(os.Stderr, "\nExamples:")
-	fmt.Fprintln(os.Stderr, "  -x \"-tls -psk randomString <host:port>\"")
+	fmt.Fprintln(fs.Output(), "\nExamples:")
+	fmt.Fprintln(fs.Output(), "  -x \"-tls -psk randomString <host:port>\"")
 }
 
 func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {

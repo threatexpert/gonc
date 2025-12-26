@@ -10,6 +10,7 @@ import (
 	"time"
 
 	pkgerr "github.com/pkg/errors" // 引入 pkg/errors 来模拟错误包装
+	"github.com/threatexpert/gonc/v2/misc"
 )
 
 func TestUDP1toN(t *testing.T) {
@@ -24,7 +25,7 @@ func TestUDP1toN(t *testing.T) {
 	}
 	log.Printf("Shared UDPConn listening on %s", sharedUDPConn.LocalAddr().String())
 
-	logToStderr := log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+	logToStderr := misc.NewLog(os.Stderr, "[UDPSession] ", log.LstdFlags|log.Lmsgprefix|log.Lshortfile)
 	// 2. 使用这个共享的 UDPConn 初始化你的 UDPSessionDialer
 	dialer, err := NewUDPSessionDialer(sharedUDPConn, false, 1500, logToStderr)
 	if err != nil {

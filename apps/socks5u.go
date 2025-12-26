@@ -59,12 +59,21 @@ const (
 	TUNNEL_REQ_UDP = "udp://"
 )
 
-// Socks5ServerConfig 用于配置 SOCKS5 服务器的行为，包括认证
-type Socks5ServerConfig struct {
+// Socks5AuthConfig 用于配置 SOCKS5 服务器的行为，包括认证
+type Socks5AuthConfig struct {
 	// AuthenticateUser 是一个函数，用于验证用户名和密码。
 	// 如果配置为 nil，则表示服务器不要求用户密码认证。
 	// 如果非 nil，服务器将要求客户端进行用户密码认证。
 	AuthenticateUser func(username, password string) bool
+}
+
+type Socks5uConfig struct {
+	Logger     *log.Logger
+	Username   string
+	Password   string
+	ServerIP   string
+	Localbind  string
+	AccessCtrl *acl.ACL
 }
 
 // sendSocks5AuthResponse 发送 SOCKS5 用户名/密码认证阶段的响应
@@ -80,7 +89,7 @@ type Socks5Request struct {
 }
 
 // handleSocks5Handshake 处理 SOCKS5 握手阶段
-func handleSocks5Handshake(conn net.Conn, config Socks5ServerConfig) error {
+func handleSocks5Handshake(conn net.Conn, authconfig *Socks5AuthConfig) error {
 	buf := make([]byte, 256)
 
 	// 1. 读取 VER (版本) 和 NMETHODS (方法数量)
@@ -106,7 +115,7 @@ func handleSocks5Handshake(conn net.Conn, config Socks5ServerConfig) error {
 	var chosenMethod byte = 0xFF // 默认：无可用方法
 
 	// 检查服务器是否要求认证
-	if config.AuthenticateUser != nil {
+	if authconfig.AuthenticateUser != nil {
 		// 服务器要求认证，优先选择 USERNAME/PASSWORD
 		for _, method := range methodsBuf {
 			if method == AUTH_USERNAME_PASSWORD {
@@ -192,7 +201,7 @@ func handleSocks5Handshake(conn net.Conn, config Socks5ServerConfig) error {
 		password := string(passwordBuf)
 
 		// --- 执行用户认证逻辑 ---
-		if !config.AuthenticateUser(username, password) { // 使用配置中提供的认证函数
+		if !authconfig.AuthenticateUser(username, password) { // 使用配置中提供的认证函数
 			sendSocks5AuthResponse(conn, AUTH_STATUS_FAILURE)
 			return fmt.Errorf("authentication failed for user: %s", username)
 		}
@@ -331,7 +340,7 @@ func sendSocks5Response(conn net.Conn, rep byte, bindAddr string, bindPort int) 
 }
 
 // handleTCPConnectViaTunnel 处理 TCP CONNECT 命令并通过隧道转发
-func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, transparent bool, targetHost string, targetPort int) error {
+func handleTCPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunnelStream net.Conn, transparent bool, targetHost string, targetPort int) error {
 	// 发送代理请求给远端: "tcp://target_host:target_port\n"
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
@@ -342,13 +351,13 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, trans
 		}
 		return fmt.Errorf("write tunnel request error: %w", err)
 	}
-	log.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+	config.Logger.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
 
 	tunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
 	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
 	responseLine, err := netx.ReadString(tunnelStream, '\n', 1024)
 	if err != nil {
-		log.Printf("%s->%s error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
+		config.Logger.Printf("%s->%s error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
 		if !transparent {
 			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
 		}
@@ -357,7 +366,7 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, trans
 	responseLine = strings.TrimSpace(responseLine)
 
 	if !strings.HasPrefix(responseLine, "OK") {
-		log.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
+		config.Logger.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
 		if !transparent {
 			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0) // 根据远端错误细化SOCKS5错误码
 		}
@@ -379,7 +388,7 @@ func handleTCPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, trans
 	return nil
 }
 
-func handleHTTPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int) error {
+func handleHTTPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int) error {
 	// 发送代理请求给远端: "tcp://target_host:target_port\n"
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
@@ -389,20 +398,20 @@ func handleHTTPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targ
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("write tunnel request error: %w", err)
 	}
-	log.Printf("HTTP-CONNECT: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+	config.Logger.Printf("HTTP-CONNECT: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
 
 	tunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
 	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
 	responseLine, err := netx.ReadString(tunnelStream, '\n', 1024)
 	if err != nil {
-		log.Printf("%s->%s tunnel read error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
+		config.Logger.Printf("%s->%s tunnel read error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("read tunnel response error: %w", err)
 	}
 	responseLine = strings.TrimSpace(responseLine)
 
 	if !strings.HasPrefix(responseLine, "OK") {
-		log.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
+		config.Logger.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("tunnel handshake failed: %s", responseLine)
 	}
@@ -419,7 +428,7 @@ func handleHTTPConnectViaTunnel(clientConn net.Conn, tunnelStream net.Conn, targ
 	return nil
 }
 
-func handleHTTPRequestViaTunnel(clientConn net.Conn, req *http.Request, tunnelConn net.Conn, targetHost string, targetPort int) error {
+func handleHTTPRequestViaTunnel(config *Socks5uConfig, clientConn net.Conn, req *http.Request, tunnelConn net.Conn, targetHost string, targetPort int) error {
 
 	bufTunnelStream := netx.NewBufferedConn(tunnelConn)
 
@@ -432,20 +441,20 @@ func handleHTTPRequestViaTunnel(clientConn net.Conn, req *http.Request, tunnelCo
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("write tunnel request error: %w", err)
 	}
-	log.Printf("HTTP-REQ: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+	config.Logger.Printf("HTTP-REQ: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
 
 	bufTunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
 	// 读取远端连接结果（例如 "OK\n" 或 "ERROR: reason\n"）
 	responseLine, err := bufTunnelStream.Reader.ReadString('\n')
 	if err != nil {
-		log.Printf("%s->%s tunnel read error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
+		config.Logger.Printf("%s->%s tunnel read error: %v", clientConn.RemoteAddr().String(), targetAddr, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("read tunnel response error: %w", err)
 	}
 	responseLine = strings.TrimSpace(responseLine)
 
 	if !strings.HasPrefix(responseLine, "OK") {
-		log.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
+		config.Logger.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("tunnel handshake failed: %s", responseLine)
 	}
@@ -488,7 +497,7 @@ func handleHTTPRequestViaTunnel(clientConn net.Conn, req *http.Request, tunnelCo
 }
 
 // handleUDPAssociateViaTunnel 处理 UDP ASSOCIATE 命令并通过隧道转发
-func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, tunnelStream net.Conn, serverIP, targetHost string, targetPort int) error {
+func handleUDPAssociateViaTunnel(config *Socks5uConfig, clientConn net.Conn, keyingMaterial [32]byte, tunnelStream net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	// 1. 本地 SOCKS5 服务器为客户端创建一个 UDP 监听端口
 	//    客户端会将 UDP 数据包发送到这个本地端口
@@ -506,10 +515,10 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 	}
 	defer localUDPConn.Close() // 确保本地 UDP 监听器关闭
 
-	log.Printf("UDP-Associate-C: Using UDP socket: %s", localUDPConn.LocalAddr())
+	config.Logger.Printf("UDP-Associate-C: Using UDP socket: %s", localUDPConn.LocalAddr())
 
 	//不指定具体serverIP时将告诉客户端0.0.0.0，因为服务器看不到自己真正的公网IP，localUDPConn.LocalAddr()可能会服务器的内网IP
-	bindIP := serverIP
+	bindIP := config.ServerIP
 	bindPort := localUDPConn.LocalAddr().(*net.UDPAddr).Port
 
 	// 2. 回复 SOCKS5 客户端成功响应，告知其本地 UDP 转发的地址和端口
@@ -536,7 +545,7 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 	responseLine = strings.TrimSpace(responseLine)
 
 	if !strings.HasPrefix(responseLine, "OK") {
-		log.Printf("Tunnel UDP associate failed: %s", responseLine)
+		config.Logger.Printf("Tunnel UDP associate failed: %s", responseLine)
 		return fmt.Errorf("tunnel UDP associate failed: %s", responseLine)
 	}
 
@@ -572,10 +581,10 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 	}
 
 	if keyingMaterial == [32]byte{} {
-		handleLocalUDPToTunnel(localUDPConn, tunnelStream, clientIP)
+		handleLocalUDPToTunnel(config, localUDPConn, tunnelStream, clientIP)
 	} else {
 		localUDPConnSS, _ := secure.NewSecureUDPConn(localUDPConn, keyingMaterial)
-		handleLocalUDPToTunnel(localUDPConnSS, tunnelStream, clientIP)
+		handleLocalUDPToTunnel(config, localUDPConnSS, tunnelStream, clientIP)
 	}
 
 	clientConn.Close()
@@ -586,7 +595,7 @@ func handleUDPAssociateViaTunnel(clientConn net.Conn, keyingMaterial [32]byte, t
 // handleLocalUDPToTunnel 是运行在本地客户端
 // 负责将本地 SOCKS5 客户端的 UDP 数据包封装并通过 tunnelStream 发送给远端
 // 并接收远端封装的 UDP 响应，解封装后发回给客户端。
-func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, clientIP net.IP) {
+func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, tunnelStream net.Conn, clientIP net.IP) {
 	var clientActualUDPAddr *net.UDPAddr // 记录 SOCKS5 客户端的实际 UDP 源地址
 	var once sync.Once                   // 确保只捕获一次客户端 UDP 地址
 
@@ -601,7 +610,7 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 		defer wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Recovered from panic in localUDPConn to tunnelStream: %v", r)
+				config.Logger.Printf("Recovered from panic in localUDPConn to tunnelStream: %v", r)
 			}
 			cancel()
 		}()
@@ -617,27 +626,27 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
 				}
-				log.Printf("Error reading from local UDP for client %s: %v", clientIP, err)
+				config.Logger.Printf("Error reading from local UDP for client %s: %v", clientIP, err)
 				return // 非临时错误或连接关闭，退出 goroutine
 			}
 			cliUDPAddr := cliAddr.(*net.UDPAddr) // 确保类型转换正确
 
 			// 确保只处理来自 SOCKS5 客户端 IP 的 UDP 包，增强安全性
 			if clientIP != nil && !cliUDPAddr.IP.Equal(clientIP) {
-				log.Printf("Received UDP packet from unexpected source: %s, expected: %s. Dropping.", cliUDPAddr.IP, clientIP)
+				config.Logger.Printf("Received UDP packet from unexpected source: %s, expected: %s. Dropping.", cliUDPAddr.IP, clientIP)
 				continue
 			}
 
 			// 首次收到客户端的 UDP 包时，保存其源地址
 			once.Do(func() {
 				clientActualUDPAddr = cliUDPAddr
-				log.Printf("UDP: %s associated", clientActualUDPAddr)
+				config.Logger.Printf("UDP: %s associated", clientActualUDPAddr)
 			})
 
 			// 封装数据包：[Length (2 bytes)] [SOCKS5 UDP Header + Data]
 			// 确保数据包长度在 2 字节可表示的范围内
 			if n > 65535 {
-				log.Printf("UDP packet too large (%d bytes) for 2-byte length prefix. Dropping.", n)
+				config.Logger.Printf("UDP packet too large (%d bytes) for 2-byte length prefix. Dropping.", n)
 				continue
 			}
 			binary.BigEndian.PutUint16(lengthBytes, uint16(n)) // 写入长度
@@ -645,13 +654,13 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 			// 写入长度前缀
 			_, err = tunnelStream.Write(lengthBytes)
 			if err != nil {
-				log.Printf("Error writing length prefix to tunnel stream: %v", err)
+				config.Logger.Printf("Error writing length prefix to tunnel stream: %v", err)
 				return
 			}
 			// 写入完整的 SOCKS5 UDP 数据报
 			_, err = tunnelStream.Write(buf[:n])
 			if err != nil {
-				log.Printf("Error writing SOCKS5 UDP packet to tunnel stream: %v", err)
+				config.Logger.Printf("Error writing SOCKS5 UDP packet to tunnel stream: %v", err)
 				return
 			}
 		}
@@ -662,7 +671,7 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 		defer wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Recovered from panic in tunnelStream to localUDPConn: %v", r)
+				config.Logger.Printf("Recovered from panic in tunnelStream to localUDPConn: %v", r)
 			}
 			cancel()
 		}()
@@ -682,21 +691,21 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 					continue // 超时，继续等待
 				}
 				if err == io.EOF {
-					log.Println("Tunnel stream closed from remote for UDP responses. Exiting.")
+					config.Logger.Println("Tunnel stream closed from remote for UDP responses. Exiting.")
 					return // 流关闭
 				}
-				log.Printf("Error reading length prefix from tunnel stream: %v", err)
+				config.Logger.Printf("Error reading length prefix from tunnel stream: %v", err)
 				return // 非 EOF 错误，退出
 			}
 
 			packetLength := binary.BigEndian.Uint16(lengthBytes) // 解析长度
 
 			if packetLength == 0 {
-				log.Printf("Received zero-length UDP packet from tunnel. Skipping.")
+				config.Logger.Printf("Received zero-length UDP packet from tunnel. Skipping.")
 				continue
 			}
 			if packetLength > uint16(len(packetBuf)) {
-				log.Printf("Received too large UDP packet from tunnel (%d bytes). Dropping.", packetLength)
+				config.Logger.Printf("Received too large UDP packet from tunnel (%d bytes). Dropping.", packetLength)
 				// 尝试跳过这个无效包，但可能导致同步问题
 				// 更好的做法是直接退出，因为这表明协议错误
 				return
@@ -706,21 +715,21 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 			_, err = io.ReadFull(tunnelStream, packetBuf[:packetLength])
 			if err != nil {
 				if err == io.EOF {
-					log.Println("Tunnel stream closed from remote while reading UDP packet body. Exiting.")
+					config.Logger.Println("Tunnel stream closed from remote while reading UDP packet body. Exiting.")
 				}
-				log.Printf("Error reading UDP packet body from tunnel stream: %v", err)
+				config.Logger.Printf("Error reading UDP packet body from tunnel stream: %v", err)
 				return // 错误，退出
 			}
 
 			// 3. 将 SOCKS5 UDP 数据报发送回 SOCKS5 客户端
 			if clientActualUDPAddr == nil {
-				log.Printf("Warning: Client's UDP address not yet known for sending responses. Dropping packet from tunnel.")
+				config.Logger.Printf("Warning: Client's UDP address not yet known for sending responses. Dropping packet from tunnel.")
 				continue // 客户端还没发过包，不知道往哪里回传
 			}
 
 			_, err = localUDPConn.WriteTo(packetBuf[:packetLength], clientActualUDPAddr)
 			if err != nil {
-				log.Printf("Error writing UDP response to client %s via local UDP: %v", clientActualUDPAddr, err)
+				config.Logger.Printf("Error writing UDP response to client %s via local UDP: %v", clientActualUDPAddr, err)
 				// 这里通常不直接 return，因为可能只是单个包发送失败，不影响后续包
 				// 但如果错误是连接关闭，那也会在 ReadFromUDP 时检测到并退出
 			}
@@ -737,11 +746,11 @@ func handleLocalUDPToTunnel(localUDPConn net.PacketConn, tunnelStream net.Conn, 
 	wg.Wait()
 }
 
-func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort int, localbind string, accessCtrl *acl.ACL) error {
+func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	dialer := &net.Dialer{}
-	if localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localbind, "0"))
+	if config.Localbind != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
 		if err != nil {
 			return err
 		}
@@ -750,7 +759,7 @@ func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort i
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, accessCtrl, "tcp", targetAddr)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddr)
 	if err != nil {
 		if isDenied {
 			sendSocks5Response(clientConn, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0)
@@ -761,7 +770,7 @@ func handleDirectTCPConnect(clientConn net.Conn, targetHost string, targetPort i
 	}
 
 	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddr.String())
-	log.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
+	config.Logger.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
 
 	if err != nil {
 		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
@@ -863,7 +872,7 @@ func handleTCPListen(clientConn net.Conn, serverIP string, targetHost string, ta
 	return nil
 }
 
-func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn, cmd, username, password, targetHost string, targetPort int) {
+func ServeProxyOnTunnel(config *Socks5uConfig, conn net.Conn, keyingMaterial [32]byte, stream net.Conn, cmd, targetHost string, targetPort int) {
 	/*
 		conn 是本地应用接入的客户端连接
 		stream 是通过mux申请下来的一个channel
@@ -871,7 +880,7 @@ func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn,
 		2、将代理请求封装为自定义的代理协议格式 "tcp://target_host:target_port\n" 通过stream发送请求到远端
 		3、等待stream反馈连接结果，再将结果反馈给 conn
 	*/
-	log.Printf("New client connected from %s", conn.RemoteAddr())
+	config.Logger.Printf("New client connected from %s", conn.RemoteAddr())
 	var err error
 	var httpreq *http.Request
 
@@ -881,7 +890,7 @@ func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn,
 		bufConn := netx.NewBufferedConn(conn)
 		head, err := bufConn.Reader.Peek(1)
 		if err != nil {
-			log.Printf("Peek from %s error : %v", conn.RemoteAddr(), err)
+			config.Logger.Printf("Peek from %s error : %v", conn.RemoteAddr(), err)
 			return
 		} else if len(head) == 0 {
 			return
@@ -891,24 +900,24 @@ func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn,
 		switch head[0] {
 		case 0x05:
 			// 1. SOCKS5 握手
-			s5config := Socks5ServerConfig{
+			s5auth := Socks5AuthConfig{
 				AuthenticateUser: nil,
 			}
-			if username != "" || password != "" {
-				s5config.AuthenticateUser = func(u, p string) bool {
-					return u == username && p == password
+			if config.Username != "" || config.Password != "" {
+				s5auth.AuthenticateUser = func(u, p string) bool {
+					return u == config.Username && p == config.Password
 				}
 			}
-			err = handleSocks5Handshake(bufConn, s5config)
+			err = handleSocks5Handshake(bufConn, &s5auth)
 			if err != nil {
-				log.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
+				config.Logger.Printf("SOCKS5 handshake failed for %s: %v", conn.RemoteAddr(), err)
 				return
 			}
 
 			// 2. SOCKS5 请求 (TCP CONNECT 或 UDP ASSOCIATE)
 			req, err := handleSocks5Request(bufConn)
 			if err != nil {
-				log.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
+				config.Logger.Printf("SOCKS5 request failed for %s: %v", conn.RemoteAddr(), err)
 				return
 			}
 
@@ -916,9 +925,9 @@ func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn,
 			targetHost, targetPort = req.Host, req.Port
 			conn = bufConn
 		default:
-			req, err := handleHTTPProxyHandShake(bufConn, username, password)
+			req, err := handleHTTPProxyHandShake(bufConn, config.Username, config.Password)
 			if err != nil {
-				log.Printf("HTTP handshake failed for %s: %v", conn.RemoteAddr(), err)
+				config.Logger.Printf("HTTP handshake failed for %s: %v", conn.RemoteAddr(), err)
 				return
 			}
 			if req.Method == http.MethodConnect {
@@ -960,77 +969,77 @@ func ServeProxyOnTunnel(conn net.Conn, keyingMaterial [32]byte, stream net.Conn,
 	switch cmd {
 	case "CONNECT", "T-CONNECT":
 		transparent := cmd == "T-CONNECT"
-		err = handleTCPConnectViaTunnel(conn, stream, transparent, targetHost, targetPort)
+		err = handleTCPConnectViaTunnel(config, conn, stream, transparent, targetHost, targetPort)
 	case "HTTP-CONNECT":
-		err = handleHTTPConnectViaTunnel(conn, stream, targetHost, targetPort)
+		err = handleHTTPConnectViaTunnel(config, conn, stream, targetHost, targetPort)
 	case "HTTP-REQ":
-		err = handleHTTPRequestViaTunnel(conn, httpreq, stream, targetHost, targetPort)
+		err = handleHTTPRequestViaTunnel(config, conn, httpreq, stream, targetHost, targetPort)
 	case "UDP":
-		err = handleUDPAssociateViaTunnel(conn, keyingMaterial, stream, "", targetHost, targetPort)
+		err = handleUDPAssociateViaTunnel(config, conn, keyingMaterial, stream, targetHost, targetPort)
 	default:
-		log.Printf("Unsupported command: %s, from client %s ", cmd, conn.RemoteAddr())
+		config.Logger.Printf("Unsupported command: %s, from client %s ", cmd, conn.RemoteAddr())
 		return
 	}
 
 	if err != nil {
-		log.Printf("Proxy session %s->%s (%s) finished with error: %v",
+		config.Logger.Printf("Proxy session %s->%s (%s) finished with error: %v",
 			conn.RemoteAddr(), targetHost, cmd, err)
 	} else {
-		log.Printf("Proxy session %s->%s (%s) finished.",
+		config.Logger.Printf("Proxy session %s->%s (%s) finished.",
 			conn.RemoteAddr(), targetHost, cmd)
 	}
 }
 
 // handleSocks5ClientOnMuxStream 处理每个通过 MuxSession 传入的 Stream
-func handleSocks5ClientOnStream(tunnelStream net.Conn, localbind string, accessCtrl *acl.ACL) {
+func handleSocks5ClientOnStream(config *Socks5uConfig, tunnelStream net.Conn) {
 	defer tunnelStream.Close()
 
 	// 读取流的第一个请求行
 	requestLine, err := netx.ReadString(tunnelStream, '\n', 1024)
 	if err != nil {
-		log.Printf("Failed to read request line from mux stream: %v", err)
+		config.Logger.Printf("Failed to read request line from mux stream: %v", err)
 		return
 	}
 	requestLine = strings.TrimSpace(requestLine)
 
 	if strings.HasPrefix(requestLine, TUNNEL_REQ_TCP) {
 		targetAddr := strings.TrimPrefix(requestLine, TUNNEL_REQ_TCP)
-		handleRemoteTCPConnect(tunnelStream, targetAddr, localbind, accessCtrl)
+		handleRemoteTCPConnect(config, tunnelStream, targetAddr)
 	} else if strings.HasPrefix(requestLine, TUNNEL_REQ_UDP) {
-		handleRemoteUDPAssociate(tunnelStream, localbind, accessCtrl)
+		handleRemoteUDPAssociate(config, tunnelStream)
 	} else {
-		log.Printf("Unknown request type from mux stream: %s", requestLine)
+		config.Logger.Printf("Unknown request type from mux stream: %s", requestLine)
 		// 向流写入错误响应
 		_, writeErr := tunnelStream.Write([]byte("ERROR: Unknown request type\n"))
 		if writeErr != nil {
-			log.Printf("Failed to write error response: %v", writeErr)
+			config.Logger.Printf("Failed to write error response: %v", writeErr)
 		}
 		return
 	}
 }
 
 // handleRemoteTCPConnect 处理远端 TCP CONNECT 代理
-func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string, localbind string, accessCtrl *acl.ACL) {
-	log.Printf("TCP-Connect: %s", targetAddr)
+func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, targetAddr string) {
+	config.Logger.Printf("TCP-Connect: %s", targetAddr)
 	d := &net.Dialer{
 		Timeout: 25 * time.Second,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localbind, "0"))
+	if config.Localbind != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
 		if err != nil {
-			log.Printf("Failed to ResolveTCPAddr: %v", err)
+			config.Logger.Printf("Failed to ResolveTCPAddr: %v", err)
 			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: %v\n", err)))
 			return
 		}
 		d.LocalAddr = localAddr
 	}
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, accessCtrl, "tcp", targetAddr)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddr)
 	if err != nil {
 		if isDenied {
-			log.Printf("Access control denied for target %s", targetAddr)
+			config.Logger.Printf("Access control denied for target %s", targetAddr)
 			tunnelStream.Write([]byte("ERROR: Access denied\n"))
 		} else {
 			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: %v\n", err)))
@@ -1040,11 +1049,11 @@ func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string, localbind 
 
 	targetConn, err := d.Dial("tcp", resolvedAddr.String())
 	if err != nil {
-		log.Printf("Failed to connect to target %s: %v", targetAddr, err)
+		config.Logger.Printf("Failed to connect to target %s: %v", targetAddr, err)
 		// 向流写入错误响应
 		_, writeErr := tunnelStream.Write([]byte(fmt.Sprintf("ERROR: %v\n", err)))
 		if writeErr != nil {
-			log.Printf("Failed to write error response: %v", writeErr)
+			config.Logger.Printf("Failed to write error response: %v", writeErr)
 		}
 		return
 	}
@@ -1053,22 +1062,22 @@ func handleRemoteTCPConnect(tunnelStream net.Conn, targetAddr string, localbind 
 	// 成功建立连接，向流写入 "OK\n"
 	_, err = tunnelStream.Write([]byte("OK\n"))
 	if err != nil {
-		log.Printf("Failed to write OK response to mux stream: %v", err)
+		config.Logger.Printf("Failed to write OK response to mux stream: %v", err)
 		return
 	}
 	// 双向数据转发：隧道流 <-> 目标连接
 	bidirectionalCopy(targetConn, tunnelStream)
-	log.Printf("TCP relay for %s ended.", targetAddr)
+	config.Logger.Printf("TCP relay for %s ended.", targetAddr)
 }
 
 // handleRemoteUDPAssociate 是运行在远程的
 // 它只创建一个 UDP socket (localUDPConn)，
 // 所有从 tunnelStream 接收的 SOCKS5 UDP 数据报都通过这个 socket 发送出去，
 // 并且所有从这个 socket 接收的 UDP 响应包都封装后通过 tunnelStream 传回本地代理。
-func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtrl *acl.ACL) {
+func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 	// 远端创建一个通用的 UDP socket，用于向任意目标发送和接收 UDP 包
 	// 绑定到 0.0.0.0:0，让操作系统选择一个可用端口
-	localAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(localbind, "0"))
+	localAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(config.Localbind, "0"))
 	if err != nil {
 		tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to ResolveUDPAddr: %v\n", err)))
 		return
@@ -1076,11 +1085,11 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 
 	remoteLocalUDPConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
-		log.Printf("Failed to listen on remote local UDP: %v", err)
+		config.Logger.Printf("Failed to listen on remote local UDP: %v", err)
 		// 如果这里失败，需要向隧道流写回错误信息
 		_, writeErr := tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to open remote UDP socket: %v\n", err)))
 		if writeErr != nil {
-			log.Printf("Failed to write error response: %v", writeErr)
+			config.Logger.Printf("Failed to write error response: %v", writeErr)
 		}
 		return
 	}
@@ -1089,10 +1098,10 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 	// 向隧道流发送 "OK\n" 响应，通知本地代理 UDP 关联成功
 	_, err = tunnelStream.Write([]byte("OK\n"))
 	if err != nil {
-		log.Printf("Failed to write OK response for UDP Associate to mux stream: %v", err)
+		config.Logger.Printf("Failed to write OK response for UDP Associate to mux stream: %v", err)
 		return
 	}
-	log.Printf("UDP-Associate-S: Using UDP socket: %s", remoteLocalUDPConn.LocalAddr())
+	config.Logger.Printf("UDP-Associate-S: Using UDP socket: %s", remoteLocalUDPConn.LocalAddr())
 
 	var wg sync.WaitGroup // 用于等待两个并发的 UDP 转发 goroutine 结束
 	wg.Add(2)
@@ -1105,7 +1114,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 		defer wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Recovered from panic in tunnelStream to remote UDP sender: %v", r)
+				config.Logger.Printf("Recovered from panic in tunnelStream to remote UDP sender: %v", r)
 			}
 			cancel()
 		}()
@@ -1124,22 +1133,22 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 					continue // 超时，继续等待
 				}
 				if err == io.EOF {
-					log.Println("Tunnel stream closed from local proxy. Ending UDP relay from stream.")
+					config.Logger.Println("Tunnel stream closed from local proxy. Ending UDP relay from stream.")
 					// Stream 关闭，通知另一个 goroutine 也停止
 					return // 流关闭，退出此 goroutine
 				}
-				log.Printf("Error reading length prefix from tunnel stream for UDP: %v", err)
+				config.Logger.Printf("Error reading length prefix from tunnel stream for UDP: %v", err)
 				return // 非 EOF 错误，退出此 goroutine
 			}
 
 			packetLength := int(binary.BigEndian.Uint16(lengthBytes)) // 解析长度
 
 			if packetLength == 0 {
-				log.Printf("Received zero-length UDP packet from tunnel. Skipping.")
+				config.Logger.Printf("Received zero-length UDP packet from tunnel. Skipping.")
 				continue
 			}
 			if packetLength > len(packetBuf) {
-				log.Printf("Received too large UDP packet from tunnel (%d bytes). Dropping.", packetLength)
+				config.Logger.Printf("Received too large UDP packet from tunnel (%d bytes). Dropping.", packetLength)
 				return // 协议错误，退出此 goroutine
 			}
 
@@ -1150,16 +1159,16 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 					continue // 超时，继续等待
 				}
 				if err == io.EOF {
-					log.Println("Tunnel stream closed from local proxy while reading UDP packet body. Exiting.")
+					config.Logger.Println("Tunnel stream closed from local proxy while reading UDP packet body. Exiting.")
 				}
-				log.Printf("Error reading UDP packet body from tunnel stream: %v", err)
+				config.Logger.Printf("Error reading UDP packet body from tunnel stream: %v", err)
 				return // 错误，退出此 goroutine
 			}
 
 			// 3. 解析 SOCKS5 UDP 报头，获取目标地址和端口
 			// (SOCKS5_UDP_RSV, SOCKS5_UDP_FRAG, ATYP, DST.ADDR, DST.PORT, DATA)
 			if packetLength < 10 { // 最小 SOCKS5 UDP 报头大小
-				log.Printf("Received malformed SOCKS5 UDP packet (too short): %d bytes. Dropping.", packetLength)
+				config.Logger.Printf("Received malformed SOCKS5 UDP packet (too short): %d bytes. Dropping.", packetLength)
 				continue
 			}
 
@@ -1168,7 +1177,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 			atyp := packetBuf[3]
 
 			if frag != SOCKS5_UDP_FRAG {
-				log.Printf("UDP fragmentation not supported by remote. Dropping fragmented packet.")
+				config.Logger.Printf("UDP fragmentation not supported by remote. Dropping fragmented packet.")
 				continue
 			}
 
@@ -1200,21 +1209,21 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 				targetPort = int(packetBuf[20])<<8 | int(packetBuf[21])
 				dataOffset = 22
 			default:
-				log.Printf("Unsupported UDP address type in SOCKS5 UDP header from local: %d", atyp)
+				config.Logger.Printf("Unsupported UDP address type in SOCKS5 UDP header from local: %d", atyp)
 				continue
 			}
 
 			once.Do(func() {
-				log.Printf("UDP: %s->%s (first outbound packet of session)", remoteLocalUDPConn.LocalAddr().String(), net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
+				config.Logger.Printf("UDP: %s->%s (first outbound packet of session)", remoteLocalUDPConn.LocalAddr().String(), net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			})
 
-			targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), accessCtrl, "udp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
+			targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			if resolveErr != nil {
 				if isDenied {
-					log.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
+					config.Logger.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
 
 				} else {
-					log.Printf("Failed to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
+					config.Logger.Printf("Failed to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
 				}
 				continue
 			}
@@ -1222,7 +1231,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 			// 4. 将 SOCKS5 UDP 包中的 DATA 部分通过 remoteLocalUDPConn 发送给目标服务器
 			_, err = remoteLocalUDPConn.WriteToUDP(packetBuf[dataOffset:packetLength], targetAddr.(*net.UDPAddr))
 			if err != nil {
-				log.Printf("Error writing UDP data to target %s: %v", targetAddr, err)
+				config.Logger.Printf("Error writing UDP data to target %s: %v", targetAddr, err)
 				// 这里通常不直接 return，因为可能只是单个包发送失败
 				// 但如果错误是连接关闭，那也会在 ReadFromUDP/WriteToUDP 时检测到并退出
 			}
@@ -1235,7 +1244,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 		defer wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Recovered from panic in remote UDP receiver: %v", r)
+				config.Logger.Printf("Recovered from panic in remote UDP receiver: %v", r)
 			}
 			cancel()
 		}()
@@ -1251,7 +1260,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
 				}
-				log.Printf("Error reading from remote local UDP: %v", err)
+				config.Logger.Printf("Error reading from remote local UDP: %v", err)
 				return // 非临时错误或连接关闭，退出此 goroutine
 			}
 
@@ -1270,7 +1279,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 				respATYP = ATYP_IPV6
 				respAddrBytes = ipv6
 			} else {
-				log.Printf("Cannot determine ATYP for source IP %s. Skipping.", udpSrcAddr.IP)
+				config.Logger.Printf("Cannot determine ATYP for source IP %s. Skipping.", udpSrcAddr.IP)
 				continue
 			}
 
@@ -1289,7 +1298,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 			// 2. 添加长度前缀
 			// 确保数据包长度在 2 字节可表示的范围内
 			if len(fullSocks5UdpPacket) > 65535 {
-				log.Printf("Response SOCKS5 UDP packet too large (%d bytes) for 2-byte length prefix. Dropping.", len(fullSocks5UdpPacket))
+				config.Logger.Printf("Response SOCKS5 UDP packet too large (%d bytes) for 2-byte length prefix. Dropping.", len(fullSocks5UdpPacket))
 				continue
 			}
 			binary.BigEndian.PutUint16(lengthBytes, uint16(len(fullSocks5UdpPacket)))
@@ -1297,12 +1306,12 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 			// 3. 将封装好的数据包写入隧道流，发回给本地 SOCKS5 代理
 			_, err = tunnelStream.Write(lengthBytes)
 			if err != nil {
-				log.Printf("Error writing length prefix for UDP response to tunnel stream: %v", err)
+				config.Logger.Printf("Error writing length prefix for UDP response to tunnel stream: %v", err)
 				return // 写入失败，退出
 			}
 			_, err = tunnelStream.Write(fullSocks5UdpPacket)
 			if err != nil {
-				log.Printf("Error writing SOCKS5 UDP response to tunnel stream: %v", err)
+				config.Logger.Printf("Error writing SOCKS5 UDP response to tunnel stream: %v", err)
 				return // 写入失败，退出
 			}
 		}
@@ -1316,7 +1325,7 @@ func handleRemoteUDPAssociate(tunnelStream net.Conn, localbind string, accessCtr
 	}
 	// 等待两个转发 goroutine 结束
 	wg.Wait()
-	log.Printf("Remote UDP associate for stream from %s ended.", tunnelStream)
+	config.Logger.Printf("Remote UDP associate for stream from %s ended.", tunnelStream)
 }
 
 // SOCKS5 客户端结构体
@@ -1395,11 +1404,11 @@ func (c *Socks5Client) socks5Handshake(conn net.Conn) error {
 		if authResp[1] != 0x00 { // Status: 0x00 for success
 			return fmt.Errorf("username/password authentication failed: status %d", authResp[1])
 		}
-		log.Println("SOCKS5 username/password authentication successful.")
+		c.Config.Logger.Println("SOCKS5 username/password authentication successful.")
 	} else if chosenMethod != AUTH_NO_AUTH {
 		return fmt.Errorf("unsupported authentication method chosen by server: %d", chosenMethod)
 	}
-	//log.Println("SOCKS5 handshake and authentication completed.")
+	//config.Logger.Println("SOCKS5 handshake and authentication completed.")
 	return nil
 }
 
@@ -1477,9 +1486,9 @@ func readSocks5Response(conn net.Conn) (*net.TCPAddr, error) {
 			return nil, fmt.Errorf("read BND.ADDR (domain) error: %w", err)
 		}
 		bndIP = net.ParseIP(string(resp[offset+1 : offset+1+domainLen])) // Try parse as IP, if not, it's domain
-		if bndIP == nil {
-			log.Printf("Warning: SOCKS5 server returned domain for BND.ADDR: %s. Proceeding with best effort.", string(resp[offset+1:offset+1+domainLen]))
-		}
+		// if bndIP == nil {
+		// 	log.Printf("Warning: SOCKS5 server returned domain for BND.ADDR: %s. Proceeding with best effort.", string(resp[offset+1:offset+1+domainLen]))
+		// }
 		offset += 1 + domainLen
 
 	case ATYP_IPV6:
@@ -1557,7 +1566,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			return nil, fmt.Errorf("read SOCKS5 CONNECT response error: %w", err)
 		}
 		socks5Conn.SetDeadline(time.Time{})
-		//log.Printf("Successfully connected to %s via SOCKS5 TCP proxy.", address)
+		//config.Logger.Printf("Successfully connected to %s via SOCKS5 TCP proxy.", address)
 		return socks5Conn, nil
 
 	case "udp", "udp4", "udp6":
@@ -1653,7 +1662,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			wrapper.Close() // 当 TCP 控制连接关闭时，关闭整个 UDP 客户端关联
 		}()
 
-		//log.Printf("Successfully established SOCKS5 UDP proxy for %s. Using local UDP socket: %s", address, wrapper.LocalAddr())
+		//config.Logger.Printf("Successfully established SOCKS5 UDP proxy for %s. Using local UDP socket: %s", address, wrapper.LocalAddr())
 		return wrapper, nil
 
 	default:
@@ -1858,7 +1867,7 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 
 	resp_frag := respBuf[2]
 	if resp_frag != 0x00 {
-		log.Printf("Warning: SOCKS5 UDP response fragmented. Fragmentation is not supported.")
+		pc.client.Config.Logger.Printf("Warning: SOCKS5 UDP response fragmented. Fragmentation is not supported.")
 	}
 
 	resp_atyp := respBuf[3]
@@ -1917,7 +1926,7 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 	}
 	if dataLen > len(b) {
 		n = copy(b, respBuf[dataOffset:dataOffset+len(b)])
-		log.Printf("Warning: UDP response truncated. Packet size: %d, Buffer size: %d", dataLen, len(b))
+		//log.Printf("Warning: UDP response truncated. Packet size: %d, Buffer size: %d", dataLen, len(b))
 	} else {
 		n = copy(b, respBuf[dataOffset:nResp])
 	}
