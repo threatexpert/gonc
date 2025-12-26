@@ -468,22 +468,22 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		if ncconfig.app_mux_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":mux "+ncconfig.app_mux_args)
 		}
-		if ncconfig.app_s5s_args != "-" {
+		if err == nil && ncconfig.app_s5s_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":s5s "+ncconfig.app_s5s_args)
 		}
-		if ncconfig.app_sh_args != "-" {
+		if err == nil && ncconfig.app_sh_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":sh "+ncconfig.app_sh_args)
 		}
-		if ncconfig.app_nc_args != "-" {
+		if err == nil && ncconfig.app_nc_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":nc "+ncconfig.app_nc_args)
 		}
-		if ncconfig.app_pr_args != "-" {
+		if err == nil && ncconfig.app_pr_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":pr "+ncconfig.app_pr_args)
 		}
-		if ncconfig.app_br_args != "-" {
+		if err == nil && ncconfig.app_br_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":br "+ncconfig.app_br_args)
 		}
-		if ncconfig.app_httpserver_args != "-" {
+		if err == nil && ncconfig.app_httpserver_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":httpserver "+ncconfig.app_httpserver_args)
 		}
 	}
