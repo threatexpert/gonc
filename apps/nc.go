@@ -317,6 +317,9 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	config, err := AppNetcatConfigByArgs(os.Stderr, "gonc", args)
 	if err != nil {
+		if err == flag.ErrHelp {
+			return 1
+		}
 		fmt.Fprintf(os.Stderr, "Error parsing gonc args: %v\n", err)
 		return 1
 	}
@@ -458,62 +461,37 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		}
 	}
 
+	var err error
 	if ncconfig.runCmd != "" && ncconfig.runCmd != ":service" {
-		err := preinitBuiltinAppConfig(ncconfig, ncconfig.runCmd)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			os.Exit(1)
-		}
+		err = preinitBuiltinAppConfig(ncconfig, ncconfig.runCmd)
 	} else {
 		if ncconfig.app_mux_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":mux "+ncconfig.app_mux_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":mux "+ncconfig.app_mux_args)
 		}
 		if ncconfig.app_s5s_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":s5s "+ncconfig.app_s5s_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":s5s "+ncconfig.app_s5s_args)
 		}
 		if ncconfig.app_sh_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":sh "+ncconfig.app_sh_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":sh "+ncconfig.app_sh_args)
 		}
 		if ncconfig.app_nc_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":nc "+ncconfig.app_nc_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":nc "+ncconfig.app_nc_args)
 		}
 		if ncconfig.app_pr_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":pr "+ncconfig.app_pr_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":pr "+ncconfig.app_pr_args)
 		}
 		if ncconfig.app_br_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":br "+ncconfig.app_br_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":br "+ncconfig.app_br_args)
 		}
 		if ncconfig.app_httpserver_args != "-" {
-			err := preinitBuiltinAppConfig(ncconfig, ":httpserver "+ncconfig.app_br_args)
-			if err != nil {
-				ncconfig.Logger.Printf("%v\n", err)
-				os.Exit(1)
-			}
+			err = preinitBuiltinAppConfig(ncconfig, ":httpserver "+ncconfig.app_httpserver_args)
 		}
+	}
+	if err != nil {
+		if err != flag.ErrHelp {
+			ncconfig.Logger.Printf("%v\n", err)
+		}
+		os.Exit(1)
 	}
 
 	xcommandline := ncconfig.proxyAddr
@@ -524,7 +502,9 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 	if xcommandline != "" {
 		xconfig, err := ProxyClientConfigByCommandline(ncconfig.LogWriter, ncconfig.proxyProt, ncconfig.auth, xcommandline)
 		if err != nil {
-			ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
+			if err != flag.ErrHelp {
+				ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
+			}
 			os.Exit(1)
 		}
 		ncconfig.arg_proxyc_Config = xconfig
@@ -1631,13 +1611,15 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 	}
 
 	if err != nil {
-		msg := fmt.Sprintf("error init %s config: %v", builtinApp, err)
-		if usage != nil {
-			usage(ncconfig.LogWriter)
+		if err != flag.ErrHelp {
+			msg := fmt.Sprintf("error init %s config: %v", builtinApp, err)
+			if usage != nil {
+				usage(ncconfig.LogWriter)
+			}
+			return fmt.Errorf("%s", msg)
 		}
-		return fmt.Errorf("%s", msg)
+		return err
 	}
-
 	return nil
 }
 
