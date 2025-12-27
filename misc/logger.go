@@ -45,6 +45,9 @@ func NewShortTimeWriter(w io.Writer, withMilli bool) *ShortTimeWriter {
 }
 
 func (tw *ShortTimeWriter) Write(p []byte) (int, error) {
+	if sw, ok := tw.w.(*SwitchableWriter); ok && !sw.enabled {
+		return len(p), nil
+	}
 	var ts string
 	if tw.withMilli {
 		ts = time.Now().Format("20060102-150405.000")
