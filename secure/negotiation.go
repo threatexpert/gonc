@@ -524,7 +524,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 		if blockCrypt == nil {
 			fmt.Fprintf(logWriter, "%sPerforming KCP-C handshake...", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake using...", config.Label, config.KeyType)
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake...", config.Label, config.KeyType)
 		}
 	}
 	sess, err = kcp.NewConn4(0, conn.RemoteAddr(), blockCrypt, 10, 3, true, buconn)
