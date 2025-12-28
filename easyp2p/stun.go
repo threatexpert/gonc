@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/stun"
+	"github.com/pion/stun/v3"
 	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
 )
@@ -145,6 +145,7 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 			}
 
 			var xorAddr stun.XORMappedAddress
+			var noneXorAddr stun.MappedAddress
 			var callErr error
 
 			req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
@@ -157,7 +158,13 @@ func GetPublicIP(network, bind string, timeout time.Duration) (index int, localA
 				if e.Error != nil {
 					callErr = e.Error
 				} else if err := xorAddr.GetFrom(e.Message); err != nil {
-					callErr = err
+					// 尝试使用非 XOR-MAPPED-ADDRESS 获取地址（某些 STUN 服务器可能只返回 MAPPED-ADDRESS）
+					if err2 := noneXorAddr.GetFrom(e.Message); err2 != nil {
+						callErr = err
+					} else {
+						xorAddr.IP = noneXorAddr.IP
+						xorAddr.Port = noneXorAddr.Port
+					}
 				}
 			})
 
@@ -422,6 +429,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			defer client.Close() // Ensure client is closed when the goroutine finishes
 
 			var xorAddr stun.XORMappedAddress
+			var noneXorAddr stun.MappedAddress
 			var callErr error
 
 			req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
@@ -430,7 +438,13 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 				if e.Error != nil {
 					callErr = e.Error
 				} else if err := xorAddr.GetFrom(e.Message); err != nil {
-					callErr = err
+					// 尝试使用非 XOR-MAPPED-ADDRESS 获取地址（某些 STUN 服务器可能只返回 MAPPED-ADDRESS）
+					if err2 := noneXorAddr.GetFrom(e.Message); err2 != nil {
+						callErr = err
+					} else {
+						xorAddr.IP = noneXorAddr.IP
+						xorAddr.Port = noneXorAddr.Port
+					}
 				}
 			})
 
