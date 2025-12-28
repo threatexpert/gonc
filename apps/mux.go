@@ -376,15 +376,16 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 // linkRuntimeConfig 保存预处理后的运行参数
 // 这里的字段是从 url.Values 解析出来的，用于 runLinkListener 直接使用
 type linkRuntimeConfig struct {
-	UseTLS        bool
-	NtConfig      *secure.NegotiationConfig
-	UseTProxy     bool
-	Username      string
-	Password      string
-	TargetHost    string
-	TargetPort    int
-	ForwardTarget string
-	MagicTargetIP string // 仅用于 TProxy 模式下的上下文判断
+	UseTLS              bool
+	NtConfig            *secure.NegotiationConfig
+	UseTProxy           bool
+	TProxyAllowPublicIP bool
+	Username            string
+	Password            string
+	TargetHost          string
+	TargetPort          int
+	ForwardTarget       string
+	MagicTargetIP       string // 仅用于 TProxy 模式下的上下文判断
 }
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
@@ -423,6 +424,12 @@ func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.
 	case "x":
 		if params.Get("tproxy") == "1" {
 			cfg.UseTProxy = true
+		}
+		switch params.Get("allow") {
+		case "any", "domain":
+			cfg.TProxyAllowPublicIP = true
+		case "private":
+			cfg.TProxyAllowPublicIP = false
 		}
 		cfg.Username = params.Get("_user")
 		cfg.Password = params.Get("_password")
@@ -516,7 +523,7 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 			// x://
 			if rtConfig.UseTProxy && magicIP != "" {
 				cmd = "T-CONNECT"
-				tHost, tPort, err = DNSLookupMagicIP(magicIP, false)
+				tHost, tPort, err = DNSLookupMagicIP(magicIP, rtConfig.TProxyAllowPublicIP)
 				if err != nil {
 					muxcfg.Logger.Println("MagicIP lookup failed:", err)
 					return

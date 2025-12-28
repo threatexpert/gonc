@@ -71,7 +71,7 @@ func App_tp_usage_flagSet(fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), "\nOptions:")
 	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
 	fmt.Fprintln(fs.Output(), "\nExample:")
-	fmt.Fprintln(fs.Output(), "  :tp x.x.x.x:1080")
+	fmt.Fprintln(fs.Output(), "  :tp -x x.x.x.x:1080")
 }
 
 func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
