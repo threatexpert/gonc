@@ -270,7 +270,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	}
 	config.Args = fs.Args()
 	if config.verbose {
-		if config.keepOpen || argv0 == ":nc" {
+		if config.keepOpen || isAppModeRequiredKeepOpen(config) || argv0 == ":nc" {
 			prefix := ""
 			if argv0 != "" {
 				prefix = fmt.Sprintf("[%s] ", argv0)
@@ -394,6 +394,18 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	if conflictCheck(ncconfig) != 0 {
 		os.Exit(1)
 	}
+}
+
+func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
+	if ncconfig.runAppFileServ != "" ||
+		ncconfig.runAppFileGet != "" ||
+		ncconfig.appMuxSocksMode ||
+		ncconfig.appMuxLinkAgent ||
+		ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "" ||
+		ncconfig.runAppLink != "" {
+		return true
+	}
+	return false
 }
 
 // configureAppMode 为内置应用程序设置命令参数

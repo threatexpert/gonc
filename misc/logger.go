@@ -10,12 +10,14 @@ import (
 )
 
 type SwitchableWriter struct {
-	mu                sync.Mutex
-	w                 io.Writer
-	enabled           bool
-	lastWasProgress   bool
-	lastProgressLen   int
-	cursorAtLineStart bool
+	mu                    sync.Mutex
+	w                     io.Writer
+	enabled               bool
+	lastWasProgress       bool
+	lastProgressLen       int
+	cursorAtLineStart     bool
+	lastLogTime           time.Time // 上一次写入普通日志的时间
+	lastProgressWriteTime time.Time // 上一次实际写入进度条的时间
 }
 
 func NewSwitchableWriter(w io.Writer, enabled bool) *SwitchableWriter {
@@ -68,6 +70,22 @@ func (tw *SwitchableWriter) Write(p []byte) (int, error) {
 	}
 
 	isProgress := isProgressWrite(p)
+	now := time.Now()
+
+	// 进度条优先级控制 ---
+	if isProgress {
+		// 规则 1：计算距离上一次普通日志过去了多久
+		sinceLastLog := now.Sub(tw.lastLogTime)
+		// 规则 2：计算距离上一次进度条显示过去了多久
+		sinceLastProg := now.Sub(tw.lastProgressWriteTime)
+
+		// 判定：如果普通日志刚输出不久 (<2s)，且进度条还没超时 (<10s)
+		// 则跳过本次进度条输出，避免抢占视线
+		if sinceLastLog < 2*time.Second && sinceLastProg < 10*time.Second {
+			// 直接返回 len(p)，欺骗调用者写入成功，实际上什么都没做
+			return len(p), nil
+		}
+	}
 
 	// 2. 关键修复：解决 "Do something..." 未换行就被进度条覆盖的问题
 	//    如果当前是进度条，但屏幕光标不在行首（说明有残留日志），强制换行。
@@ -105,6 +123,16 @@ func (tw *SwitchableWriter) Write(p []byte) (int, error) {
 	}
 
 	n, err := tw.w.Write(p)
+
+	// 更新时间戳 ---
+	if err == nil { // 只有写入成功才更新时间
+		if isProgress {
+			tw.lastProgressWriteTime = now
+		} else {
+			tw.lastLogTime = now
+		}
+	}
+
 	tw.lastWasProgress = isProgress
 	if isProgress {
 		// 进度条以 \r 结尾，虽然光标回到了行首，但该行被占用了。
