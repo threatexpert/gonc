@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.5"
+	VERSION = "v2.4.6"
 )
 
 type AppNetcatConfig struct {
@@ -143,7 +143,14 @@ type AppNetcatConfig struct {
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
 func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*AppNetcatConfig, error) {
-	swriter := misc.NewSwitchableWriter(logWriter, true)
+	var swriter *misc.SwitchableWriter
+	if sw, ok := logWriter.(*misc.SwitchableWriter); ok {
+		// 复用，不再包一层
+		swriter = sw
+	} else {
+		swriter = misc.NewSwitchableWriter(logWriter, true)
+	}
+
 	config := &AppNetcatConfig{
 		LogWriter: swriter,
 		Logger:    log.New(swriter, "", 0),
@@ -1431,7 +1438,7 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 					connCount := atomic.LoadInt32(&ncconfig.goroutineConnectionCounter)
 					if connCount > 1 {
 						fmt.Fprintf(ncconfig.LogWriter,
-							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %d | %02d:%02d:%02d        \r",
+							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %d | %02d:%02d:%02d\r",
 							misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
 							misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
 							connCount,
@@ -1439,7 +1446,7 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 						)
 					} else if connCount == 1 {
 						fmt.Fprintf(ncconfig.LogWriter,
-							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \r",
+							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d\r",
 							misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
 							misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
 							h, m, s,
@@ -1460,7 +1467,7 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 					m := (elapsed % 3600) / 60
 					s := elapsed % 60
 					fmt.Fprintf(ncconfig.LogWriter,
-						"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d        \n",
+						"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %02d:%02d:%02d\n",
 						misc.FormatBytes(in.TotalBytes), in.TotalBytes, misc.FormatBytes(int64(in.SpeedBps)),
 						misc.FormatBytes(out.TotalBytes), out.TotalBytes, misc.FormatBytes(int64(out.SpeedBps)),
 						h, m, s,

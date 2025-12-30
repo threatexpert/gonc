@@ -385,7 +385,6 @@ type linkRuntimeConfig struct {
 	TargetHost          string
 	TargetPort          int
 	ForwardTarget       string
-	MagicTargetIP       string // 仅用于 TProxy 模式下的上下文判断
 }
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
