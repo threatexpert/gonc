@@ -141,7 +141,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 - 另一端将在本机监听端口3080提供socks5/HTTP代理服务访问远程：
     ```bash
     # link可开启远程代理反向访问，none则表示远程不监听端口
-    gonc -p2p <口令> -link 3080;none
+    gonc -p2p <口令> -link "3080;none"
     ```
 
     使用透明代理特性：接下来例如你想连接远程网络的10.0.0.1:3389，你可以直接在本地远程桌面客户端填要连接的地址为：

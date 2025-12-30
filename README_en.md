@@ -133,7 +133,7 @@ On the sender side, start an HTTP file server to expose the files or directories
     ```bash
     # The link option controls how the local and remote proxy endpoints are created.
     # Use none to indicate that no listening port is opened on that side:
-    gonc -p2p passphrase -link 3080;none
+    gonc -p2p passphrase -link "3080;none"
     ```
 
     Next, for example, if you want to connect to 10.0.0.1:3389 in the remote network, you can simply enter the following address in your local Remote Desktop client:
