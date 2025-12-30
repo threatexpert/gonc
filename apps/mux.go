@@ -154,7 +154,7 @@ func App_mux_usage(logWriter io.Writer) {
 	fmt.Fprintln(logWriter, "Usage:")
 	fmt.Fprintln(logWriter, "   :mux socks5")
 	fmt.Fprintln(logWriter, "   :mux linkagent")
-	fmt.Fprintln(logWriter, "   :mux link \"<L-Config>;<R-Config>\" (e.g. mux link \"x://127.0.0.1:8000;none\")")
+	fmt.Fprintln(logWriter, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
 	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>...")
 	fmt.Fprintln(logWriter, "   :mux httpclient <saveDir> <remotePath>")
 	fmt.Fprintln(logWriter, "   :mux -l listen_port")

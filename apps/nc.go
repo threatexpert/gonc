@@ -213,7 +213,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.appMuxListenOn, "httplocal-port", "", "(mux tunnel mode)local listen port for remote httpserver")
 	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "(mux tunnel mode)socks5 server")
 	fs.BoolVar(&config.appMuxLinkAgent, "linkagent", false, "(mux tunnel mode)dual proxy service")
-	fs.StringVar(&config.runAppLink, "link", "", "(mux tunnel mode)<L-Config>;<R-Config> (e.g. mux link 1080;1080)")
+	fs.StringVar(&config.runAppLink, "link", "", "(mux tunnel mode)\"<L-Config>;<R-Config>\" (e.g. mux link \"1080;1080\")")
 	fs.BoolVar(&config.portRotate, "port-rotate", false, "enable port rotation feature")
 	fs.BoolVar(&config.kcpBridgeMode, "kcpbr", false, "kcp bridge mode")
 	fs.StringVar(&config.fileACL, "acl", "", "ACL file for inbound/outbound connections")
