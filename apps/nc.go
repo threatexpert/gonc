@@ -139,6 +139,7 @@ type AppNetcatConfig struct {
 	portRotate        bool
 	kcpBridgeMode     bool
 	verbose           bool
+	verboseWithTime   bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -262,6 +263,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		usage_full(argv0, fs)
 	}
 
+	args = reorderNetcatArgs(args)
+
 	// 解析传入的 args 切片
 	// 注意：我们假设 args 已经不包含程序名 (os.Args[0])，所以直接传入
 	err := fs.Parse(args)
@@ -270,12 +273,13 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	}
 	config.Args = fs.Args()
 	if config.verbose {
-		if config.keepOpen || isAppModeRequiredKeepOpen(config) || argv0 == ":nc" {
+		if config.verboseWithTime || config.keepOpen || isAppModeRequiredKeepOpen(config) || argv0 == ":nc" {
 			prefix := ""
 			if argv0 != "" {
 				prefix = fmt.Sprintf("[%s] ", argv0)
 			}
 			config.Logger = misc.NewLog(swriter, prefix, log.LstdFlags|log.Lmsgprefix)
+			config.verboseWithTime = true
 		}
 	}
 
@@ -301,7 +305,6 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(config)
 	if err != nil && len(config.featureModulesRun) == 0 {
 		fmt.Fprintf(logWriter, "Error determining network address: %v\n", err)
-		usage_less(logWriter, argv0)
 		os.Exit(1)
 	}
 
@@ -323,6 +326,73 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	config.connConfig = preinitNegotiationConfig(config)
 	swriter.Enable(config.verbose)
 	return config, nil
+}
+
+// reorderNetcatArgs 对参数列表进行“清洗”和重排
+// 目的：让标准库 flag 能解析所有的 -flag，将非 flag 参数（IP, Port, -l 的值）统一赶到最后
+func reorderNetcatArgs(args []string) []string {
+	var keepArgs []string // 放在前面，供 flag.Parse 解析
+	var tailArgs []string // 挪到最后，作为剩余参数
+
+	// 标记是否已经遇到过第一个 flag
+	// 用途：用于判断出现在开头的参数是否需要移动
+	firstFlagFound := false
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		isFlag := strings.HasPrefix(arg, "-")
+
+		// ------------------------------------------------------
+		// 逻辑 1: 处理开头的非 Flag 参数 (如: gonc 127.0.0.1 -e cmd)
+		// ------------------------------------------------------
+		// 如果还没遇到过 flag，且当前参数不是 flag，说明这是开头的 args，先存入 tail
+		if !firstFlagFound && !isFlag {
+			tailArgs = append(tailArgs, arg)
+			i++
+			continue
+		}
+
+		// 一旦遇到了 flag (以 - 开头)，改变状态
+		if isFlag {
+			firstFlagFound = true
+		}
+
+		// ------------------------------------------------------
+		// 逻辑 2: 处理 -l 或 --l 及其参数
+		// ------------------------------------------------------
+		if arg == "-l" || arg == "--l" {
+			// 向后看一位 (Lookahead)
+			// 如果后面还有参数，且该参数 **不是** 以 "-" 开头
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				// 判定为：-l 携带了参数 (如 -l 2222)
+				// 将 -l 和它的参数都挪到 tailArgs
+				tailArgs = append(tailArgs, arg)
+				i++
+
+				// 贪婪匹配：继续吃掉后续的非 flag 参数 (IP, Port)
+				for i < len(args) {
+					nextArg := args[i]
+					if strings.HasPrefix(nextArg, "-") {
+						break // 遇到下一个 flag，停止移动
+					}
+					tailArgs = append(tailArgs, nextArg)
+					i++
+				}
+				continue // 完成本次处理，进入下一轮
+			}
+		}
+
+		// ------------------------------------------------------
+		// 逻辑 3: 普通参数 (正常的 flag 或 flag 的值)
+		// ------------------------------------------------------
+		// 直接保留在原位
+		keepArgs = append(keepArgs, arg)
+		i++
+	}
+
+	// 将被移动的参数拼接到最后
+	return append(keepArgs, tailArgs...)
 }
 
 func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
@@ -812,8 +882,12 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 				newSess.Close()
 				continue
 			}
-			ncconfig.Logger.Printf("UDP session established from %s\n", newSess.RemoteAddr().String())
-			go handleConnection(console, ncconfig, ncconfig.connConfig, newSess, stats_in, stats_out)
+			go func(c net.Conn) {
+				raddr := c.RemoteAddr().String()
+				ncconfig.Logger.Printf("UDP session established from %s\n", raddr)
+				handleConnection(console, ncconfig, ncconfig.connConfig, c, stats_in, stats_out)
+				ncconfig.Logger.Printf("UDP session disconnected from %s\n", raddr)
+			}(newSess)
 		}
 	} else {
 		newSess, err := usessListener.Accept()
@@ -900,16 +974,25 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 				}
 			}
 			if conn.LocalAddr().Network() == "unix" {
-				ncconfig.Logger.Printf("Connection on %s received!\n", conn.LocalAddr().String())
+				go func(c net.Conn) {
+					addr := c.LocalAddr().String()
+					ncconfig.Logger.Printf("Connection on %s received!\n", addr)
+					handleConnection(console, ncconfig, ncconfig.connConfig, c, stats_in, stats_out)
+					ncconfig.Logger.Printf("Connection on %s closed!\n", addr)
+				}(conn)
 			} else {
 				if !acl.ACL_inbound_allow(ncconfig.accessControl, conn.RemoteAddr()) {
 					ncconfig.Logger.Printf("ACL refused: %s\n", conn.RemoteAddr())
 					conn.Close()
 					continue
 				}
-				ncconfig.Logger.Printf("Connected from: %s        \n", conn.RemoteAddr().String())
+				go func(c net.Conn) {
+					addr := c.RemoteAddr().String()
+					ncconfig.Logger.Printf("Connected from: %s\n", addr)
+					handleConnection(console, ncconfig, ncconfig.connConfig, c, stats_in, stats_out)
+					ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
+				}(conn)
 			}
-			go handleConnection(console, ncconfig, ncconfig.connConfig, conn, stats_in, stats_out)
 		RE_BIND:
 			if socks5BindMode {
 				listener.Close()
@@ -1007,7 +1090,8 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 		return 1
 	}
 
-	// 连接成功后打印信息
+	onTip := ""
+	offTip := ""
 	remoteTargetAddr := net.JoinHostPort(host, port)
 	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 		proxyRemoteAddr := ""
@@ -1019,18 +1103,26 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 			}
 		}
 		if proxyRemoteAddr != "" {
-			ncconfig.Logger.Printf("UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
+			onTip = fmt.Sprintf("UDP ready for: %s -> %s -> %s", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
+			offTip = fmt.Sprintf("UDP closed for: %s -> %s -> %s", conn.LocalAddr().String(), proxyRemoteAddr, remoteTargetAddr)
 		} else {
-			ncconfig.Logger.Printf("UDP ready for: %s\n", remoteTargetAddr)
+			onTip = fmt.Sprintf("UDP ready for: %s", remoteTargetAddr)
+			offTip = fmt.Sprintf("UDP closed for: %s", remoteTargetAddr)
 		}
 	} else {
 		if ncconfig.arg_proxyc_Config == nil {
-			ncconfig.Logger.Printf("Connected to: %s\n", conn.RemoteAddr().String())
+			onTip = fmt.Sprintf("Connected to: %s", conn.RemoteAddr().String())
+			offTip = fmt.Sprintf("Disconnected from: %s", conn.RemoteAddr().String())
 		} else {
-			ncconfig.Logger.Printf("Connected to: %s -> %s\n", conn.RemoteAddr().String(), remoteTargetAddr)
+			onTip = fmt.Sprintf("Connected to: %s -> %s", conn.RemoteAddr().String(), remoteTargetAddr)
+			offTip = fmt.Sprintf("Disconnected from: %s -> %s", conn.RemoteAddr().String(), remoteTargetAddr)
 		}
 	}
 
+	ncconfig.Logger.Printf("%s\n", onTip)
+	if ncconfig.verboseWithTime {
+		defer ncconfig.Logger.Printf("%s\n", offTip)
+	}
 	return handleSingleConnection(console, ncconfig, conn)
 }
 
