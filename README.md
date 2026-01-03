@@ -14,6 +14,8 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
 [最新版本下载](https://www.gonc.cc/)
 
+[详细文档](https://www.gonc.cc/docs/)
+
 ---
 
 ## 使用示例

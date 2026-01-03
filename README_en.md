@@ -14,6 +14,8 @@ README in [English](./README_en.md) and [中文](./README.md)
 
 [Latest version download](https://www.gonc.cc/)
 
+[docs](https://www.gonc.cc/docs/)
+
 ---
 
 ## Usage Examples

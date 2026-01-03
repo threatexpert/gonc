@@ -1,0 +1,59 @@
+site_name: gonc 文档
+site_description: Netcat，具备自动NAT穿透功能，支持安全点对点连接，并提供用于shell访问、文件传输和网络代理的高级特性。
+site_url: https://www.gonc.cc/docs/
+repo_url: https://github.com/threatexpert/gonc
+repo_name: gonc
+
+theme:
+  name: material
+  language: zh
+  palette: 
+    # 浅色模式 (默认)
+    - scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: 切换至深色模式
+    # 深色模式 (点击切换)
+    - scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: 切换至浅色模式
+  features:
+    - navigation.tabs        # 启用顶部导航栏 (看起来像专业官网)
+    - navigation.sections    # 侧边栏折叠效果
+    - navigation.top         # 返回顶部按钮
+    - search.suggest         # 搜索输入建议
+    - search.highlight       # 搜索结果高亮
+    - content.code.copy      # ⭐ 代码块右上角显示“复制”按钮 
+    - content.tabs.link      # 记住用户选择的标签页 (比如用户选了 Linux，翻页后还是 Linux)
+
+markdown_extensions:
+  - admonition               # 支持提示块 (Note, Warning)
+  - pymdownx.details         # 支持折叠块
+  - pymdownx.superfences     # 更好的代码块支持
+  - pymdownx.tabbed:         # 支持多标签 (适合展示 Windows/Linux 不同命令)
+      alternate_style: true
+  - attr_list                # 支持添加属性
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_javascript:
+  - js/random-psk.js
+
+nav:
+  - 首页: index.md
+  - 核心概念: concepts.md
+  - 安装指南: install.md
+  - 常用场景: cookbook.md
+  - 参数手册: 
+      - 基础连接: guide/basic.md
+      - P2P连接: guide/p2p.md
+      - 内置模块 (-e): guide/modules.md
+      - 安全与加密: guide/security.md
+      - 高级参数: guide/advanced.md

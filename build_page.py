@@ -8,6 +8,8 @@ import shutil
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BIN_DIR = SCRIPT_DIR / "bin"
+SITE_DIR = SCRIPT_DIR / "site" 
+
 INDEX_HTML = BIN_DIR / "index.html"
 NOTFOUND_HTML = BIN_DIR / "404.html"
 #HEADERS_FILE = BIN_DIR / "_headers"
@@ -86,7 +88,9 @@ body {
 <div style="font-family: sans-serif; margin-bottom: 20px; position: relative;">
 
     <h2 style="margin-bottom: 10px;">gonc $VERSION</h2>
-    <p>Github: <a href="https://github.com/threatexpert/gonc">https://github.com/threatexpert/gonc</a></p>
+    <p>Github: <a href="https://github.com/threatexpert/gonc">https://github.com/threatexpert/gonc</a>
+    <br><a href="/docs/">Docs/详细文档</a></br>
+    </p>
 
     <!-- 语言切换按钮 -->
     <input type="checkbox" id="lang-toggle">
@@ -197,23 +201,46 @@ def build_headers(files):
 
 def build_zip(files_to_zip, zip_name):
     """
-    files_to_zip: list of Path 对象
-    将指定文件打包成 .zip，如果已存在先删除
+    files_to_zip: list of Path 对象 (index.html, 404.html, _redirects)
+    zip_name: 输出 zip 文件名
+    功能：
+    1. 将 files_to_zip 打包到 zip 根目录
+    2. 将 SITE_DIR 目录下的所有文件打包到 zip 的 docs/ 目录下
     """
     DEPLOY_ZIP = BIN_DIR / zip_name
+    
     # 如果 .zip 已存在，先删除
     if DEPLOY_ZIP.exists():
         print(f"⚠ {DEPLOY_ZIP} 已存在，删除...")
         DEPLOY_ZIP.unlink()
 
-    print(f"⚠ {DEPLOY_ZIP} 打包中({len(files_to_zip)}个文件)..." )
+    print(f"📦 开始打包 {DEPLOY_ZIP} ...")
 
-    # 打包指定文件
     with zipfile.ZipFile(DEPLOY_ZIP, "w", zipfile.ZIP_DEFLATED) as zipf:
+        # 1. 打包指定文件 (index.html, 404.html 等) 到 Zip 根目录
         for f in files_to_zip:
             if f.is_file():
-                zipf.write(f, arcname=f.name)  # 保持文件名，不带目录
-    print(f"✔ 已生成 {DEPLOY_ZIP}")
+                print(f"  + 添加文件: {f.name}")
+                zipf.write(f, arcname=f.name)
+        
+        # 2. 打包 site 目录内容到 Zip 的 docs/ 目录
+        if SITE_DIR.exists() and SITE_DIR.is_dir():
+            print(f"  + 添加目录: {SITE_DIR} -> docs/")
+            count = 0
+            # 使用 rglob 递归遍历所有文件
+            for file_path in SITE_DIR.rglob("*"):
+                if file_path.is_file():
+                    # 计算相对路径，例如 site/css/style.css -> css/style.css
+                    rel_path = file_path.relative_to(SITE_DIR)
+                    # 拼接目标路径 docs/css/style.css
+                    target_path = Path("docs") / rel_path
+                    zipf.write(file_path, arcname=str(target_path))
+                    count += 1
+            print(f"  ✔ 已打包 site 目录 ({count} 个文件)")
+        else:
+            print(f"  ⚠ 警告: 未找到 site 目录 ({SITE_DIR})，跳过打包文档。")
+
+    print(f"✔ 成功生成 {DEPLOY_ZIP}")
 
 def build_redirects(files, version):
     """
