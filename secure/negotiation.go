@@ -63,18 +63,19 @@ func NewNegotiationConfig() *NegotiationConfig {
 }
 
 type NegotiatedConn struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	Config           *NegotiationConfig
-	KeyingMaterial   [32]byte
-	TopLayer         net.Conn
-	ConnStack        []string
-	ConnLayers       []net.Conn
-	IsUDP            bool
-	IsFramed         bool
-	WithKCP          bool
-	MQTTHelloPayload string
-	OnClose          func()
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	Config               *NegotiationConfig
+	KeyingMaterial       [32]byte
+	TopLayer             net.Conn
+	ConnStack            []string
+	ConnLayers           []net.Conn
+	IsUDP                bool
+	IsFramed             bool
+	WithKCP              bool
+	MQTTHelloCtrlPayload string
+	MQTTHelloAppPayload  string
+	OnClose              func()
 }
 
 func (nconn *NegotiatedConn) Close() error {

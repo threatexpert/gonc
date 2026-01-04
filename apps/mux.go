@@ -66,6 +66,16 @@ type ChanError struct {
 
 type muxListener struct {
 	session interface{}
+	raddr   string
+	laddr   string
+}
+
+func newMuxListener(session interface{}) *muxListener {
+	return &muxListener{
+		session: session,
+		raddr:   muxSessionRemoteAddr(session),
+		laddr:   muxSessionLocalAddr(session),
+	}
 }
 
 func (m *muxListener) Accept() (net.Conn, error) {
@@ -84,7 +94,7 @@ func (m *muxListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	return &streamWrapper{Conn: stream}, nil
+	return newStreamWrapper(stream, m.raddr, m.laddr), nil
 }
 
 func (m *muxListener) Close() error {
@@ -104,6 +114,22 @@ func (m *muxListener) Addr() net.Addr {
 
 type streamWrapper struct {
 	net.Conn
+	raddr string
+	laddr string
+}
+
+func newStreamWrapper(conn net.Conn, remoteAddr, localAddr string) *streamWrapper {
+	if remoteAddr == "" {
+		remoteAddr = "remote"
+	}
+	if localAddr == "" {
+		localAddr = "local"
+	}
+	return &streamWrapper{
+		Conn:  conn,
+		raddr: remoteAddr,
+		laddr: localAddr,
+	}
 }
 
 func (s *streamWrapper) CloseWrite() error {
@@ -111,11 +137,11 @@ func (s *streamWrapper) CloseWrite() error {
 }
 
 func (s *streamWrapper) LocalAddr() net.Addr {
-	return misc.DummyAddr("local")
+	return misc.DummyAddr(s.laddr)
 }
 
 func (s *streamWrapper) RemoteAddr() net.Addr {
-	return misc.DummyAddr("remote")
+	return misc.DummyAddr(s.raddr)
 }
 
 func (s *streamWrapper) SetDeadline(t time.Time) error {
@@ -504,7 +530,7 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 			muxcfg.Logger.Println("mux Open failed:", err)
 			return
 		}
-		streamWithCloseWrite := &streamWrapper{Conn: stream}
+		streamWithCloseWrite := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
 		defer streamWithCloseWrite.Close()
 
 		if scheme == "raw" {
@@ -956,7 +982,7 @@ func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
 func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool) error {
-	listener := &muxListener{session}
+	listener := newMuxListener(session)
 	s5config := Socks5uConfig{
 		Logger:     cfg.Logger,
 		AccessCtrl: cfg.AccessCtrl,
@@ -1061,7 +1087,7 @@ func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 		return err
 	}
 
-	ln := &muxListener{session}
+	ln := newMuxListener(session)
 	enableZstd := true
 
 	srvcfg := httpfileshare.ServerConfig{
@@ -1132,6 +1158,40 @@ func openMuxStream(session interface{}) (net.Conn, error) {
 		return s.OpenStream()
 	default:
 		return nil, fmt.Errorf("unknown session type")
+	}
+}
+
+func muxSessionLocalAddr(session interface{}) string {
+	var addr net.Addr
+	switch s := session.(type) {
+	case *yamux.Session:
+		addr = s.LocalAddr()
+	case *smux.Session:
+		addr = s.LocalAddr()
+	default:
+		return ""
+	}
+	if addr != nil {
+		return addr.String()
+	} else {
+		return ""
+	}
+}
+
+func muxSessionRemoteAddr(session interface{}) string {
+	var addr net.Addr
+	switch s := session.(type) {
+	case *yamux.Session:
+		addr = s.RemoteAddr()
+	case *smux.Session:
+		addr = s.RemoteAddr()
+	default:
+		return ""
+	}
+	if addr != nil {
+		return addr.String()
+	} else {
+		return ""
 	}
 }
 

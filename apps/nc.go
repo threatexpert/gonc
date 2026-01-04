@@ -140,6 +140,9 @@ type AppNetcatConfig struct {
 	kcpBridgeMode     bool
 	verbose           bool
 	verboseWithTime   bool
+	muxEnabled        bool
+	muxLocalPort      string
+	muxListener       net.Listener
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -224,6 +227,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.tlsVerifyCert, "verify", false, "verify TLS certificate (client mode only)")
 	fs.IntVar(&config.keepAlive, "keepalive", 0, "none 0 will enable keepalive feature")
 	fs.BoolVar(&config.verbose, "v", true, "verbose output")
+	fs.BoolVar(&config.muxEnabled, "mux", false, "Enable multiplexing protocol")
+	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Enable multiplexing protocol. Open a local listener")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
@@ -434,6 +439,17 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 	if len(config.featureModulesRun) != 0 {
 		return runFeatureModules(console, config)
 	}
+
+	if config.muxLocalPort != "" {
+		ln, err := prepareLocalListener(config.muxLocalPort, false)
+		if err != nil {
+			config.Logger.Printf("Error starting local mux listener on %s: %v\n", config.muxLocalPort, err)
+			return 1
+		}
+		config.muxListener = ln
+		config.Logger.Printf("Mux local listener started on %s\n", ln.Addr().String())
+	}
+
 	if config.p2pSessionKey != "" {
 		return runP2PMode(console, config)
 	} else {
@@ -472,7 +488,8 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 		ncconfig.appMuxSocksMode ||
 		ncconfig.appMuxLinkAgent ||
 		ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "" ||
-		ncconfig.runAppLink != "" {
+		ncconfig.runAppLink != "" ||
+		ncconfig.muxLocalPort != "" {
 		return true
 	}
 	return false
@@ -734,6 +751,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				} else {
 					ncconfig.MQTTHelloPayload.SetControlValue("cs", "tls")
 				}
+				if ncconfig.muxLocalPort != "" {
+					ncconfig.MQTTHelloPayload.SetControlValue("mux", "1")
+				}
 			}
 			if isTLSEnabled(ncconfig) {
 				if ncconfig.presharedKey == "" {
@@ -791,10 +811,17 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 				time.Sleep(10 * time.Second)
 				continue
 			}
+
 			if ncconfig.useMQTTWait {
-				go handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+				go func(c *secure.NegotiatedConn) {
+					addr := c.RemoteAddr().String()
+					handleP2PConnection(console, ncconfig, c, stats_in, stats_out)
+					ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
+				}(nconn)
 			} else {
-				handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+				addr := nconn.RemoteAddr().String()
+				handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
+				ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
 			}
 			time.Sleep(2 * time.Second)
 		}
@@ -804,7 +831,7 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 			ncconfig.Logger.Printf("P2P failed: %v\n", err)
 			return 1
 		}
-		return handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+		return handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 }
 
@@ -1915,6 +1942,16 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 	return config
 }
 
+func handleMuxChannelConnection(console net.Conn, ncconfig *AppNetcatConfig, channel net.Conn, stats_in, stats_out *misc.ProgressStats) int {
+	nconn := &secure.NegotiatedConn{
+		Config:     secure.NewNegotiationConfig(),
+		ConnLayers: []net.Conn{channel},
+		TopLayer:   channel,
+	}
+
+	return handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+}
+
 func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *secure.NegotiatedConn, stats_in, stats_out *misc.ProgressStats) int {
 	defer atomic.AddInt32(&ncconfig.goroutineConnectionCounter, -1)
 	atomic.AddInt32(&ncconfig.goroutineConnectionCounter, 1)
@@ -2107,7 +2144,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			input = pipeConn.In
 			output = pipeConn.Out
 			defer pipeConn.Close()
-			go App_Bridge_main_withconfig(pipeConn, nconn.MQTTHelloPayload, ncconfig, ncconfig.app_br_Config)
+			go App_Bridge_main_withconfig(pipeConn, nconn.MQTTHelloAppPayload, ncconfig, ncconfig.app_br_Config)
 		} else if builtinApp == ":httpserver" {
 			if ncconfig.app_httpserver_Config == nil {
 				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
@@ -2272,7 +2309,134 @@ func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.N
 		conn.Close()
 		return 1
 	}
+
+	if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" {
+		return handleMuxConnection(console, ncconfig, nconn, stats_in, stats_out)
+	}
+
 	return handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+}
+
+func handleP2PConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *secure.NegotiatedConn, stats_in *misc.ProgressStats, stats_out *misc.ProgressStats) int {
+
+	ctrlPayload := easyp2p.HelloPayloadFromString(nconn.MQTTHelloCtrlPayload)
+
+	muxVal, _ := ctrlPayload.GetControlValue("mux")
+
+	if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" || muxVal == "1" {
+		return handleMuxConnection(console, ncconfig, nconn, stats_in, stats_out)
+	}
+
+	return handleNegotiatedConnection(console, ncconfig, nconn, stats_in, stats_out)
+}
+
+type NetcatMuxStreamHandler func(client, server net.Conn)
+
+func runMuxListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-chan struct{}, handler NetcatMuxStreamHandler) error {
+	defer ncconfig.muxListener.Close()
+
+	// 监听 doneChan (Session 死则 Listener 死)
+	go func() {
+		<-doneChan
+		ncconfig.muxListener.Close()
+	}()
+
+	handleConn := func(c net.Conn) {
+		defer c.Close()
+		stream, err := openMuxStream(session)
+		if err != nil {
+			ncconfig.Logger.Println("mux Open failed:", err)
+			return
+		}
+		streamWithCloseWrite := newStreamWrapper(stream, "", "")
+		defer streamWithCloseWrite.Close()
+		handler(c, streamWithCloseWrite)
+	}
+
+	for {
+		conn, err := ncconfig.muxListener.Accept()
+		if err != nil {
+			select {
+			case <-doneChan:
+				return fmt.Errorf("mux session closed")
+			default:
+				return fmt.Errorf("listener accept failed: %v", err)
+			}
+		}
+
+		go handleConn(conn)
+	}
+}
+
+func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
+	isClient := false
+	if ncconfig.muxLocalPort != "" {
+		isClient = true
+		if ncconfig.muxListener == nil {
+			ncconfig.Logger.Printf("invalid muxListener")
+			return 1
+		}
+	}
+
+	session, err := createMuxSession(VarmuxEngine, conn, isClient)
+	if err != nil {
+		ncconfig.Logger.Printf("create mux session failed: %v", err)
+		return 1
+	}
+
+	ncconfig.ConsoleMode = false
+
+	if isClient {
+		ncconfig.Logger.Printf(
+			"Mux client ready, remote service mapped to %s",
+			ncconfig.muxListener.Addr(),
+		)
+
+		sessionDone := make(chan struct{})
+		go func() {
+			defer close(sessionDone)
+			listener := newMuxListener(session)
+			stream, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			stream.Close()
+		}()
+
+		handler := func(client, server net.Conn) {
+			cliRaddr := client.RemoteAddr().String()
+			ncconfig.Logger.Printf(
+				"Open mux stream from %s",
+				cliRaddr,
+			)
+			handleMuxChannelConnection(client, ncconfig, server, stats_in, stats_out)
+			ncconfig.Logger.Printf(
+				"Close mux stream from %s",
+				cliRaddr,
+			)
+		}
+		err = runMuxListener(ncconfig, session, sessionDone, handler)
+		if err != nil {
+			return 1
+		}
+	} else {
+		ncconfig.Logger.Printf("Enter mux server mode\n")
+
+		listener := newMuxListener(session)
+		for {
+			stream, err := listener.Accept()
+			if err != nil {
+				if err == io.EOF {
+					return 0
+				}
+				return 1
+			}
+
+			go handleMuxChannelConnection(console, ncconfig, stream, stats_in, stats_out)
+		}
+	}
+
+	return 0
 }
 
 func isKCPEnabled(ncconfig *AppNetcatConfig) bool {
@@ -2453,7 +2617,8 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			preOnClose()
 		}
 	}
-	nconn.MQTTHelloPayload = helloPayload.AppString()
+	nconn.MQTTHelloCtrlPayload = helloPayload.CtrlString()
+	nconn.MQTTHelloAppPayload = helloPayload.AppString()
 	return nconn, nil
 }
 

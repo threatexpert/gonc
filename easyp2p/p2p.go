@@ -2033,6 +2033,14 @@ func (h HelloPayload) String() string {
 	}
 }
 
+func (h HelloPayload) CtrlString() string {
+	if len(h.Control) == 0 {
+		return ""
+	} else {
+		return strings.Join(h.Control, ";")
+	}
+}
+
 func (h HelloPayload) AppString() string {
 	if h.App == "" {
 		return ""

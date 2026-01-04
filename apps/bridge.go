@@ -241,8 +241,8 @@ func brAcceptSessKickByConnAddr(localStr, remoteStr string) bool {
 	return deleted
 }
 
-func Bridge_IsP2PHelloAllowed(MQTTHelloPayload string) bool {
-	parts := strings.Split(MQTTHelloPayload, "#")
+func Bridge_IsP2PHelloAllowed(MQTTHelloAppPayload string) bool {
+	parts := strings.Split(MQTTHelloAppPayload, "#")
 	if len(parts) != 2 {
 		return false
 	}
@@ -267,7 +267,7 @@ func Bridge_IsP2PHelloAllowed(MQTTHelloPayload string) bool {
 // ==========================================
 // Section 3: Main Logic
 // ==========================================
-func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig *AppNetcatConfig, config *AppBridgeConfig) {
+func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloAppPayload string, ncconfig *AppNetcatConfig, config *AppBridgeConfig) {
 
 	startOnceForBridge.Do(func() {
 		go brSessCacheCleanRoutine()
@@ -372,7 +372,7 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloPayload string, ncconfig
 		cid := brRegisterConn(sess)
 		defer brConnCache.Delete(cid)
 
-		bridgeinfo := MQTTHelloPayload
+		bridgeinfo := MQTTHelloAppPayload
 		ncconfig.Logger.Printf("Received bridge info: %s", bridgeinfo)
 
 		// 2. 解析 sessid 和 序号
