@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/threatexpert/gonc/v2/acl"
@@ -76,16 +77,171 @@ type Socks5uConfig struct {
 	AccessCtrl *acl.ACL
 }
 
-// sendSocks5AuthResponse 发送 SOCKS5 用户名/密码认证阶段的响应
-func sendSocks5AuthResponse(conn net.Conn, status byte) error {
-	_, err := conn.Write([]byte{0x01, status})
-	return err
-}
-
 type Socks5Request struct {
 	Command string
 	Host    string
 	Port    int
+}
+
+const (
+	ListenerIdleTimeout = 30 * time.Second // 监听器空闲超时时间（没人领连接就关闭）
+)
+
+// SharedListener 代表一个持久化的监听端口，专门为BIND命令设计，它可缓存BIND端口并发连入的连接，并提供给稍后请求BIND的客户端使用
+type SharedListener struct {
+	Ref        int32 // 引用计数
+	Listener   net.Listener
+	ConnQueue  chan net.Conn // 生产者-消费者队列
+	LastActive time.Time     // 最后一次被客户端“触摸”的时间
+	CloseOnce  sync.Once     // 确保只关闭一次
+	QuitChan   chan struct{} // 通知后台协程退出
+	Port       int           // 实际监听端口
+	BindIP     string        // 监听IP
+}
+
+// BindManager 管理所有活跃的监听器
+type BindManager struct {
+	mu        sync.Mutex
+	listeners map[string]*SharedListener // Key: "IP:Port"
+}
+
+// 全局管理器实例
+var globalBindManager = &BindManager{
+	listeners: make(map[string]*SharedListener),
+}
+
+// 获取或创建一个 SharedListener
+func (m *BindManager) GetOrStartListener(ctx context.Context, bindIP string, reqPort int, logger *log.Logger) (*SharedListener, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := net.JoinHostPort(bindIP, strconv.Itoa(reqPort))
+
+	// 1. 尝试查找现有的监听器 (仅当请求端口不为0时)
+	if reqPort != 0 {
+		if sl, exists := m.listeners[key]; exists {
+			// 刷新活跃时间
+			sl.LastActive = time.Now()
+			atomic.AddInt32(&sl.Ref, 1)
+			return sl, nil
+		}
+	}
+
+	// 2. 如果没找到，或者请求端口是0，创建新的监听
+	lc := net.ListenConfig{Control: netx.ControlTCP}
+	addr := net.JoinHostPort(bindIP, ":0")
+	if reqPort != 0 {
+		addr = key
+	}
+
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 获取实际端口 (处理端口0的情况)
+	realAddr := ln.Addr().(*net.TCPAddr)
+	realKey := net.JoinHostPort(bindIP, strconv.Itoa(realAddr.Port))
+
+	sl := &SharedListener{
+		Ref:        1,
+		Listener:   ln,
+		ConnQueue:  make(chan net.Conn), // 大小为 0,
+		LastActive: time.Now(),
+		QuitChan:   make(chan struct{}),
+		Port:       realAddr.Port,
+		BindIP:     bindIP,
+	}
+
+	// 存入 Map
+	m.listeners[realKey] = sl
+
+	// 如果请求的是端口0，可能产生了一个新的key，需要确保以后能通过具体端口找到它
+	// 但通常 Port 0 意味着“一次性”或“告知客户端新端口”，后续客户端会连这个新端口
+
+	// 启动后台任务
+	go sl.acceptLoop(logger)
+	go sl.monitorLifecycle(m, realKey, logger)
+
+	return sl, nil
+}
+
+// 后台接收连接循环 (生产者)
+func (sl *SharedListener) acceptLoop(logger *log.Logger) {
+	defer func() {
+		// 退出时关闭 channel
+		// 因为是无缓冲的，channel 里不可能有残留连接。
+		close(sl.ConnQueue)
+		sl.Listener.Close() // 确保物理监听关闭
+	}()
+
+	for {
+		// 1. 阻塞等待内核的新连接
+		// 如果这里阻塞太久，monitorLifecycle 会关闭 Listener，
+		// 导致 Accept 返回 error，从而退出循环。
+		conn, err := sl.Listener.Accept()
+		if err != nil {
+			select {
+			case <-sl.QuitChan:
+				return // 正常超时退出
+			default:
+				// 异常错误
+				return
+			}
+		}
+
+		// 2. 拿到连接了，必须递交给消费者
+		// 我们利用 select 来实现“要么有人领走，要么超时关闭”
+		select {
+		case sl.ConnQueue <- conn:
+			// 成功！有消费者（客户端 BIND 请求）拿走了连接
+			// 继续循环去 Accept 下一个
+
+		case <-sl.QuitChan:
+			// 悲剧了：手里拿着个刚 Accept 的连接，但是管理器通知要关闭了
+			// (比如超时时间到了，monitor 关闭了 QuitChan)
+			conn.Close() // 销毁手里这个没送出去的连接
+			return       // 退出协程
+		}
+	}
+}
+
+// 生命周期监控 (超时管理)
+func (sl *SharedListener) monitorLifecycle(m *BindManager, mapKey string, logger *log.Logger) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sl.QuitChan:
+			return
+		case <-ticker.C:
+			// 检查是否空闲超时
+			if atomic.LoadInt32(&sl.Ref) == 0 && time.Since(sl.LastActive) > ListenerIdleTimeout {
+				// 执行清理
+				m.mu.Lock()
+				// 二次确认，防止在获取锁期间被更新
+				if time.Since(sl.LastActive) > ListenerIdleTimeout {
+					if current, ok := m.listeners[mapKey]; ok && current == sl {
+						delete(m.listeners, mapKey)
+						sl.CloseOnce.Do(func() {
+							close(sl.QuitChan)
+							sl.Listener.Close()
+						})
+						logger.Printf("Closed idle BIND listener on %s", mapKey)
+					}
+				}
+				m.mu.Unlock()
+				return // 退出监控
+			}
+		}
+	}
+}
+
+// sendSocks5AuthResponse 发送 SOCKS5 用户名/密码认证阶段的响应
+func sendSocks5AuthResponse(conn net.Conn, status byte) error {
+	_, err := conn.Write([]byte{0x01, status})
+	return err
 }
 
 // handleSocks5Handshake 处理 SOCKS5 握手阶段
@@ -769,9 +925,8 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 		return err
 	}
 
+	config.Logger.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr(), targetAddr)
 	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddr.String())
-	config.Logger.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr().String(), targetAddr)
-
 	if err != nil {
 		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
 		return fmt.Errorf("tunnel TCP connect failed: %v", err)
@@ -781,94 +936,102 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 	return nil
 }
 
-func handleTCPListen(clientConn net.Conn, serverIP string, targetHost string, targetPort int) error {
-	lc := net.ListenConfig{Control: netx.ControlTCP}
-	if targetHost == "" {
+func handleTCPListen(config *Socks5uConfig, clientConn net.Conn, targetHost string, targetPort int) error {
+	// 1. 确定 BIND 的 IP 地址
+	bindIP := targetHost
+	if bindIP == "" {
+		// 如果客户端没指定IP，通常沿用连接进来的本地IP
 		local, ok := clientConn.LocalAddr().(*net.TCPAddr)
 		if ok {
-			targetHost = local.IP.String()
+			bindIP = local.IP.String()
 		}
 	}
-	bindAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-	listener, err := lc.Listen(context.Background(), "tcp", bindAddr)
+
+	// 2. 从管理器获取或创建监听器
+	// 注意：这里没有把 clientConn 传进去，意味着任何知道端口的人可能都能连（SOCKS5标准如此）。
+	// 如果需要隔离用户，可以在 GetOrStartListener key 中加入 config.Username
+	sl, err := globalBindManager.GetOrStartListener(context.Background(), bindIP, targetPort, config.Logger)
 	if err != nil {
 		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
-		return fmt.Errorf("bind to %v failed: %w", bindAddr, err)
+		return fmt.Errorf("manager get listener failed: %w", err)
 	}
 
-	localAddr := listener.Addr()
-	local, ok := localAddr.(*net.TCPAddr)
-	if !ok {
-		listener.Close()
-		return fmt.Errorf("bind to %v failed: local address is %s://%s", bindAddr, localAddr.Network(), localAddr.String())
+	var onceReleaseSL sync.Once
+	releaseSL := func() {
+		onceReleaseSL.Do(func() {
+			atomic.AddInt32(&sl.Ref, -1)
+		})
 	}
+	defer releaseSL()
 
-	err = sendSocks5Response(clientConn, REP_SUCCEEDED, serverIP, local.Port)
+	config.Logger.Printf("Client %s attached to BIND listener on %s:%d", clientConn.RemoteAddr(), sl.BindIP, sl.Port)
+
+	// 3. 发送第一次响应 (Reply 1) - 告诉客户端我们在哪个端口监听
+	// 即使是复用旧监听器，这里也必须再次告诉客户端监听端口
+	err = sendSocks5Response(clientConn, REP_SUCCEEDED, config.ServerIP, sl.Port)
 	if err != nil {
-		return fmt.Errorf("send response error: %w", err)
+		return fmt.Errorf("send response 1 error: %w", err)
 	}
+
+	// 4. 等待连接接入 (消费者逻辑)
+	var targetConn net.Conn
+
+	// 创建一个用于监测 clientConn 断开的 channel
+	clientClosed := make(chan struct{})
 
 	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.Background()) // 控制 goroutine 正常退出
 	wg.Add(1)
 
 	// 监控 clientConn 是否异常
+	clientConn.SetReadDeadline(time.Time{}) // 移除 deadline 避免干扰
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 1)
-		for {
-			// 设置1秒超时
-			_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			_, err := clientConn.Read(buf)
-
-			if err != nil {
-				// 检查是否是超时（非致命）
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					select {
-					case <-ctx.Done():
-						// 收到主线程通知，正常退出
-						return
-					default:
-						// 超时但还要继续循环
-						continue
-					}
-				}
-
-				// 其他错误，说明连接断了或异常
-				listener.Close() // 主动关闭 Accept
-				return
-			}
-
-			// 如果读到数据（buf 非空），也认为异常
-			listener.Close()
-			return
+		if _, err := clientConn.Read(buf); err == nil {
+			// 正常读到数据，说明客户端发了不该发的数据，直接关闭
+			clientConn.Close()
 		}
+		// 读到数据或发生错误，说明连接断开或异常
+		close(clientClosed)
 	}()
 
-	// 阻塞等待连接
-	conn, err := listener.Accept()
-	cancel() // 通知 goroutine 正常退出
-	if err != nil {
-		listener.Close()
-		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
-		wg.Wait()
-		return fmt.Errorf("accept failed: %w", err)
+	select {
+	case conn, ok := <-sl.ConnQueue:
+		if !ok {
+			// 这种情况一般是监听器被强制关闭了
+			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+			return fmt.Errorf("listener closed unexpectedly")
+		}
+		targetConn = conn
+
+	case <-clientClosed:
+		// 客户端在等待期间断开了
+		return fmt.Errorf("client connection closed while waiting")
 	}
 
-	listener.Close()
+	sl.LastActive = time.Now()
+	releaseSL()
+	defer targetConn.Close()
+
+	_ = clientConn.SetReadDeadline(time.Now())
 	wg.Wait() // 等 goroutine 退出后继续
 	_ = clientConn.SetReadDeadline(time.Time{})
 
-	remoteAddr := conn.RemoteAddr()
+	// 5. 发送第二次响应 (Reply 2) - 告诉客户端谁连上来了
+	remoteAddr := targetConn.RemoteAddr()
 	remote, ok := remoteAddr.(*net.TCPAddr)
 	if !ok {
-		return fmt.Errorf("failed: cast remote address to TCPAddr: %s://%s", remoteAddr.Network(), remoteAddr.String())
+		return fmt.Errorf("failed cast remote addr")
 	}
+
 	err = sendSocks5Response(clientConn, REP_SUCCEEDED, remote.IP.String(), remote.Port)
 	if err != nil {
-		return fmt.Errorf("send response error: %w", err)
+		return fmt.Errorf("send response 2 error: %w", err)
 	}
-	bidirectionalCopy(clientConn, conn)
+
+	// 注意：转发结束后，我们不关闭 Listener，只由 monitorLifecycle 去负责
+	bidirectionalCopy(clientConn, targetConn)
+
 	return nil
 }
 

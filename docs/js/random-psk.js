@@ -35,12 +35,12 @@ document$.subscribe(function() {
             // 注意：这里使用 innerHTML 替换，以保持原有的高亮格式。
             // 只要 mysecret123 是个完整的单词，通常不会被高亮插件切割，可以直接替换。
             const regex = /mysecret123/g;
-            const replacement = `<span style="color:rgb(0, 0, 0);" title="随机示例Key">${randomKey}</span>`;
+            const replacement = `<span title="随机示例Key">${randomKey}</span>`;
             block.innerHTML = block.innerHTML.replace(regex, replacement);
         }
         if (block.textContent.includes('simplekey123')) {
             const regex2 = /simplekey123/g;
-            const replacement2 = `<span style="color:rgb(0, 0, 0);" title="随机示例Key">${simpleKey}</span>`;
+            const replacement2 = `<span title="随机示例Key">${simpleKey}</span>`;
             block.innerHTML = block.innerHTML.replace(regex2, replacement2);
         }
     });

@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.6"
+	VERSION = "v2.4.7"
 )
 
 type AppNetcatConfig struct {
@@ -905,6 +905,36 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	}
 }
 
+func retrySocks5Bind(ncconfig *AppNetcatConfig, proxyClient *ProxyClient, network, listenAddr string) (net.Listener, error) {
+	retryDelay := 5 * time.Second
+	maxDelay := 60 * time.Second
+
+	var listener net.Listener
+	var err error
+
+	for {
+		ncconfig.Logger.Printf("Attempting SOCKS5 BIND on proxy at %s...\n", listenAddr)
+		listener, err = proxyClient.Dialer.Listen(network, listenAddr)
+		if err == nil {
+			ncconfig.Logger.Printf("SOCKS5 BIND listening on %s", listenAddr)
+			return listener, nil
+		}
+
+		ncconfig.Logger.Printf("SOCKS5 BIND failed on %s: %v", listenAddr, err)
+		if !ncconfig.keepOpen {
+			return nil, err
+		}
+		ncconfig.Logger.Printf("Retrying in %s...", retryDelay)
+		time.Sleep(retryDelay)
+
+		// 指数退避，最多不超过 maxDelay
+		retryDelay *= 2
+		if retryDelay > maxDelay {
+			retryDelay = maxDelay
+		}
+	}
+}
+
 // startTCPListener 启动TCP/Unix监听器并处理传入连接
 func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	listenAddr := net.JoinHostPort(host, port)
@@ -925,10 +955,11 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		return 1
 	}
 	if proxyClient.SupportBIND() {
-		ncconfig.Logger.Printf("Attempting SOCKS5 BIND on proxy at %s...\n", listenAddr)
-		listener, err = proxyClient.Dialer.Listen(network, listenAddr)
-		//socks5listener的Close函数是空，无需Close()
 		socks5BindMode = true
+		listener, err = retrySocks5Bind(ncconfig, proxyClient, network, listenAddr)
+		if err != nil {
+			return 1
+		}
 	} else {
 		lc := net.ListenConfig{}
 		if ncconfig.useSTUN {
@@ -939,13 +970,11 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			lc.Control = netx.ControlTCP
 		}
 		listener, err = lc.Listen(context.Background(), network, listenAddr)
-		if err == nil {
-			defer listener.Close()
+		if err != nil {
+			ncconfig.Logger.Printf("Error listening on %s: %v\n", listenAddr, err)
+			return 1
 		}
-	}
-	if err != nil {
-		ncconfig.Logger.Printf("Error listening on %s: %v\n", listenAddr, err)
-		return 1
+		defer listener.Close()
 	}
 
 	ncconfig.Logger.Printf("Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
@@ -967,7 +996,11 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			if err != nil {
 				ncconfig.Logger.Printf("Error accepting connection: %v\n", err)
 				if socks5BindMode {
-					goto RE_BIND
+					listener, err = retrySocks5Bind(ncconfig, proxyClient, network, listenAddr)
+					if err != nil {
+						return 1
+					}
+					continue
 				} else {
 					time.Sleep(1 * time.Second)
 					continue
@@ -993,20 +1026,11 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 					ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
 				}(conn)
 			}
-		RE_BIND:
 			if socks5BindMode {
 				listener.Close()
-				for tt := 0; tt < 60; tt++ {
-					ncconfig.Logger.Printf("Re-attempting SOCKS5 BIND on proxy at %s...", listenAddr)
-					listener, err = proxyClient.Dialer.Listen(network, listenAddr)
-					if err != nil {
-						ncconfig.Logger.Printf("Error listening on %s: %v\n", listenAddr, err)
-						ncconfig.Logger.Printf("Will retry in 5 seconds...\n")
-						time.Sleep(5 * time.Second)
-					} else {
-						ncconfig.Logger.Printf("completed\n")
-						break
-					}
+				listener, err = retrySocks5Bind(ncconfig, proxyClient, network, listenAddr)
+				if err != nil {
+					return 1
 				}
 			}
 		}

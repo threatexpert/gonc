@@ -59,7 +59,7 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 			config.Logger.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
 		}
 	} else if req.Command == "BIND" && config.EnableBind {
-		err = handleTCPListen(conn, config.ServerIP, req.Host, req.Port)
+		err = handleTCPListen(&s5config, conn, req.Host, req.Port)
 		if err != nil {
 			config.Logger.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
 		}
