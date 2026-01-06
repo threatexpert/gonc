@@ -497,6 +497,8 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 
 // configureAppMode 为内置应用程序设置命令参数
 func configureAppMode(ncconfig *AppNetcatConfig) {
+	isServiceMode := strings.HasPrefix(ncconfig.runCmd, ":service")
+	isAppMode := true
 	if ncconfig.runAppFileServ != "" {
 		//使用了-httpserver 的情况，获取多余的参数都当作根目录添加进去。
 		rootPaths := []string{ncconfig.runAppFileServ}
@@ -550,6 +552,13 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
+	} else {
+		isAppMode = false
+	}
+
+	if isAppMode && isServiceMode {
+		ncconfig.Logger.Printf("Error: App modes (-httpserver, -linkagent, etc.) cannot be used with -e \":service\"\n")
+		os.Exit(1)
 	}
 
 	if ncconfig.portRotate {
@@ -1728,6 +1737,10 @@ func conflictCheck(ncconfig *AppNetcatConfig) int {
 		ncconfig.Logger.Printf("-ss and (-plain -tls) cannot be used together\n")
 		return 1
 	}
+	if (ncconfig.muxEnabled || ncconfig.muxLocalPort != "") && ncconfig.app_mux_args != "-" {
+		ncconfig.Logger.Printf("mux mode and -e \":mux\" cannot be used together\n")
+		return 1
+	}
 	return 0
 }
 
@@ -1745,6 +1758,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 	builtinApp := args[0]
 	switch builtinApp {
 	case ":mux":
+		if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" {
+			return fmt.Errorf("mux mode and -e \":mux\" cannot be used together")
+		}
 		ncconfig.app_mux_Config, err = AppMuxConfigByArgs(ncconfig.LogWriter, args[1:])
 		if err != nil {
 			usage = App_mux_usage
