@@ -142,7 +142,7 @@ type AppNetcatConfig struct {
 	verboseWithTime   bool
 	muxEnabled        bool
 	muxLocalPort      string
-	muxListener       net.Listener
+	muxLocalListener  net.Listener
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -446,7 +446,7 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 			config.Logger.Printf("Error starting local mux listener on %s: %v\n", config.muxLocalPort, err)
 			return 1
 		}
-		config.muxListener = ln
+		config.muxLocalListener = ln
 		config.Logger.Printf("Mux local listener started on %s\n", ln.Addr().String())
 	}
 
@@ -2348,13 +2348,13 @@ func handleP2PConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *sec
 
 type NetcatMuxStreamHandler func(client, server net.Conn)
 
-func runMuxListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-chan struct{}, handler NetcatMuxStreamHandler) error {
-	defer ncconfig.muxListener.Close()
+func runMuxLocalListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-chan struct{}, handler NetcatMuxStreamHandler) error {
+	defer ncconfig.muxLocalListener.Close()
 
 	// 监听 doneChan (Session 死则 Listener 死)
 	go func() {
 		<-doneChan
-		ncconfig.muxListener.Close()
+		ncconfig.muxLocalListener.Close()
 	}()
 
 	handleConn := func(c net.Conn) {
@@ -2370,7 +2370,7 @@ func runMuxListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-c
 	}
 
 	for {
-		conn, err := ncconfig.muxListener.Accept()
+		conn, err := ncconfig.muxLocalListener.Accept()
 		if err != nil {
 			select {
 			case <-doneChan:
@@ -2388,9 +2388,13 @@ func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.C
 	isClient := false
 	if ncconfig.muxLocalPort != "" {
 		isClient = true
-		if ncconfig.muxListener == nil {
-			ncconfig.Logger.Printf("invalid muxListener")
-			return 1
+		if ncconfig.muxLocalListener == nil {
+			ln, err := prepareLocalListener(ncconfig.muxLocalPort, false)
+			if err != nil {
+				ncconfig.Logger.Printf("Error starting local mux listener on %s: %v\n", ncconfig.muxLocalPort, err)
+				return 1
+			}
+			ncconfig.muxLocalListener = ln
 		}
 	}
 
@@ -2401,17 +2405,18 @@ func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.C
 	}
 
 	ncconfig.ConsoleMode = false
+	listener := newMuxListener(session)
+	defer listener.Close()
 
 	if isClient {
 		ncconfig.Logger.Printf(
 			"Mux client ready, remote service mapped to %s",
-			ncconfig.muxListener.Addr(),
+			ncconfig.muxLocalListener.Addr(),
 		)
 
 		sessionDone := make(chan struct{})
 		go func() {
 			defer close(sessionDone)
-			listener := newMuxListener(session)
 			stream, err := listener.Accept()
 			if err != nil {
 				return
@@ -2431,14 +2436,13 @@ func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.C
 				cliRaddr,
 			)
 		}
-		err = runMuxListener(ncconfig, session, sessionDone, handler)
+		err = runMuxLocalListener(ncconfig, session, sessionDone, handler)
+		ncconfig.muxLocalListener = nil //runMuxLocalListener总是会Close它，这里重置nil
 		if err != nil {
 			return 1
 		}
 	} else {
 		ncconfig.Logger.Printf("Enter mux server mode\n")
-
-		listener := newMuxListener(session)
 		for {
 			stream, err := listener.Accept()
 			if err != nil {
