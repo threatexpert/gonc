@@ -204,9 +204,9 @@ gonc -e ":httpserver /var/www/html /tmp/test" -k -l 8080
 
 ---
 
-## 🧬 `:mux` - 多路复用的文件服务和代理服务
+## 🧬 `:mux` - 多路复用的代理服务和文件服务
 
-`:mux` 主要用于建立隧道，它可用在单个TCP/KCP会话上创建多个虚拟流，为本地接入的客户端提供并发访问的体验。目前基于mux集成了两个应用功能：HTTP文件服务和SOCKS5/HTTP代理服务。通过传统方式建立的连接或P2P建立的连接都可以使用mux来提供文件服务和代理服务。
+`:mux` 目前集成了两个应用功能：HTTP文件服务和SOCKS5/HTTP代理服务。是`gonc`为了在P2P场景提供用户更容易上手的文件传输和内网穿透功能，比起你用:s5s或:httpserver要更容易上手。
 
 **核心引擎**：
 可以通过 `-mux-engine` 参数切换底层引擎： `smux` (默认)。`yamux`另一个流行mux引擎。
@@ -217,9 +217,9 @@ gonc -e ":httpserver /var/www/html /tmp/test" -k -l 8080
 
 ```
 
-### 1. 隧道构建 (`link` / `linkagent`)
+### 1. 代理服务隧道构建 (`link` / `linkagent`)
 
-这是构建复杂端口映射和内网穿透的核心功能。
+这是构建复杂端口映射和内网穿透的核心功能。link还特意处理了SOCKS5的UDP代理，实现UDP走MUX隧道从对端出去。这解决了使用`:s5s`加`-mux`无法代理UDP的问题。
 
 * **`:mux linkagent`**: 启动双向代理 Agent，通常在**服务端**（等待连接的一方）使用。
 * **`:mux link "<L-Config>;<R-Config>"`**: 定义隧道规则，通常在**客户端**（发起连接的一方）使用。
@@ -416,10 +416,10 @@ gonc -p2p mysecret123 -k -mqtt-wait -e ":mux socks5"
 
 ### 服务端配置示例
 
-启动一个端口 `2222`，同时提供 Shell、SOCKS5 和 HTTP 服务，并使用 TLS+PSK 加密：
+启动一个端口 `2222`，开启mux模式，同时提供 Shell、SOCKS5 和 HTTP 服务，并使用 TLS+PSK 加密：
 
 ```bash
-gonc -l -local :2222 -tls -psk mysecret123 -keep-open \
+gonc -l 2222 -tls -psk mysecret123 -keep-open -mux \
     -e ":service" \
     -:sh "/bin/bash"  \
     -:s5s "-http" \
@@ -430,20 +430,21 @@ gonc -l -local :2222 -tls -psk mysecret123 -keep-open \
 ### 客户端调用示例
 
 === "调用 Shell"
+    shell模式，`-mux-l`用`-`表示不用本地再监听端口，直接用stdio接入
     ```bash
-    gonc -remote <server-ip>:2222 -tls -psk mysecret123 -call :sh -pty
+    gonc server-ip 2222 -tls -psk mysecret123 -call :sh -pty -mux-l -
     ```
 
 === "调用 SOCKS5"
-    在本地启动 1080 端口，通过 server 的 :s5s 模块代理上网。
+    在本地启动 1080 端口，通过 server 的 `:s5s` 模块代理上网。
     ```bash
-    gonc -e ":nc -tls -psk mysecret123 -call :s5s <server-ip> 2222" -k -l 127.0.0.1 1080 
+    gonc server-ip 2222 -tls -psk mysecret123 -call :s5s -mux-l 1080 
     ```
 
 === "调用 HTTP"
-    将服务端的 /tmp 映射到本地 8000 端口
+    将服务端的 /tmp 映射到本地 8080 端口
     ```bash
-    gonc -e ":nc -tls -psk mysecret123 -call :httpserver <server-ip> 2222" -k -l 127.0.0.1 8080 
+    gonc server-ip 2222 -tls -psk mysecret123 -call :httpserver -mux-l 8080 
     ```
 
 ### 为什么使用 `:service`？

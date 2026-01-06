@@ -54,6 +54,7 @@ nav:
   - 参数手册: 
       - 基础连接: guide/basic.md
       - P2P连接: guide/p2p.md
+      - 多路复用: guide/mux.md
       - 内置模块 (-e): guide/modules.md
       - 安全与加密: guide/security.md
       - 高级参数: guide/advanced.md

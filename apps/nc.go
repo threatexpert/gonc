@@ -227,8 +227,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.tlsVerifyCert, "verify", false, "verify TLS certificate (client mode only)")
 	fs.IntVar(&config.keepAlive, "keepalive", 0, "none 0 will enable keepalive feature")
 	fs.BoolVar(&config.verbose, "v", true, "verbose output")
-	fs.BoolVar(&config.muxEnabled, "mux", false, "Enable multiplexing protocol")
-	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Enable multiplexing protocol. Open a local listener")
+	fs.BoolVar(&config.muxEnabled, "mux", false, "Enable multiplexing protocol. Server mux mode")
+	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Client mux mode: local listen port or '-' for stdin/stdout")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
@@ -440,7 +440,7 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 		return runFeatureModules(console, config)
 	}
 
-	if isLocalMuxMode(config) && config.muxLocalListener == nil {
+	if isLocalMuxMode(config) && config.muxLocalListener == nil && config.muxLocalPort != "-" {
 		ln, err := prepareLocalListener(config.muxLocalPort, false)
 		if err != nil {
 			config.Logger.Printf("Error starting local mux listener on %s: %v\n", config.muxLocalPort, err)
@@ -2377,7 +2377,7 @@ func runMuxLocalListener(ncconfig *AppNetcatConfig, session interface{}, doneCha
 			ncconfig.Logger.Println("mux Open failed:", err)
 			return
 		}
-		streamWithCloseWrite := newStreamWrapper(stream, "", "")
+		streamWithCloseWrite := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
 		defer streamWithCloseWrite.Close()
 		handler(c, streamWithCloseWrite)
 	}
@@ -2398,10 +2398,11 @@ func runMuxLocalListener(ncconfig *AppNetcatConfig, session interface{}, doneCha
 }
 
 func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
+	defer conn.Close()
 	isClient := false
 	if isLocalMuxMode(ncconfig) {
 		isClient = true
-		if ncconfig.muxLocalListener == nil {
+		if ncconfig.muxLocalListener == nil && ncconfig.muxLocalPort != "-" {
 			ln, err := prepareLocalListener(ncconfig.muxLocalPort, false)
 			if err != nil {
 				ncconfig.Logger.Printf("Error starting local mux listener on %s: %v\n", ncconfig.muxLocalPort, err)
@@ -2422,37 +2423,47 @@ func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.C
 	defer listener.Close()
 
 	if isClient {
-		ncconfig.Logger.Printf(
-			"Mux client ready, remote service mapped to %s",
-			ncconfig.muxLocalListener.Addr(),
-		)
-
-		sessionDone := make(chan struct{})
-		go func() {
-			defer close(sessionDone)
-			stream, err := listener.Accept()
+		if ncconfig.muxLocalPort == "-" {
+			stream, err := openMuxStream(session)
 			if err != nil {
-				return
+				ncconfig.Logger.Println("mux Open failed:", err)
+				return 1
 			}
-			stream.Close()
-		}()
+			server := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
+			handleMuxChannelConnection(console, ncconfig, server, stats_in, stats_out)
+		} else {
+			ncconfig.Logger.Printf(
+				"Mux client ready, remote service mapped to %s",
+				ncconfig.muxLocalListener.Addr(),
+			)
 
-		handler := func(client, server net.Conn) {
-			cliRaddr := client.RemoteAddr().String()
-			ncconfig.Logger.Printf(
-				"Open mux stream from %s",
-				cliRaddr,
-			)
-			handleMuxChannelConnection(client, ncconfig, server, stats_in, stats_out)
-			ncconfig.Logger.Printf(
-				"Close mux stream from %s",
-				cliRaddr,
-			)
-		}
-		err = runMuxLocalListener(ncconfig, session, sessionDone, handler)
-		ncconfig.muxLocalListener = nil //runMuxLocalListener总是会Close它，这里重置nil
-		if err != nil {
-			return 1
+			sessionDone := make(chan struct{})
+			go func() {
+				defer close(sessionDone)
+				stream, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				stream.Close()
+			}()
+
+			handler := func(client, server net.Conn) {
+				cliRaddr := client.RemoteAddr().String()
+				ncconfig.Logger.Printf(
+					"Open mux stream from %s",
+					cliRaddr,
+				)
+				handleMuxChannelConnection(client, ncconfig, server, stats_in, stats_out)
+				ncconfig.Logger.Printf(
+					"Close mux stream from %s",
+					cliRaddr,
+				)
+			}
+			err = runMuxLocalListener(ncconfig, session, sessionDone, handler)
+			ncconfig.muxLocalListener = nil //runMuxLocalListener总是会Close它，这里重置nil
+			if err != nil {
+				return 1
+			}
 		}
 	} else {
 		ncconfig.Logger.Printf("Enter mux server mode\n")

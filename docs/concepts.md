@@ -81,8 +81,8 @@ gonc 对监听模式进行了增强：在 -l 的基础上，通过 -k（--keep-o
 | **`:sh`** | 交互式 Shell | 远程桌面 (命令行版) |
 | **`:s5s`** | 标准SOCKS5+HTTP 代理服务器 | VPN 网关 |
 | **`:httpserver`** | HTTP 文件服务 | Python 的 `SimpleHTTPServer` |
-| **`:nc`** | gonc本身，内部函数，不用创建进程 | netcat |
-| **`:mux`** | 多路复用 | SSH隧道 |
+| **`:nc`** | gonc本身，直接调用函数，不用创建进程 | netcat |
+| **`:mux`** | 多路复用的SOCKS5代理和HTTP文件服务器 | SSH隧道 |
 | **`:tp`** | 透明代理 | 有点创新，找不到类比 |
 
 这些模块就是懒人福利。文件快传，端口转发，反向Shell，一切都打包在 `gonc` 这一个二进制文件里送给你。
