@@ -201,7 +201,7 @@ gonc -p2p mysecret123 -link 1080
     ```
     10.0.0.5-3389.gonc.cc (注意中间是横杠)，该域名会被解析为类似127.b.c.d的IP，因此`mstsc`会连入本地的socks5代理端口1080，然后`gonc`根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
 
-    这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私包含，gonc的透明代理默认只接受内网私有IP段，不接受域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
+    这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私保护，gonc的透明代理默认只接受内网私有IP段，不接受域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
 
 === "无需DNS"
 

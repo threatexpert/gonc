@@ -440,7 +440,7 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 		return runFeatureModules(console, config)
 	}
 
-	if config.muxLocalPort != "" {
+	if isLocalMuxMode(config) && config.muxLocalListener == nil {
 		ln, err := prepareLocalListener(config.muxLocalPort, false)
 		if err != nil {
 			config.Logger.Printf("Error starting local mux listener on %s: %v\n", config.muxLocalPort, err)
@@ -482,6 +482,14 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	}
 }
 
+func isEnabledMuxMode(ncconfig *AppNetcatConfig) bool {
+	return ncconfig.muxEnabled || ncconfig.muxLocalPort != ""
+}
+
+func isLocalMuxMode(ncconfig *AppNetcatConfig) bool {
+	return isEnabledMuxMode(ncconfig) && ncconfig.muxLocalPort != ""
+}
+
 func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 	if ncconfig.runAppFileServ != "" ||
 		ncconfig.runAppFileGet != "" ||
@@ -497,8 +505,8 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 
 // configureAppMode 为内置应用程序设置命令参数
 func configureAppMode(ncconfig *AppNetcatConfig) {
-	isServiceMode := strings.HasPrefix(ncconfig.runCmd, ":service")
-	isAppMode := true
+	userSpecifiedRunCmd := ncconfig.runCmd != ""
+	appMode := false
 	if ncconfig.runAppFileServ != "" {
 		//使用了-httpserver 的情况，获取多余的参数都当作根目录添加进去。
 		rootPaths := []string{ncconfig.runAppFileServ}
@@ -519,6 +527,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileGet, "\\", "/")
 		downloadSubPath := strings.ReplaceAll(ncconfig.downloadSubPath, "\\", "/")
@@ -531,20 +540,24 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		}
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.appMuxSocksMode {
 		ncconfig.runCmd = ":mux socks5"
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.appMuxLinkAgent {
 		ncconfig.runCmd = ":mux linkagent"
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.runAppLink != "" {
 		ncconfig.runCmd = ":mux link " + ncconfig.runAppLink
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "" {
 		if ncconfig.appMuxListenOn == "" {
 			ncconfig.appMuxListenOn = "0"
@@ -552,12 +565,12 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
-	} else {
-		isAppMode = false
+		appMode = true
 	}
 
-	if isAppMode && isServiceMode {
-		ncconfig.Logger.Printf("Error: App modes (-httpserver, -linkagent, etc.) cannot be used with -e \":service\"\n")
+	if appMode && userSpecifiedRunCmd {
+		// appMode（-linkagent等） 需要替换runCmd， 如果本来用户配置了-e，则有冲突
+		ncconfig.Logger.Printf("Error: App modes (-httpserver, -linkagent, etc.) cannot be used with -e \n")
 		os.Exit(1)
 	}
 
@@ -760,7 +773,7 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				} else {
 					ncconfig.MQTTHelloPayload.SetControlValue("cs", "tls")
 				}
-				if ncconfig.muxLocalPort != "" {
+				if isLocalMuxMode(ncconfig) {
 					ncconfig.MQTTHelloPayload.SetControlValue("mux", "1")
 				}
 			}
@@ -1737,7 +1750,7 @@ func conflictCheck(ncconfig *AppNetcatConfig) int {
 		ncconfig.Logger.Printf("-ss and (-plain -tls) cannot be used together\n")
 		return 1
 	}
-	if (ncconfig.muxEnabled || ncconfig.muxLocalPort != "") && ncconfig.app_mux_args != "-" {
+	if isEnabledMuxMode(ncconfig) && ncconfig.app_mux_args != "-" {
 		ncconfig.Logger.Printf("mux mode and -e \":mux\" cannot be used together\n")
 		return 1
 	}
@@ -1758,7 +1771,7 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 	builtinApp := args[0]
 	switch builtinApp {
 	case ":mux":
-		if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" {
+		if isEnabledMuxMode(ncconfig) {
 			return fmt.Errorf("mux mode and -e \":mux\" cannot be used together")
 		}
 		ncconfig.app_mux_Config, err = AppMuxConfigByArgs(ncconfig.LogWriter, args[1:])
@@ -2326,7 +2339,7 @@ func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.N
 		return 1
 	}
 
-	if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" {
+	if isEnabledMuxMode(ncconfig) {
 		return handleMuxConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 
@@ -2339,7 +2352,7 @@ func handleP2PConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *sec
 
 	muxVal, _ := ctrlPayload.GetControlValue("mux")
 
-	if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" || muxVal == "1" {
+	if isEnabledMuxMode(ncconfig) || muxVal == "1" {
 		return handleMuxConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 
@@ -2386,7 +2399,7 @@ func runMuxLocalListener(ncconfig *AppNetcatConfig, session interface{}, doneCha
 
 func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
 	isClient := false
-	if ncconfig.muxLocalPort != "" {
+	if isLocalMuxMode(ncconfig) {
 		isClient = true
 		if ncconfig.muxLocalListener == nil {
 			ln, err := prepareLocalListener(ncconfig.muxLocalPort, false)
