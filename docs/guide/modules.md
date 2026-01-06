@@ -79,7 +79,10 @@ gonc -k -e ":s5s -auth user:simplekey123" -l 1080
 
 **高级组合 (Socks5 over TLS)**：
 利用 `gonc` 的加密通道保护 SOCKS5 流量。
-
+<div class="interactive-box">
+  <label>🛠️设置示例服务器 IP:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
 === "SOCKS5服务器（加密）"
 
 ```bash
@@ -94,7 +97,7 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
     ```bash
     # 客户端调用:nc建立加密TCP连接。不支持代理UDP
-    gonc -e ":nc -tls -psk simplekey123 <serverIP> 8443" -k -l 127.0.0.1 1080
+    gonc -e ":nc -tls -psk simplekey123 server-ip 8443" -k -l 127.0.0.1 1080
 
     ```
 
@@ -102,7 +105,7 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
     ```bash
     # 实现类似frp反向代理，请求代理服务器保持开启23306端口，并转发到本机127.0.0.1 3306
-    gonc -x "-tls -psk simplekey123 <serverIP>:8443" -e ":nc 127.0.0.1 3306" -k -l 23306
+    gonc -x "-tls -psk simplekey123 server-ip:8443" -e ":nc 127.0.0.1 3306" -k -l 23306
 
     ```
 
@@ -147,6 +150,12 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 - :tp 自动通过配置好的上游代理（如 127.0.0.1:1080）发起代理连接
 
 - 客户端与远端服务之间的通信在整个过程中无需任何代理配置
+
+!!! warning "隐私问题"
+
+    这个特性依赖ns.gonc.cc公网DNS解析。请谨慎使用，例如访问`tonypc.corp.lan-3389.gonc.cc`这种包含单位信息的域名。
+    
+    需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为客户端的 DNS 查询一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
 
 ---
 
@@ -428,6 +437,11 @@ gonc -l 2222 -tls -psk mysecret123 -keep-open -mux \
 ```
 
 ### 客户端调用示例
+
+<div class="interactive-box">
+  <label>🛠️设置示例服务器 IP:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
 
 === "调用 Shell"
     shell模式，`-mux-l`用`-`表示不用本地再监听端口，直接用stdio接入

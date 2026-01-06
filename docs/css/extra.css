@@ -1,0 +1,33 @@
+/* 交互式输入框容器 */
+.interactive-box {
+    background-color: #f5f5f5; /* 浅灰背景 */
+    border-left: 4px solid #7e57c2; /* 紫色边框 */
+    padding: 12px 16px;
+    margin: 1em 0;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+}
+
+/* 输入框样式 */
+.interactive-box input {
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-family: monospace; /* 等宽字体，像代码一样 */
+    color: #d32f2f;         /* 输入文字显红，醒目 */
+    outline: none;
+    transition: border 0.3s;
+}
+
+.interactive-box input:focus {
+    border-color: #7e57c2;
+}
+
+/* 动态变量在代码块中的样式 (可选) */
+.dynamic-var-ip {
+    border-bottom: 1px dashed #999; /* 虚线底边，提示这是可变的 */
+    cursor: help;
+}

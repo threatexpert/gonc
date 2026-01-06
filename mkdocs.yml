@@ -24,6 +24,7 @@ theme:
         name: 切换至浅色模式
   features:
     - navigation.tabs        # 启用顶部导航栏 (看起来像专业官网)
+    - navigation.tabs.sticky
     - navigation.sections    # 侧边栏折叠效果
     - navigation.top         # 返回顶部按钮
     - search.suggest         # 搜索输入建议
@@ -43,8 +44,12 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
+extra_css:
+  - css/extra.css
+
 extra_javascript:
   - js/random-psk.js
+  - js/dynamic-ip.js
 
 nav:
   - 首页: index.md

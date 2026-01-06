@@ -87,6 +87,11 @@
 
 ### 方式2：传统反弹 Shell
 
+<div class="interactive-box">
+  <label>🛠️设置示例服务器 IP:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
+
 === "控制端"
 
     等待连接并获取交互式 Shell（-pty可支持 Tab 补全和 Ctrl+C）。
@@ -103,10 +108,10 @@
 
     ```bash
     # Linux/Mac
-    gonc -e ":sh /bin/bash" -tls -psk mysecret123 <target_ip> 2222
+    gonc -e ":sh /bin/bash" -tls -psk mysecret123 server-ip 2222
 
     # Windows，不支持:sh，只能直接绑定cmd
-    gonc -e "cmd.exe" -tls -psk mysecret123 <target_ip> 2222
+    gonc -e "cmd.exe" -tls -psk mysecret123 server-ip 2222
     ```
 
 
@@ -123,7 +128,7 @@
 
     ```bash
     # 连接目标
-    gonc -tls -psk mysecret123 -pty <target_ip> 1234
+    gonc -tls -psk mysecret123 -pty server-ip 1234
     ```
 
 ---
@@ -143,7 +148,10 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 ```
 
 如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发（只支持TCP），不支持SOCKS5代理UDP。
-
+<div class="interactive-box">
+  <label>🛠️设置示例服务器 IP:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
 
 === "服务端 (监听)"
 
@@ -156,7 +164,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
     ```bash
     # 类似SSH，应用客户端通过1080接入代理服务器
-    gonc -e ":nc -tls -psk mysecret123 <serverIP> 3080" -k -l 1080
+    gonc -e ":nc -tls -psk mysecret123 server-ip 3080" -k -l 1080
     ```
 
 === "客户端（BIND加密反向代理）"
@@ -164,7 +172,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
     ```bash
     # 在代理服务器保持开启23306端口，并转发到本机127.0.0.1 3306
     # -k参数可以保持把本机3306暴露在公网23306，类似frp反向代理
-    gonc -x "-tls -psk mysecret123 <serverIP>:3080" -e ":nc 127.0.0.1 3306" -k -l 23306
+    gonc -x "-tls -psk mysecret123 server-ip:3080" -e ":nc 127.0.0.1 3306" -k -l 23306
     ```
 
 ### 场景 2：P2P 隧道 (内网穿透访问)
@@ -201,7 +209,13 @@ gonc -p2p mysecret123 -link 1080
     ```
     10.0.0.5-3389.gonc.cc (注意中间是横杠)，该域名会被解析为类似127.b.c.d的IP，因此`mstsc`会连入本地的socks5代理端口1080，然后`gonc`根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
 
+!!! warning "隐私问题"
+
     这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私保护，gonc的透明代理默认只接受内网私有IP段，不接受域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
+
+    需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为客户端的 DNS 查询一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
+
+    因此，在默认配置下（不使用域名方式），该机制通常不会引入额外的隐私或安全风险。
 
 === "无需DNS"
 
@@ -307,6 +321,11 @@ gonc -nat-checker
 
 ## 🧠 高级技巧：多服务复用 (Mux Service)
 
+<div class="interactive-box">
+  <label>🛠️设置示例服务器 IP:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
+
 === "传统连接方式"
 
     就像 SSH 的 22 端口一样，你可以在一个 `gonc` 端口上同时运行 Shell、SOCKS5 和 HTTP 服务，并通过 TLS + PSK 保护。
@@ -315,10 +334,10 @@ gonc -nat-checker
 
     ```bash
     # 启动一个超级服务端口 2222，实现远程shell、文件共享、流量转发
-    gonc -l -local :2222 -tls -psk mysecret1234 -keep-open \
+    gonc -l -local :2222 -tls -psk mysecret123 -keep-open \
         -e ":service" \
         -:sh "/bin/bash" \
-        -:httpserver "/tmp/file1 /tmp/dir2" \
+        -:httpserver "/tmp /var/log" \
         -:mux "linkagent"
 
     ```
@@ -329,23 +348,59 @@ gonc -nat-checker
 
     * **连 Shell**:
     ```bash
-    gonc -remote <server-ip>:2222 -tls -psk mysecret1234 -call :sh -pty
+    gonc -remote server-ip:2222 -tls -psk mysecret123 -call :sh -pty
 
     ```
 
 
     * **连 HTTP** (映射到本地 8800):
     ```bash
-    gonc -e ":nc -tls -psk mysecret1234 -call :httpserver <server-ip> 2222" -k -l -local :8800
+    gonc -e ":nc -tls -psk mysecret123 -call :httpserver server-ip 2222" -k -l -local :8800
 
     ```
 
 
     * **SOCKS5+HTTP代理** (本地监听1080):
     ```bash
-    gonc -remote <server-ip>:2222 -tls -psk mysecret1234 -call :mux -link 1080
+    gonc -remote server-ip:2222 -tls -psk mysecret123 -call :mux -link 1080
 
     ```
+
+
+=== "mux连接方式"
+
+    就像 SSH 的 22 端口一样，你可以在一个 `gonc` 端口上同时运行 Shell、SOCKS5 和 HTTP 服务，并通过 TLS + PSK 保护。
+
+    **服务端配置：**
+
+    ```bash
+    # 启动一个超级服务端口 2222，实现远程shell、文件共享、流量转发，-:mux不能和-mux一起
+    gonc -l -local :2222 -tls -psk mysecret123 -keep-open -mux \
+        -e ":service" \
+        -:sh "/bin/bash"  \
+        -:httpserver "/tmp /var/log" \
+        -:s5s "-http"
+    ```
+
+    **客户端调用：**
+
+    客户端连接同一个端口 `2222`，但通过 `-call` 参数调用不同服务：
+
+
+    * **连 Shell**: `-mux-l`用`-`表示不用本地再监听端口，直接用stdio接入
+        ```bash
+        gonc server-ip 2222 -tls -psk mysecret123 -call :sh -pty -mux-l -
+        ```
+
+    * **连 HTTP**: 将服务端的 /tmp 映射到本地 8800 端口
+        ```bash
+        gonc server-ip 2222 -tls -psk mysecret123 -call :httpserver -mux-l 8800 
+        ```
+
+    * **SOCKS5+HTTP代理**: 在本地启动 1080 端口，通过 server 的 `:s5s` 模块代理上网。
+        ```bash
+        gonc server-ip 2222 -tls -psk mysecret123 -call :s5s -mux-l 1080 
+        ```
 
 === "P2P连接方式"
 
@@ -357,6 +412,7 @@ gonc -nat-checker
     gonc -p2p mysecret123 -k -mqtt-wait \
         -e ":service" \
         -:sh "/bin/bash" \
+        -:httpserver "/tmp /var/log" \
         -:mux "linkagent"
     ```
 
@@ -368,6 +424,11 @@ gonc -nat-checker
     ```bash
     # 可以加上-u 或 -ss 或两者来实现P2P成功后与服务端的传输协议。
     gonc -p2p mysecret123 -mqtt-hello -call :sh -pty
+    ```
+
+    * **连 HTTP**: 将服务端的 /tmp 映射到本地 8800 端口
+    ```bash
+    gonc -p2p mysecret123 -mqtt-hello -call :httpserver -mux-l 8800 
     ```
 
     * **SOCKS5+HTTP代理** (本地监听1080):

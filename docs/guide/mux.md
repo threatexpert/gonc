@@ -1,8 +1,6 @@
 # 多路复用 (Multiplexing)
 
-`gonc` 引入了基于 Smux/Yamux 的多路复用协议，允许在一个物理 TCP/KCP 连接中承载无数个虚拟的逻辑流。
-
-这对于高并发场景（如网页浏览、数据库连接池）至关重要，它能显著降低握手延迟并提高传输效率。
+`gonc` 引入了基于 `smux`/`yamux` 的多路复用协议，允许在一个物理 TCP/KCP 连接中承载无数个虚拟的逻辑流。
 
 ---
 
@@ -41,6 +39,11 @@
 
 我们将搭建一个加密的 HTTP 文件服务器，并通过 Mux 隧道在本地访问。
 
+<div class="interactive-box">
+  <label>🛠️设置示例服务器 IP:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
+
 ### 1. 服务端 (Server)
 
 在服务器端开启监听，启用 TLS 加密和 Mux 协议封装。
@@ -77,7 +80,7 @@ gonc server-ip 2222 -tls -psk mysecret123 -mux-l 8080
 | 参数 | 说明 |
 | --- | --- |
 | **`-mux`** | **启用多路复用 (被动端/服务端)**。告诉 `gonc` 在建立一个会话（TCP或KCP）后，进入 Mux 模式，等待虚拟的逻辑流的建立，再将每个虚拟的逻辑流交给上层服务（如 `-e` 指定的模块）处理。 |
-| **`-mux-l <port>`** | **本地 Mux 监听器 (主动端/客户端)**。建立连接后，在本地开启一个 TCP 监听端口。当有应用连接该端口时，`gonc` 会在现有的 Mux 隧道中打开一个新的虚拟的逻辑流。 |
+| **`-mux-l <port>`** | **本地 Mux 监听器 (主动端/客户端)**。建立连接后，在本地开启一个 TCP 监听端口。当有应用连接该端口时，`gonc` 会在现有的 Mux 隧道中打开一个新的虚拟的逻辑流。参数值为`-`时，可以不监听端口，直接将控制台的stdio作为逻辑流。 |
 | **`-mux-engine <string>`** | **选择底层引擎**。默认为 `smux`。可选值：• `yamux`: 另一个开源的mux引擎。 |
 
 !!! tip "引擎兼容性"
@@ -107,6 +110,6 @@ gonc -e ":nc 127.0.0.1 6379" -mux -tls -psk mysecret123 -l 443
 连接 A，并在本地开启 16379 提供服务。
 ```bash
 # 任何连接 B:16379 的请求，都会通过隧道瞬间到达 A 的 Redis
-gonc <IP_of_A> 443 -tls -psk mysecret123 -mux-l 0.0.0.0:16379
+gonc server-ip 443 -tls -psk mysecret123 -mux-l 0.0.0.0:16379
 
 ```

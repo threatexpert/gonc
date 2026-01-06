@@ -23,7 +23,7 @@
 === "客户端"
     ```bash
     # 本地监听TCP 1080提供标准的SOCKS5代理协议，用:nc转换为KCP协议
-    gonc -e ":nc -kcp -psk simplekey123 <serverIP> 6680" -k -l 127.0.0.1 1080
+    gonc -e ":nc -kcp -psk simplekey123 server-ip 6680" -k -l 127.0.0.1 1080
 
     ```
 
