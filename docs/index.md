@@ -36,6 +36,8 @@
 
 ## 🚀 快速安装
 
+访问 [https://www.gonc.cc/](https://www.gonc.cc/) 或者 [GitHub Releases](https://github.com/threatexpert/gonc/releases) 选择相应系统/CPU架构。
+
 === "Go Install (推荐)"
 
     如果你已安装 Go 环境 (1.24.3+)：
