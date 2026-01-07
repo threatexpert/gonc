@@ -1915,14 +1915,13 @@ func (b *Socks5BindConn) RemoteAddr() net.Addr {
 	return b.fakeRemoteAddr
 }
 
-func (c *Socks5BindConn) Accept() (net.Conn, error) {
+func (c *Socks5BindConn) Accept() error {
 	remoteAcceptAddr, err := readSocks5Response(c)
 	if err != nil {
-		c.Close()
-		return nil, fmt.Errorf("read SOCKS5 Accept response error: %w", err)
+		return fmt.Errorf("read SOCKS5 Accept response error: %w", err)
 	}
 	c.fakeRemoteAddr = remoteAcceptAddr
-	return c, nil
+	return nil
 }
 
 type socks5listener struct {
@@ -1932,11 +1931,27 @@ type socks5listener struct {
 
 // Accept waits for and returns the next connection to the listener.
 func (l *socks5listener) Accept() (net.Conn, error) {
-	return l.boundConn.Accept()
+	if l.boundConn == nil {
+		return nil, fmt.Errorf("no bounded connection available")
+	}
+	err := l.boundConn.Accept()
+	if err != nil {
+		l.Close()
+		return nil, err
+	}
+
+	conn := l.boundConn
+	l.boundConn = nil
+
+	return conn, nil
 }
 
 // Close closes the listener.
 func (l *socks5listener) Close() error {
+	if l.boundConn != nil {
+		l.boundConn.Close()
+		l.boundConn = nil
+	}
 	return nil
 }
 

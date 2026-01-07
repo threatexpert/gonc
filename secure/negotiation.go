@@ -37,6 +37,7 @@ type NegotiationConfig struct {
 	UdpKeepAlivePayload       string
 	KCPIdleTimeoutSecond      int
 	UDPIdleTimeoutSecond      int
+	ReadIdleTimeoutSecond     int
 }
 
 const DefaultKCPIdleTimeoutSecond = 41
@@ -160,6 +161,9 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 	}
 
 	timeout_sec := 20
+	if cfg.ReadIdleTimeoutSecond > 0 {
+		timeout_sec = cfg.ReadIdleTimeoutSecond
+	}
 	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), time.Duration(timeout_sec)*time.Second)
 	defer cancelTimeout()
 	var keyingMaterial [32]byte

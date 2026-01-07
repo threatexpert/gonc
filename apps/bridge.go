@@ -536,7 +536,7 @@ func bidirectionalCopy2(ncconfig *AppNetcatConfig, local net.Conn, stream net.Co
 	go func() {
 		defer wg.Done()
 		IsUDP := strings.HasPrefix(local.LocalAddr().Network(), "udp")
-		err := copyWithProgress(ncconfig, stream, local, blocksize, !IsUDP, nil, 0)
+		err := copyWithProgress(ncconfig, stream, local, blocksize, !IsUDP, nil, 0, 0)
 		ncconfig.Logger.Printf("Bridge direction local -> stream closed: %v", err)
 		stream.Close()
 	}()
@@ -544,7 +544,7 @@ func bidirectionalCopy2(ncconfig *AppNetcatConfig, local net.Conn, stream net.Co
 	go func() {
 		defer wg.Done()
 		IsUDP := strings.HasPrefix(stream.LocalAddr().Network(), "udp")
-		err := copyWithProgress(ncconfig, local, stream, bufsize, !IsUDP, nil, 0)
+		err := copyWithProgress(ncconfig, local, stream, bufsize, !IsUDP, nil, 0, 0)
 		ncconfig.Logger.Printf("Bridge direction stream -> local closed: %v", err)
 		local.SetReadDeadline(time.Now())
 	}()
