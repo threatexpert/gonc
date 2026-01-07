@@ -56,7 +56,7 @@
 
     ```bash
     pkg install wget
-    wget https://www.gonc.cc/gonc_linux_amd64 -O gonc
+    wget https://www.gonc.cc/gonc_android_arm64 -O gonc
     chmod +x gonc
     mv gonc $PREFIX/bin/
     ```
