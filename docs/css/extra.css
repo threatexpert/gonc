@@ -1,33 +1,57 @@
-/* 交互式输入框容器 */
+/* 1. 定义基础颜色变量 (默认浅色模式) */
+:root {
+    --box-border-accent: #7e57c2;/* 紫色边框 */
+    --input-border: #ccc;        /* 输入框边框 */
+    --input-text: #d32f2f;       /* 输入文字红 */
+    --box-shadow: rgba(0,0,0,0.05);
+}
+
+/* 2. 定义暗色模式下的颜色覆盖 */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --box-bg: #2d2d2d;           /* 深灰背景，避免纯黑 */
+        --box-border-accent: #9575cd;/* 稍微提亮紫色，增加对比度 */
+        --input-border: #555555;     /* 深色边框 */
+        --input-bg: #1e1e1e;         /* 更深的输入框背景 */
+        /* 暗色背景上，深红看不清，改为淡红色/粉红 */
+        --input-text: #ff8a80;       
+        --box-shadow: rgba(0,0,0,0.3);
+    }
+}
+
+/* 3. 应用变量到具体样式 */
 .interactive-box {
-    background-color: #f5f5f5; /* 浅灰背景 */
-    border-left: 4px solid #7e57c2; /* 紫色边框 */
+    background-color: var(--box-bg); /* 使用变量 */
+    border-left: 4px solid var(--box-border-accent);
     padding: 12px 16px;
     margin: 1em 0;
     border-radius: 4px;
     display: flex;
     align-items: center;
     gap: 10px;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    box-shadow: 0 2px 5px var(--box-shadow);
+    
+    /* 增加文字颜色定义，防止暗黑模式下默认黑字看不见 */
+    color: inherit; 
 }
 
-/* 输入框样式 */
 .interactive-box input {
-    border: 1px solid #ccc;
+    background-color: var(--input-bg); /* 增加背景色适配 */
+    border: 1px solid var(--input-border);
     border-radius: 4px;
     padding: 6px 10px;
-    font-family: monospace; /* 等宽字体，像代码一样 */
-    color: #d32f2f;         /* 输入文字显红，醒目 */
+    font-family: monospace;
+    color: var(--input-text); /* 使用变量 */
     outline: none;
-    transition: border 0.3s;
+    transition: border 0.3s, background-color 0.3s;
 }
 
 .interactive-box input:focus {
-    border-color: #7e57c2;
+    border-color: var(--box-border-accent);
 }
 
-/* 动态变量在代码块中的样式 (可选) */
+/* 虚线样式保持不变，或者也可以加个变量 */
 .dynamic-var-ip {
-    border-bottom: 1px dashed #999; /* 虚线底边，提示这是可变的 */
+    border-bottom: 1px dashed #999;
     cursor: help;
 }
