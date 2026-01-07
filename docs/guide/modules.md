@@ -8,7 +8,10 @@
     ```bash
     gonc -e ":<command> [args]" ...
     ```
-    注意：内置命令始终以冒号 `:` 开头。要查看特定模块的帮助，可运行 `gonc -e ":<cmd> -h"`，例如 `gonc -e ":s5s -h"`。
+    注意：
+    
+    * **查看子模块参数**：内置命令始终以冒号 `:` 开头。要查看特定模块的帮助，可运行 `gonc -e ":<cmd> -h"`，例如 `gonc -e ":s5s -h"`。
+    * **字符\\**：args中`\`需要`\\`转义表示。例如 gonc -e ":httpserver d:\\\\dir"，建议windows下路径也用/字符。
 
 ---
 
@@ -80,7 +83,7 @@ gonc -k -e ":s5s -auth user:simplekey123" -l 1080
 **高级组合 (Socks5 over TLS)**：
 利用 `gonc` 的加密通道保护 SOCKS5 流量。
 <div class="interactive-box">
-  <label>🛠️设置示例服务器 IP:</label>
+  <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
 </div>
 === "SOCKS5服务器（加密）"
@@ -137,25 +140,30 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
 以 远程桌面客户端（RDP） 为例，用户在客户端中填入地址：
 
-`10.0.0.5-3389.gonc.cc:3080`
+`10.0.0.1-3389.gonc.cc:3080`
 
 连接过程如下：
 
-- 客户端解析 10.0.0.5-3389.gonc.cc，得到形如 127.a.b.c 的回环地址
+- 客户端解析 10.0.0.1-3389.gonc.cc，得到形如 127.b.c.d 的回环地址
 
 - 客户端认为自己在直连目标服务，并实际连接到本机的 3080 端口
 
-- :tp 用127.a.b.c反查域名，解析出真实目标 10.0.0.5:3389
+- :tp 用127.b.c.d反查域名，解析出真实目标 10.0.0.1:3389
 
 - :tp 自动通过配置好的上游代理（如 127.0.0.1:1080）发起代理连接
 
 - 客户端与远端服务之间的通信在整个过程中无需任何代理配置
 
-!!! warning "隐私问题"
+!!! warning "隐私和安全问题"
 
-    这个特性依赖ns.gonc.cc公网DNS解析。请谨慎使用，例如访问`tonypc.corp.lan-3389.gonc.cc`这种包含单位信息的域名。
-    
-    需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为客户端的 DNS 查询一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
+    这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私和安全保护，gonc的透明代理默认只接受内网私有IP段，不接受公网IP或域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数":tp -x 127.0.0.1:1080 **-allow domain**"
+
+    需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为（DNS递归查询机制）客户端的请求一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
+
+    关于安全问题，例如在处理`mstsc`连接时，如果 DNS 被恶意篡改，理论上可能得到`1.2.3.4-3389`这样的地址，而不是预期的`10.0.0.1-3389`。
+    由于`gonc`默认只允许内网 IP 段，这类异常连接会被拒绝，保证透明代理不会将客户端流量发送到你对端内网之外的目的地。
+
+    因此，在默认配置下，该机制通常不会带来额外的隐私或安全风险。
 
 ---
 
@@ -439,7 +447,7 @@ gonc -l 2222 -tls -psk mysecret123 -keep-open -mux \
 ### 客户端调用示例
 
 <div class="interactive-box">
-  <label>🛠️设置示例服务器 IP:</label>
+  <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
 </div>
 

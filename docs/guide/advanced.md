@@ -85,7 +85,7 @@ gonc -U /tmp/gonc.sock
 | 参数 | 说明 |
 | --- | --- |
 | **`-dns <ip:port>`** | **自定义 DNS 服务器**。强制 `gonc` 使用指定的 DNS 服务器解析域名，而非系统默认。例如 `-dns 8.8.8.8:53`。 |
-| **`-magicdns`** | **MagicDNS 域名** (默认 `gonc.cc`)。用于透明代理模式。`gonc` 会从该域名反向解析请求，提取127.a.b.c相关的域名信息。 |
+| **`-magicdns`** | **MagicDNS 域名** (默认 `gonc.cc`)。用于透明代理模式。`gonc` 会从该域名反向解析请求，提取127.b.c.d相关的域名信息。 |
 | **`-nat-checker`** | **NAT 检测工具**。检测当前网络的 NAT 类型（Full Cone, Symmetric 等）和公网 IP。 |
 
 ---

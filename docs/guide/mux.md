@@ -40,7 +40,7 @@
 我们将搭建一个加密的 HTTP 文件服务器，并通过 Mux 隧道在本地访问。
 
 <div class="interactive-box">
-  <label>🛠️设置示例服务器 IP:</label>
+  <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
 </div>
 

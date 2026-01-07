@@ -1,23 +1,31 @@
 // docs/js/random-psk.js
 
 function randomString(len = 22) {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    const charsLen = chars.length;
-
-    const max = Math.floor(256 / charsLen) * charsLen;
-    let result = '';
-
-    while (result.length < len) {
-        const buf = new Uint8Array(len);
-        crypto.getRandomValues(buf);
-
-        for (let i = 0; i < buf.length && result.length < len; i++) {
-            if (buf[i] < max) {
-                result += chars[buf[i] % charsLen];
-            }
-        }
+    if (len < 2) {
+        throw new Error("length must be at least 2 to include letters and digits");
     }
-    return result;
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    
+    // 1. 一次性获取足够的随机数 (使用 Uint32 极大降低模数偏差，无需复杂过滤逻辑)
+    const values = new Uint32Array(len);
+    crypto.getRandomValues(values);
+    
+    // 2. 映射为字符数组
+    const result = Array.from(values, v => chars[v % 62]);
+
+    // 3. 兜底修正：利用现有的随机数，确保必须有数字和字母
+    // 如果没有数字，用第1个随机数算出位置，强制替换为数字
+    if (!result.some(c => c >= '0' && c <= '9')) {
+        result[values[0] % len] = String(values[0] % 10);
+    }
+    
+    // 如果没有字母 (即全是数字)，用第2个随机数算出位置，强制替换为字母
+    if (result.every(c => c >= '0' && c <= '9')) {
+        const letters = 'abcdefghijklmnopqrstuvwxyz'; // 简单起见只补小写，反正目的是过校验
+        result[values[1] % len] = letters[values[1] % 26];
+    }
+
+    return result.join('');
 }
 
 document$.subscribe(function() {

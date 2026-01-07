@@ -20,10 +20,8 @@
     ```bash
     gonc -p2p mysecret123 -httpserver /path1/to/share /path2/to/share
     ```
-    上面这个命令是为了使用起来相对方便，它实际会转为下面这样，因为gonc所有的服务都是基于-e提供的
-    ```bash
-    gonc -p2p mysecret123 -e ":mux httpserver /path1/to/share /path2/to/share" -k -mqtt-wait
-    ```
+    上面这个命令是为了使用起来相对方便，`-httpserver`实际会转为这样调用-e的模块`-e ":mux httpserver /path1/to/share /path2/to/share"`
+
 
 === "接收端 (Client)"
 
@@ -88,7 +86,7 @@
 ### 方式2：传统反弹 Shell
 
 <div class="interactive-box">
-  <label>🛠️设置示例服务器 IP:</label>
+  <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
 </div>
 
@@ -149,7 +147,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
 如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发（只支持TCP），不支持SOCKS5代理UDP。
 <div class="interactive-box">
-  <label>🛠️设置示例服务器 IP:</label>
+  <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
 </div>
 
@@ -179,7 +177,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
 **需求**：你在家里，想访问公司内网的 Web 服务 (例如 10.0.0.5:80)，或者通过公司的网络上网。
 
-=== "公司电脑 (出口)"
+=== "公司电脑"
 
 开启 Link Agent 模式，会一直等待连接，支持接入多个客户端。
 
@@ -187,7 +185,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 gonc -p2p mysecret123 -linkagent
 ```
 
-=== "家里电脑 (入口)"
+=== "家里电脑"
 
 建立连接，并在本地开启 SOCKS5+HTTP 代理端口1080。使用SOCKS5协议时，支持UDP，UDP将封装进入p2p的隧道中。
 
@@ -209,13 +207,16 @@ gonc -p2p mysecret123 -link 1080
     ```
     10.0.0.5-3389.gonc.cc (注意中间是横杠)，该域名会被解析为类似127.b.c.d的IP，因此`mstsc`会连入本地的socks5代理端口1080，然后`gonc`根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
 
-!!! warning "隐私问题"
+    !!! warning "隐私和安全问题"
 
-    这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私保护，gonc的透明代理默认只接受内网私有IP段，不接受域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
+        这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私和安全保护，gonc的透明代理默认只接受内网私有IP段，不接受公网IP或域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
 
-    需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为客户端的 DNS 查询一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
+        需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为（DNS递归查询机制）客户端的请求一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
 
-    因此，在默认配置下（不使用域名方式），该机制通常不会引入额外的隐私或安全风险。
+        关于安全问题，例如在处理`mstsc`连接时，如果 DNS 被恶意篡改，理论上可能得到`1.2.3.4-3389`这样的地址，而不是预期的`10.0.0.1-3389`。
+        由于`gonc`默认只允许内网 IP 段，这类异常连接会被拒绝，保证透明代理不会将客户端流量发送到公司内网之外的目的地。
+
+        因此，在默认配置下，该机制通常不会带来额外的隐私或安全风险。
 
 === "无需DNS"
 
@@ -322,7 +323,7 @@ gonc -nat-checker
 ## 🧠 高级技巧：多服务复用 (Mux Service)
 
 <div class="interactive-box">
-  <label>🛠️设置示例服务器 IP:</label>
+  <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
 </div>
 
