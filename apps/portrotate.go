@@ -290,6 +290,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 
 	config.ncconfig.sessionReady = true
 	handleNegotiatedConnection(&misc.ConsoleIO{}, &config.ncconfig, secureDataSess, config.stats_in, config.stats_out)
+	handler.Clear()
 	config.Logger.Printf("PortRotate ends")
 }
 
@@ -625,6 +626,23 @@ func (h *rotateBusinessHandler) OnConnectionError(err error) {
 func (h *rotateBusinessHandler) OnPortRotate(id int, network string) {
 	h.log("Received PortRotate command for ID: %d, Network: %s", id, network)
 
+	h.recvMu.Lock()
+	pendingCount := len(h.receiverPending)
+	h.recvMu.Unlock()
+
+	if pendingCount > 2 {
+		h.log("Rotation skipped: too many(%d) pending in progress", pendingCount)
+		h.ctrl.SendPortRotateAck(id, 501)
+		return
+	}
+
+	// 检查是否已有轮转在进行中
+	if atomic.LoadInt32(&h.config.isRotating) > 0 {
+		h.log("Rotation skipped: already in progress")
+		h.ctrl.SendPortRotateAck(id, 502)
+		return
+	}
+
 	// 在 goroutine 中处理
 	go func() {
 		h.ncconfig.sessionReady = false
@@ -897,6 +915,32 @@ func (h *rotateBusinessHandler) ServeHTTP_Rotate(w http.ResponseWriter, r *http.
 	} else {
 		fmt.Fprintf(w, "Rotation triggered (default network). Check logs for details.\n")
 	}
+}
+
+func (h *rotateBusinessHandler) Clear() {
+	// 清理 pendingRotations
+	h.pendingMu.Lock()
+	for id, state := range h.pendingRotations {
+		if state.conn != nil {
+			h.log("Closing pending rotation connection for ID: %d", id)
+			state.conn.Close()
+		}
+		delete(h.pendingRotations, id)
+	}
+	h.pendingMu.Unlock()
+
+	// 清理 receiverPending
+	h.recvMu.Lock()
+	for id, conn := range h.receiverPending {
+		if conn != nil {
+			h.log("Closing receiver pending connection for ID: %d", id)
+			conn.Close()
+		}
+		delete(h.receiverPending, id)
+	}
+	h.recvMu.Unlock()
+
+	h.log("All pending rotations and receiver connections have been cleared.")
 }
 
 // --- Utils ---
