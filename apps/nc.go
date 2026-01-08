@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.7"
+	VERSION = "v2.4.8"
 )
 
 type AppNetcatConfig struct {
@@ -264,6 +264,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.IntVar(&secure.UdpOutputBlockSize, "udp-size", secure.UdpOutputBlockSize, "")
 	fs.IntVar(&secure.KcpWindowSize, "kcp-window-size", secure.KcpWindowSize, "")
 	fs.IntVar(&secure.KCPIdleTimeoutSecond, "kcp-timeout", secure.KCPIdleTimeoutSecond, "kcp idle timeout seconds (0 means no timeout)")
+	fs.IntVar(&secure.KcpUpdateInterval, "kcp-update-interval", secure.KcpUpdateInterval, "KCP update interval in milliseconds")
 	fs.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")
 	fs.IntVar(&secure.UDPIdleTimeoutSecond, "udp-timeout", secure.UDPIdleTimeoutSecond, "udp idle timeout seconds (0 means no timeout)")
 	fs.StringVar(&VarmuxEngine, "mux-engine", VarmuxEngine, "yamux | smux")

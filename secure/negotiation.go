@@ -36,6 +36,7 @@ type NegotiationConfig struct {
 	KeepAlive                 int
 	UdpKeepAlivePayload       string
 	KCPIdleTimeoutSecond      int
+	KcpUpdateInterval         int
 	UDPIdleTimeoutSecond      int
 	ReadIdleTimeoutSecond     int
 }
@@ -43,10 +44,13 @@ type NegotiationConfig struct {
 const DefaultKCPIdleTimeoutSecond = 41
 const DefaultUDPIdleTimeoutSecond = 60 * 5
 const DefaultUdpOutputBlockSize = 1320
+const DefaultKcpUpdateInterval = 20 //ms
+const DefaultKcpWindowSize = 1500
 
 var (
 	UdpOutputBlockSize   int    = DefaultUdpOutputBlockSize
-	KcpWindowSize        int    = 1500
+	KcpWindowSize        int    = DefaultKcpWindowSize
+	KcpUpdateInterval    int    = DefaultKcpUpdateInterval
 	UdpKeepAlivePayload  string = "ping\n"
 	KCPIdleTimeoutSecond int    = DefaultKCPIdleTimeoutSecond
 	UDPIdleTimeoutSecond int    = DefaultUDPIdleTimeoutSecond
@@ -59,6 +63,7 @@ func NewNegotiationConfig() *NegotiationConfig {
 		KcpWindowSize:        KcpWindowSize,
 		UdpKeepAlivePayload:  UdpKeepAlivePayload,
 		KCPIdleTimeoutSecond: KCPIdleTimeoutSecond,
+		KcpUpdateInterval:    KcpUpdateInterval,
 		UDPIdleTimeoutSecond: UDPIdleTimeoutSecond,
 	}
 }
@@ -568,7 +573,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	default:
 	}
 
-	sess.SetNoDelay(1, 10, 2, 1)
+	sess.SetNoDelay(1, config.KcpUpdateInterval, 2, 1)
 	sess.SetWindowSize(config.KcpWindowSize, config.KcpWindowSize)
 	//kcp header 24字节SetMtu时就暗含其中。但实际发出包可能还多出28字节。根据情况把mtu再调小，防止超过udpOutputBlockSize
 	mtu := config.UdpOutputBlockSize - 8 // 8: fecHeaderSizePlus2
