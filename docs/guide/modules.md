@@ -15,7 +15,7 @@
 
 ---
 
-## 🐚 `:sh` - 远程 Shell
+## 🐚 `:sh` - 远程 Shell {: #shell }
 
 提供交互式的命令行访问。这是最常用的模块。
 
@@ -50,7 +50,7 @@
 
 ---
 
-## 🌐 `:s5s` - SOCKS5 代理服务
+## 🌐 `:s5s` - SOCKS5 代理服务 {: #socks5 }
 
 将当前连接转换为一个标准的 SOCKS5 代理服务器。
 
@@ -114,7 +114,7 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
 ---
 
-## 🔀 `:tp` - 透明代理
+## 🔀 `:tp` - 透明代理 {: #tproxy }
 
 :tp 是一种透明端口转发机制，用于在客户端不支持或不便配置代理的场景下，通过本地监听端口自动完成代理转发。
 
@@ -167,7 +167,7 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
 ---
 
-## 🔗 `:nc` - 端口转发 (Netcat)
+## 🔗 `:nc` - 端口转发 (Netcat) {: #nc }
 
 :nc安全等效于gonc本身，即gonc可以在内存中执行自己，不用开启子进程，因此可以实现高效的将流量转发到另一个地址。
 
@@ -197,7 +197,7 @@ gonc -e ":nc -framed -u 8.8.8.8 53" -framed -udp-timeout 2 -u -k -l 53
 
 ---
 
-## 📂 `:httpserver` - 文件服务器
+## 📂 `:httpserver` - 文件服务器 {: #httpserver }
 
 快速共享文件或目录。
 
@@ -221,7 +221,7 @@ gonc -e ":httpserver /var/www/html /tmp/test" -k -l 8080
 
 ---
 
-## 🧬 `:mux` - 多路复用的代理服务和文件服务
+## 🧬 `:mux` - 多路复用的代理服务和文件服务 {: #mux }
 
 `:mux` 目前集成了两个应用功能：HTTP文件服务和SOCKS5/HTTP代理服务。是`gonc`为了在P2P场景提供用户更容易上手的文件传输和内网穿透功能，比起你用:s5s或:httpserver要更容易上手。
 
@@ -234,7 +234,7 @@ gonc -e ":httpserver /var/www/html /tmp/test" -k -l 8080
 
 ```
 
-### 1. 代理服务隧道构建 (`link` / `linkagent`)
+### 1. 代理服务隧道构建 (`link` / `linkagent`)  {: #link }
 
 这是构建复杂端口映射和内网穿透的核心功能。link还特意处理了SOCKS5的UDP代理，实现UDP走MUX隧道从对端出去。这解决了使用`:s5s`加`-mux`无法代理UDP的问题。
 
@@ -355,7 +355,7 @@ gonc -p2p mysecret123 -link "x+tls://0.0.0.0:8443?cert=ca.pem&key=key.pem;none"
 ```
 
 
-### 2. 文件传输 (`httpserver` / `httpclient`)
+### 2. 文件传输 (`httpserver` / `httpclient`) {: #file }
 
 在复用通道中直接传输文件，无需建立额外的连接，支持断点续传。
 
@@ -398,7 +398,7 @@ gonc -p2p mysecret123 -link "x+tls://0.0.0.0:8443?cert=ca.pem&key=key.pem;none"
     gonc -p2p mysecret123 -httplocal-port 8080
     ```
 
-### 3. 监听模式 (`-l`)
+### 3. 监听模式 (`-l`) {: #muxlisten }
 
 **语法**：
 
@@ -410,7 +410,7 @@ gonc -p2p mysecret123 -k -mqtt-wait -e ":mux -l <port>"
 指定 `:mux` 模块在特定的本地端口上监听，对端httpserver时，指定本地监听 <port> 作为mux的入口，共浏览器或gonc访问对端的HTTP服务。
 
 
-### 4. `socks5`
+### 4. `socks5` {: #muxsocks5 }
 
 类似linkagent，不展开介绍，新版的linkagent功能已经取代它。
 
@@ -421,7 +421,7 @@ gonc -p2p mysecret123 -k -mqtt-wait -e ":mux socks5"
 
 ---
 
-## 🤖 `:service` - 动态服务 (Super Server)
+## 🤖 `:service` - 动态服务 (Super Server) {: #service }
 
 它允许在一个监听端口上，根据客户端的请求（Call）动态提供不同的服务。类似于 Linux 的 `inetd` 或 SSH 的多功能端口。
 

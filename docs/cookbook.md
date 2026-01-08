@@ -5,7 +5,7 @@
 
 ---
 
-## 📂 文件快传
+## 📂 文件快传 {: #file }
 
 告别 `tar` 和 `scp`，使用 P2P 协议在两台内网机器间高速传输文件或目录。gonc内置的httpserver会自动识别文件类型，适当启用zstd实时压缩传输。
 
@@ -42,9 +42,11 @@
     gonc -http-download /path/to/save http://127.0.0.1:9999/subpath
     ```
 
+更多参数说明在[:mux 多路复用文件传输](guide/modules.md#file)章节
+
 ---
 
-## 🌐 代理与隧道
+## 🌐 代理与隧道 {: #link }
 
 将 `gonc` 变成随身携带的 VPN 网关。
 
@@ -182,9 +184,11 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
     gonc -e ":nc -framed -u 8.8.8.8 53" -framed -udp-timeout 2 -u -k -l 53
     ```
 
+更多参数说明在[:mux 多路复用](guide/modules.md#mux)章节
+
 ---
 
-## 🐚 远程管理 (Shell)
+## 🐚 远程管理 (Shell) {: #shell }
 
 类似于 SSH，但你可以用正向、反弹或P2P的方式来获得Shell。以下统一用TCP的TLS+PSK加密方式，你也可以都加上-kcp使用UDP的加密方式。
 
@@ -248,9 +252,11 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
     gonc -tls -psk mysecret123 -pty server-ip 1234
     ```
 
+更多参数说明在[:shell](guide/modules.md#shell)章节
+
 ---
 
-## 🧠 高级技巧：多服务复用 (Mux Service)
+## 🧠 高级技巧：多服务复用 (Mux Service) {: #service }
 
 <div class="interactive-box">
   <label>🛠️设置示例server-ip:</label>
@@ -367,9 +373,11 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
     gonc -p2p mysecret123 -mqtt-hello -call :mux -link "1080;none" 
     ```
 
+更多参数说明在[:service](guide/modules.md#service)章节
+
 ---
 
-## 🔧 网络诊断与测试
+## 🔧 网络诊断与测试 {: #test }
 
 ### 检测 NAT 类型
 
