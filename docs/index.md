@@ -4,7 +4,7 @@
 [![GitHub license](https://img.shields.io/github/license/threatexpert/gonc)](https://github.com/threatexpert/gonc/blob/master/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/threatexpert/gonc)](https://github.com/threatexpert/gonc/stargazers)
 
-**gonc** 是一个现代化的、功能增强版的网络瑞士军刀。它保留了经典 `netcat` 的简洁管道设计，并针对现代复杂的网络环境（NAT、防火墙）引入了 **P2P 穿透**、**多路复用**、**强加密** 以及 **内置服务模块**。
+**gonc** 是一个现代化的、功能增强版的网络瑞士军刀。它保留了经典 `netcat` 的简洁管道设计，并针对现代复杂的网络环境（NAT、防火墙）引入了 **P2P 穿透**、**多路复用**、**强加密** 以及 **内置服务模块**，并且**完全开源（100% Open Source）**。
 
 如果你习惯使用 `nc`，那么 `gonc` 将给你带来“鸟枪换炮”的体验。
 

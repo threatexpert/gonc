@@ -20,19 +20,19 @@
     ```bash
     gonc -p2p mysecret123 -httpserver /path1/to/share /path2/to/share
     ```
-    上面这个命令是为了使用起来相对方便，`-httpserver`实际会转为这样调用-e的模块`-e ":mux httpserver /path1/to/share /path2/to/share"`
+    上面这个命令是为了使用起来相对方便，`-httpserver`实际会转为这样调用-e的模块`-e ":mux httpserver /path1/to/share /path2/to/share"`，以及使用-k -mqtt-wait持续等待客户端连接。
 
 
 === "接收端 (Client)"
 
-    方式1：自动下载远程目录到本地。
+    方式1：P2P连接后自动下载远程目录到本地。
     
     ```bash
     # -download 指定保存路径
     gonc -p2p mysecret123 -download /path/to/save
     ```
 
-    方式2：不会自动开始下载，仅将远程HTTP服务映射到127.0.0.1:9999 端口，如果有需要，可以明确指定绑定到0.0.0.0:9999
+    方式2：不会自动开始下载，P2P连接成功后仅将远程HTTP服务映射到127.0.0.1:9999 端口（指定绑定到0.0.0.0:9999），该端口是多路复用的入口。
     ```bash
     gonc -p2p mysecret123 -httplocal-port 9999
     ```
@@ -42,25 +42,144 @@
     gonc -http-download /path/to/save http://127.0.0.1:9999/subpath
     ```
 
-### 场景 2：管道流传输 (类 Unix 风格)
+---
 
-适合传输单个文件或配合 `tar` 使用。
+## 🌐 代理与隧道
 
-=== "发送端"
+将 `gonc` 变成随身携带的 VPN 网关。
 
+### 场景 1：P2P 隧道 (内网穿透访问)
+
+**需求**：你在家里，想访问公司内网的 服务器远程桌面 (例如 10.0.0.1:3389)，或者通过公司的网络上网。
+
+=== "公司电脑"
+
+开启 Link Agent 模式，会一直等待连接，支持接入多个客户端。
+
+```bash
+gonc -p2p mysecret123 -linkagent
+```
+
+=== "家里电脑"
+
+建立连接，并在本地开启 SOCKS5+HTTP 代理端口1080。使用SOCKS5协议时，支持UDP，UDP将封装进入p2p的隧道中。
+
+```bash
+# 在本地 1080 开启代理，流量将从公司电脑出去
+gonc -p2p mysecret123 -link 1080
+```
+
+
+!!! tip "透明代理魔法 (Magic DNS)"
+连接建立后，如果你想直接访问公司内网的远程桌面 (10.0.0.1:3389)，虽然`mstsc`(远程桌面客户端)不支持代理，你也无需配置端口转发。
+
+=== "依赖公网DNS"
+
+    直接连接目标地址：
+
+    ```
+    10.0.0.1-3389.gonc.cc:1080
+    ```
+    10.0.0.1-3389.gonc.cc (注意中间是横杠)，该域名会被解析为类似127.b.c.d的IP，因此`mstsc`会连入本地的socks5代理端口1080，然后`gonc`根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
+
+    !!! warning "隐私和安全问题"
+
+        这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私和安全保护，gonc的透明代理默认只接受内网私有IP段，不接受公网IP或域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
+
+        需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为（DNS递归查询机制）客户端的请求一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
+
+        关于安全问题，例如在处理`mstsc`连接时，如果 DNS 被恶意篡改，理论上可能得到`1.2.3.4-3389`这样的地址，而不是预期的`10.0.0.1-3389`。
+        由于`gonc`默认只允许内网 IP 段，这类异常连接会被拒绝，保证透明代理不会将客户端流量发送到公司内网之外的目的地。
+
+        因此，在默认配置下，该机制通常不会带来额外的隐私或安全风险。
+
+=== "无需DNS"
+
+    gonc透明代理也支持不依赖公网DNS解析的方式：
     ```bash
-    # 使用 -send 参数
-    gonc -p2p mysecret123 -mqtt-wait -send /path/to/file.zip
-    
-    # 或者使用标准管道 (Linux)
-    cat file.zip | gonc -p2p mysecret123 -mqtt-wait
+    # -magicdns指定为公司网络的IP段，但只支持一个段，并设置最后段是0
+    gonc -p2p mysecret123 -link 1080 -magicdns 10.0.0.0
+    ```
+    假如准备连接10.0.0.5:3389，我们借助ping先计算一下magic ip，
+    ```bash
+    ping 127.5.3389
+    PING 127.5.3389 (127.5.13.61) 56(84) bytes of data.
+    64 bytes from 127.5.13.61: icmp_seq=1 ttl=128 time=0.302 ms
+    ^C
+    ```
+    得到直接连接目标地址：
+    ```
+    127.5.13.61:1080
     ```
 
-=== "接收端"
+### 场景 2：高级端口映射 (-link 配置详解)
+
+`-link` 参数非常强大，可以实现类似SSH的-D、-L、-R功能，且支持双向的，以及透明代理和TLS加密。格式为 `"本地配置;远程配置"`，注意要使用引号。
+
+```bash
+# 1. 双向 SOCKS5+HTTP：两边都开启 1080 端口，互通互连
+gonc -p2p mysecret123 -link "1080;1080"
+
+# 2. 远程端口转发：将本地 1080 流量转发给远程去访问 1.2.3.4:80
+gonc -p2p mysecret123 -link "f://127.0.0.1:1080?to=1.2.3.4:80;none"
+
+# 3. 本地端口转发：让远程监听 80，流量转发给本地的 127.0.0.1:80
+gonc -p2p mysecret123 -link "none;f://0.0.0.0:80?to=127.0.0.1:80"
+
+```
+
+### 场景 3：快速开启 SOCKS5 代理 server
+
+在公司内网开启一个标准代理服务，供其他设备使用，为了持续提供服务必须使用-k(-keep-open)，否则gonc监听端口只接受一个连接。
+
+```bash
+# 监听 1080 端口，-auth设置账号密码，-b/-u分别启用BIND/UDP模式，-http是兼容HTTP代理协议
+gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080 
+
+```
+
+如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发（只支持TCP），不支持SOCKS5代理UDP。
+<div class="interactive-box">
+  <label>🛠️设置示例server-ip:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
+
+=== "服务端 (监听)"
 
     ```bash
-    # 将接收到的流写入文件
-    gonc -p2p mysecret123 -mqtt-hello > received_file.zip
+    # 这次:s5s没有用-auth user:pass，因为有TLS+PSK保护也具备加密和认证
+    gonc -e ":s5s -b -u" -tls -psk mysecret123  -k -l 3080 
+    ```
+
+=== "客户端 (加密转发代理)"
+
+    ```bash
+    # 类似SSH，应用客户端通过1080接入代理服务器
+    gonc -e ":nc -tls -psk mysecret123 server-ip 3080" -k -l 1080
+    ```
+
+=== "客户端（BIND加密反向代理）"
+
+    ```bash
+    # 在代理服务器保持开启23306端口，并转发到本机127.0.0.1 3306
+    # -k参数可以保持把本机3306暴露在公网23306，类似frp反向代理
+    gonc -x "-tls -psk mysecret123 server-ip:3080" -e ":nc 127.0.0.1 3306" -k -l 23306
+    ```
+
+### 场景 4：端口转发
+
+=== "TCP端口转发"
+
+    ```bash
+    # 监听在[::]:80，可持续将客户端转发到127.0.0.1 8000
+    gonc -e ":nc 127.0.0.1 8000" -k -l 80
+    ```
+
+=== "UDP端口转发"
+
+    ```bash
+    # 监听在[::]:53，转发到8.8.8.8 53。-framed是防止-e的管道机制导致UDP粘包
+    gonc -e ":nc -framed -u 8.8.8.8 53" -framed -udp-timeout 2 -u -k -l 53
     ```
 
 ---
@@ -127,195 +246,6 @@
     ```bash
     # 连接目标
     gonc -tls -psk mysecret123 -pty server-ip 1234
-    ```
-
----
-
-## 🌐 代理与隧道
-
-将 `gonc` 变成随身携带的 VPN 网关。
-
-### 场景 1：快速开启 SOCKS5 代理 server
-
-在公司内网开启一个标准代理服务，供其他设备使用，为了持续提供服务必须使用-k(-keep-open)，否则gonc监听端口只接受一个连接。
-
-```bash
-# 监听 1080 端口，-auth设置账号密码，-b/-u分别启用BIND/UDP模式，-http是兼容HTTP代理协议
-gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080 
-
-```
-
-如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发（只支持TCP），不支持SOCKS5代理UDP。
-<div class="interactive-box">
-  <label>🛠️设置示例server-ip:</label>
-  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
-</div>
-
-=== "服务端 (监听)"
-
-    ```bash
-    # 这次:s5s没有用-auth user:pass，因为有TLS+PSK保护也具备加密和认证
-    gonc -e ":s5s -b -u" -tls -psk mysecret123  -k -l 3080 
-    ```
-
-=== "客户端 (加密转发代理)"
-
-    ```bash
-    # 类似SSH，应用客户端通过1080接入代理服务器
-    gonc -e ":nc -tls -psk mysecret123 server-ip 3080" -k -l 1080
-    ```
-
-=== "客户端（BIND加密反向代理）"
-
-    ```bash
-    # 在代理服务器保持开启23306端口，并转发到本机127.0.0.1 3306
-    # -k参数可以保持把本机3306暴露在公网23306，类似frp反向代理
-    gonc -x "-tls -psk mysecret123 server-ip:3080" -e ":nc 127.0.0.1 3306" -k -l 23306
-    ```
-
-### 场景 2：P2P 隧道 (内网穿透访问)
-
-**需求**：你在家里，想访问公司内网的 Web 服务 (例如 10.0.0.5:80)，或者通过公司的网络上网。
-
-=== "公司电脑"
-
-开启 Link Agent 模式，会一直等待连接，支持接入多个客户端。
-
-```bash
-gonc -p2p mysecret123 -linkagent
-```
-
-=== "家里电脑"
-
-建立连接，并在本地开启 SOCKS5+HTTP 代理端口1080。使用SOCKS5协议时，支持UDP，UDP将封装进入p2p的隧道中。
-
-```bash
-# 在本地 1080 开启代理，流量将从公司电脑出去
-gonc -p2p mysecret123 -link 1080
-```
-
-
-!!! tip "透明代理魔法 (Magic DNS)"
-连接建立后，如果你想直接访问公司内网的远程桌面 (10.0.0.1:3389)，虽然`mstsc`(远程桌面客户端)不支持代理，你也无需配置端口转发。
-
-=== "依赖公网DNS"
-
-    直接连接目标地址：
-
-    ```
-    10.0.0.1-3389.gonc.cc:1080
-    ```
-    10.0.0.1-3389.gonc.cc (注意中间是横杠)，该域名会被解析为类似127.b.c.d的IP，因此`mstsc`会连入本地的socks5代理端口1080，然后`gonc`根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
-
-    !!! warning "隐私和安全问题"
-
-        这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私和安全保护，gonc的透明代理默认只接受内网私有IP段，不接受公网IP或域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数-link "x://:1080?tproxy=1&allow=domain;none"
-
-        需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为（DNS递归查询机制）客户端的请求一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
-
-        关于安全问题，例如在处理`mstsc`连接时，如果 DNS 被恶意篡改，理论上可能得到`1.2.3.4-3389`这样的地址，而不是预期的`10.0.0.1-3389`。
-        由于`gonc`默认只允许内网 IP 段，这类异常连接会被拒绝，保证透明代理不会将客户端流量发送到公司内网之外的目的地。
-
-        因此，在默认配置下，该机制通常不会带来额外的隐私或安全风险。
-
-=== "无需DNS"
-
-    gonc透明代理也支持不依赖公网DNS解析的方式：
-    ```bash
-    # -magicdns指定为公司网络的IP段，但只支持一个段，并设置最后段是0
-    gonc -p2p mysecret123 -link 1080 -magicdns 10.0.0.0
-    ```
-    假如准备连接10.0.0.5:3389，我们借助ping先计算一下magic ip，
-    ```bash
-    ping 127.5.3389
-    PING 127.5.3389 (127.5.13.61) 56(84) bytes of data.
-    64 bytes from 127.5.13.61: icmp_seq=1 ttl=128 time=0.302 ms
-    ^C
-    ```
-    得到直接连接目标地址：
-    ```
-    127.5.13.61:1080
-    ```
-
-### 场景 3：高级端口映射 (-link 配置详解)
-
-`-link` 参数非常强大，可以实现类似SSH的-D、-L、-R功能，且支持双向的，以及透明代理和TLS加密。格式为 `"本地配置;远程配置"`，注意要使用引号。
-
-```bash
-# 1. 双向 SOCKS5+HTTP：两边都开启 1080 端口，互通互连
-gonc -p2p mysecret123 -link "1080;1080"
-
-# 2. 远程端口转发：将本地 1080 流量转发给远程去访问 1.2.3.4:80
-gonc -p2p mysecret123 -link "f://127.0.0.1:1080?to=1.2.3.4:80;none"
-
-# 3. 本地端口转发：让远程监听 80，流量转发给本地的 127.0.0.1:80
-gonc -p2p mysecret123 -link "none;f://0.0.0.0:80?to=127.0.0.1:80"
-
-```
-
-### 场景 4：端口转发
-
-=== "TCP端口转发"
-
-    ```bash
-    # 监听在[::]:80，转发到127.0.0.1 8000
-    gonc -e ":nc 127.0.0.1 8000" -k -l 80
-    ```
-
-=== "UDP端口转发"
-
-    ```bash
-    # 监听在[::]:53，转发到8.8.8.8 53。-framed是防止-e的管道机制导致UDP粘包
-    gonc -e ":nc -framed -u 8.8.8.8 53" -framed -udp-timeout 2 -u -k -l 53
-    ```
-
----
-
-## 🔧 网络诊断与测试
-
-### 检测 NAT 类型
-
-在进行 P2P 连接前，了解当前的网络环境至关重要。
-
-```bash
-gonc -nat-checker
-
-```
-
-**输出解读：**
-
-* **(easy)**: 容易穿透。NAT端口与内网端口总是保持不变的。
-* **(hard)**: NAT端口与内网端口不一致，但连接不同目的地址，源端口会复用。
-* **(symm)**: NAT端口每个都不一样，无法预测，算是最困难的类型。
-
-### 宽带测速
-
-测试两点之间的纯粹带宽（不写磁盘），下面命令也兼容windows，gonc在windows下兼容实现了/dev/null、/dev/zero和/dev/urandom。
-
-=== "传统连接方式"
-
-    === "接收端"
-    ```bash
-    gonc -P -write /dev/null -l 8888
-    ```
-
-    === "发送端"
-    ```bash
-    # 发送零数据流
-    gonc -send /dev/zero -P <接收端IP> 8888
-    ```
-
-=== "P2P连接方式"
-
-    === "接收端"
-    ```bash
-    gonc -P -write /dev/null -p2p mysecret123 -mqtt-wait
-    ```
-
-    === "发送端"
-    ```bash
-    # 发送零数据流
-    gonc -send /dev/zero -P -p2p mysecret123 -mqtt-hello
     ```
 
 ---
@@ -435,4 +365,53 @@ gonc -nat-checker
     * **SOCKS5+HTTP代理** (本地监听1080):
     ```bash
     gonc -p2p mysecret123 -mqtt-hello -call :mux -link "1080;none" 
+    ```
+
+---
+
+## 🔧 网络诊断与测试
+
+### 检测 NAT 类型
+
+在进行 P2P 连接前，了解当前的网络环境至关重要。
+
+```bash
+gonc -nat-checker
+
+```
+
+**输出解读：**
+
+* **(easy)**: 容易穿透。NAT端口与内网端口总是保持不变的。
+* **(hard)**: NAT端口与内网端口不一致，但连接不同目的地址，源端口会复用。
+* **(symm)**: NAT端口每个都不一样，无法预测，算是最困难的类型。
+
+### 宽带测速
+
+测试两点之间的纯粹带宽（不写磁盘），下面命令也兼容windows，gonc在windows下兼容实现了/dev/null、/dev/zero和/dev/urandom。
+
+=== "传统连接方式"
+
+    === "接收端"
+    ```bash
+    gonc -P -write /dev/null -l 8888
+    ```
+
+    === "发送端"
+    ```bash
+    # 发送零数据流
+    gonc -send /dev/zero -P <接收端IP> 8888
+    ```
+
+=== "P2P连接方式"
+
+    === "接收端"
+    ```bash
+    gonc -P -write /dev/null -p2p mysecret123 -mqtt-wait
+    ```
+
+    === "发送端"
+    ```bash
+    # 发送零数据流
+    gonc -send /dev/zero -P -p2p mysecret123 -mqtt-hello
     ```
