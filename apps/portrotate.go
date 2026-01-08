@@ -843,15 +843,95 @@ func (h *rotateBusinessHandler) performInitiatorSwitch(id int, conn net.Conn) {
 
 // --- HTTP Management Server ---
 
+/*
+const nets = ["", "any", "tcp", "udp", "any4", "any6"];
+
+	document.getElementById('network').innerHTML = nets.map(function(n) {
+	    return '<option value="' + n + '">' + (n || 'Auto') + '</option>';
+	}).join('');
+
+	function fetchInfo() {
+	    fetch('/info').then(res => res.json()).then(data => {
+	        const container = document.getElementById('infoDisplay');
+	        const rows = [
+	            ["Session ID", data.current_id],
+	            ["Traffic", (data.total_bytes/1048576).toFixed(2) + " MB"],
+	            ["Period", data.config.period],
+	            ["Limit", data.config.limit],
+	            ["Forwarder", data.forwarder_addr],
+	            ["Is Client", data.is_client]
+	        ];
+	        container.innerHTML = rows.map(function(r) {
+	            return '<div class="bold">' + r[0] + ':</div><div>' + r[1] + '</div>';
+	        }).join('');
+	    });
+	}
+
+	function triggerRotate() {
+	    const net = document.getElementById('network').value;
+	    const logBox = document.getElementById('log');
+	    logBox.style.display = 'block';
+	    logBox.innerText = 'Processing...';
+
+	    fetch('/rotate?network=' + net)
+	        .then(function(res) {
+	            return res.text().then(function(txt) {
+	                logBox.innerText = "[" + res.status + "] " + txt;
+	                if (res.ok) setTimeout(fetchInfo, 1000);
+	            });
+	        });
+	}
+
+fetchInfo();
+setInterval(fetchInfo, 5000);
+*/
+const pr_Debug_IndexHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body { font-family: monospace; max-width: 600px; margin: 20px; }
+.card { border: 1px solid #000; padding: 10px; margin-bottom: 10px; }
+.grid { display: grid; grid-template-columns: 120px 1fr; line-height: 1.6; }
+#log { margin-top: 10px; border: 1px dashed #000; padding: 5px; display: none; font-size: 12px; }
+</style>
+</head>
+<body>
+<h3>PortRotate Management</h3>
+<div class="card"><div id="infoDisplay" class="grid">Loading...</div></div>
+
+<div class="card">
+	<select id="network"></select>
+	<button onclick="triggerRotate()">Rotate</button>
+	<div id="log"></div>
+</div>
+
+<script>const nets=["","any","tcp","udp","any4","any6"];function fetchInfo(){fetch("/info").then(t=>t.json()).then(t=>{const n=document.getElementById("infoDisplay"),e=[["Session ID",t.current_id],["Traffic",(t.total_bytes/1048576).toFixed(2)+" MB"],["Period",t.config.period],["Limit",t.config.limit],["Forwarder",t.forwarder_addr],["Is Client",t.is_client]];n.innerHTML=e.map(function(t){return'<div class="bold">'+t[0]+":</div><div>"+t[1]+"</div>"}).join("")})}function triggerRotate(){var t=document.getElementById("network").value;const e=document.getElementById("log");e.style.display="block",e.innerText="Processing...",fetch("/rotate?network="+t).then(function(n){return n.text().then(function(t){e.innerText="["+n.status+"] "+t,n.ok&&setTimeout(fetchInfo,1e3)})})}document.getElementById("network").innerHTML=nets.map(function(t){return'<option value="'+t+'">'+(t||"Auto")+"</option>"}).join(""),fetchInfo(),setInterval(fetchInfo,5e3);
+</script>
+</body>
+</html>
+`
+
 func (h *rotateBusinessHandler) StartHTTPServer(addr string) {
 	mux := http.NewServeMux()
+	// 1. 注册根路径指引
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 确保只处理精确的 "/" 路径，避免匹配到不存在的子路径
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, pr_Debug_IndexHTML)
+	})
 	mux.HandleFunc("/info", h.ServeHTTP_Info)
 	mux.HandleFunc("/rotate", h.ServeHTTP_Rotate)
 
 	// 保存实例以便关闭
 	h.httpServer = &http.Server{Addr: addr, Handler: mux}
 
-	h.log("Starting HTTP Management Server at %s", addr)
+	h.log("Starting HTTP Management Server at http://%s", addr)
 	// ListenAndServe 会阻塞，且正常关闭会返回 ErrServerClosed
 	if err := h.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		h.log("HTTP Server Error: %v", err)

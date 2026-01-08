@@ -86,22 +86,117 @@ func brRegisterConn(conn net.Conn) int64 {
 	return id
 }
 
-func brStartConnDebugHTTP() (listenAddr string, err error) {
+/*
+	function refreshConns() {
+		fetch('/conns')
+			.then(res => res.json())
+			.then(data => {
+				const tbody = document.getElementById('connTable');
+				document.getElementById('status').innerText = 'Last update: ' + new Date().toLocaleTimeString() + ' (Count: ' + data.length + ')';
+
+				tbody.innerHTML = '';
+				data.forEach(c => {
+					const tr = document.createElement('tr');
+
+					tr.innerHTML = [
+						'<td>' + c.id + '</td>',
+						'<td>' + c.local + '</td>',
+						'<td>' + c.remote + '</td>',
+						'<td><button class="btn-close" onclick="closeConn(' + c.id + ')">Close</button></td>'
+					].join('');
+
+					tbody.appendChild(tr);
+				});
+			})
+			.catch(err => {
+				document.getElementById('status').innerText = 'Error fetching connections';
+				document.getElementById('connTable').innerHTML = '';
+			});
+	}
+
+	function closeConn(id) {
+		fetch('/close?id=' + id)
+			.then(res => res.text())
+			.then(txt => {
+				alert('Result: ' + txt);
+				refreshConns();
+			});
+	}
+
+refreshConns();
+setInterval(refreshConns, 3000);
+*/
+const brConnDashboardHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Bridge Debugger</title>
+<style>
+body { font-family: monospace; margin: 20px; }
+table { width: 100%; }
+th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+.btn-close { padding: 5px 10px; cursor: pointer; }
+.status { margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<h2>🔗 Active Connections</h2>
+<div class="status" id="status">Loading connections...</div>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Local Address</th>
+<th>Remote Address</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody id="connTable"></tbody>
+</table>
+<script>function refreshConns(){fetch("/conns").then(e=>e.json()).then(e=>{const t=document.getElementById("connTable");document.getElementById("status").innerText="Last update: "+(new Date).toLocaleTimeString()+" (Count: "+e.length+")",t.innerHTML="",e.forEach(e=>{const n=document.createElement("tr");n.innerHTML=["<td>"+e.id+"</td>","<td>"+e.local+"</td>","<td>"+e.remote+"</td>",'<td><button class="btn-close" onclick="closeConn('+e.id+')">Close</button></td>'].join(""),t.appendChild(n)})}).catch(e=>{document.getElementById("status").innerText="Error fetching connections",document.getElementById("connTable").innerHTML=""})}function closeConn(e){fetch("/close?id="+e).then(e=>e.text()).then(e=>{alert("Result: "+e),refreshConns()})}refreshConns(),setInterval(refreshConns,3e3);
+</script>
+</body>
+</html>
+`
+
+func brStartConnDebugHTTP(debugPort string) (listenAddr string, err error) {
 	var ln net.Listener
 
-	for port := 8800; port < 9000; port++ {
-		addr := fmt.Sprintf("127.0.0.1:%d", port)
+	if debugPort == "1" {
+		for port := 8800; port < 9000; port++ {
+			addr := fmt.Sprintf("127.0.0.1:%d", port)
+			ln, err = net.Listen("tcp", addr)
+			if err == nil {
+				listenAddr = addr
+				break
+			}
+		}
+
+		if ln == nil {
+			return "", fmt.Errorf("no available port in range 8800-8899")
+		}
+	} else {
+		addr := "127.0.0.1:" + debugPort
 		ln, err = net.Listen("tcp", addr)
 		if err == nil {
 			listenAddr = addr
-			break
 		}
-	}
-	if ln == nil {
-		return "", fmt.Errorf("no available port in range 8800-8899")
+		if ln == nil {
+			return "", err
+		}
 	}
 
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, brConnDashboardHTML)
+	})
 
 	// GET /conns
 	mux.HandleFunc("/conns", func(w http.ResponseWriter, r *http.Request) {
@@ -271,13 +366,13 @@ func App_Bridge_main_withconfig(sess net.Conn, MQTTHelloAppPayload string, nccon
 
 	startOnceForBridge.Do(func() {
 		go brSessCacheCleanRoutine()
-
-		if os.Getenv("BR_DEBUG") != "" {
-			addr, err := brStartConnDebugHTTP()
+		debugPort := os.Getenv("BR_DEBUG")
+		if debugPort != "" {
+			addr, err := brStartConnDebugHTTP(debugPort)
 			if err != nil {
 				log.Fatal(err)
 			}
-			config.ncconfig.Logger.Println("conn debug http listening on", addr)
+			config.ncconfig.Logger.Println("bridge debug http API on http://" + addr)
 		}
 	})
 
