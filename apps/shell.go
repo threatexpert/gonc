@@ -80,12 +80,12 @@ func PtyShellConfigByArgs(logWriter io.Writer, args []string) (*PtyShellConfig, 
 }
 
 func PtyShell_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(fs.Output(), "-sh Usage: [options] shell-path <args>")
+	fmt.Fprintln(fs.Output(), ":sh Usage: [options] shell-path <args>")
 	fmt.Fprintln(fs.Output(), "Options:")
 	fs.PrintDefaults()
 	fmt.Fprintln(fs.Output(), "")
 	fmt.Fprintln(fs.Output(), "Examples:")
-	fmt.Fprintln(fs.Output(), "  -sh /bin/bash")
+	fmt.Fprintln(fs.Output(), "  :sh /bin/bash")
 }
 
 // App_shell_main_withconfig 启动 shell 并绑定到 conn
