@@ -744,7 +744,7 @@ func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done 
 		close(sessionDone)
 	}()
 
-	scheme := "raw"
+	var scheme string
 	params := make(url.Values)
 	useTProxy := false
 
@@ -806,7 +806,7 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 
 	var ln net.Listener
 	var rtConfig *linkRuntimeConfig
-	ackMsg := "OK"
+	var ackMsg string
 
 	if rScheme != "none" {
 		// -------------------------------------------------------------

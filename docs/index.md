@@ -1,6 +1,6 @@
 # 欢迎使用 gonc
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/threatexpert/gonc)](https://goreportcard.com/report/github.com/threatexpert/gonc)
+[![Go Report Card](https://goreportcard.com/badge/github.com/threatexpert/gonc/v2)](https://goreportcard.com/report/github.com/threatexpert/gonc/v2)
 [![GitHub license](https://img.shields.io/github/license/threatexpert/gonc)](https://github.com/threatexpert/gonc/blob/master/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/threatexpert/gonc)](https://github.com/threatexpert/gonc/stargazers)
 
