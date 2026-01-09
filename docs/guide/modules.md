@@ -20,25 +20,25 @@
 提供交互式的命令行访问。这是最常用的模块。
 
 **原理**：
-将网络连接的标准输入/输出 (Stdin/Stdout) 绑定到系统的 Shell 进程，不支持Windows，Linux/Mac 为 `/bin/sh` 或 `/bin/bash`。
+将网络连接的标准输入/输出 (Stdin/Stdout) 绑定到系统的 Shell 进程。
 
 **参数**：
 * `[path]`: (可选) 指定 Shell 的路径。
 
 **示例**：
 
-=== "Linux / macOS"
+=== "Windows / Linux / macOS"
     ```bash
-    # 默认调用 /bin/sh
+    # 调用系统默认的 shell
     gonc -e ":sh" -l 1234 
     
     # 指定 bash
     gonc -e ":sh /bin/bash" -l 1234 
     ```
 
-=== "Windows"
+=== "旧版Windows"
     ```bash
-    # :sh不支持windows，-e可以直接执行cmd，但客户端不支持用-pty的方式
+    # :sh不支持旧版windows（早于win10 1809），-e可以直接执行cmd，但客户端不支持用-pty的方式
     gonc -l 1234 -e "cmd"
     ```
 

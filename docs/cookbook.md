@@ -202,8 +202,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 === "被控端"
 
     ```bash
-    # Linux/Mac
-    gonc -e ":sh /bin/bash" -p2p mysecret123 -k -mqtt-wait
+    gonc -e ":sh" -p2p mysecret123 -k -mqtt-wait
     ```
 
 ### 方式2：传统反弹 Shell
@@ -218,21 +217,13 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
     等待连接并获取交互式 Shell（-pty可支持 Tab 补全和 Ctrl+C）。
     
     ```bash
-    # 对端是Linux/Mac
     gonc -pty -tls -psk mysecret123 -l 2222
-
-    # 对端是Windows，不支持-pty
-    gonc -tls -psk mysecret123 -l 2222
     ```
 
 === "被控端"
 
     ```bash
-    # Linux/Mac
-    gonc -e ":sh /bin/bash" -tls -psk mysecret123 server-ip 2222
-
-    # Windows，不支持:sh，只能直接绑定cmd
-    gonc -e "cmd.exe" -tls -psk mysecret123 server-ip 2222
+    gonc -e ":sh" -tls -psk mysecret123 server-ip 2222
     ```
 
 
@@ -242,7 +233,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
     ```bash
     # 监听 2222 端口，启用 TLS+PSK 加密, 启用-k(-keep-open)
-    gonc -e ":sh /bin/bash" -tls -psk mysecret123 -k -l 2222
+    gonc -e ":sh" -tls -psk mysecret123 -k -l 2222
     ```
 
 === "客户端 (连接)"

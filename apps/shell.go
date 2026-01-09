@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
+	"sync"
 
 	"github.com/threatexpert/gonc/v2/misc"
 )
@@ -30,9 +32,28 @@ type PtyShellConfig struct {
 
 // PtyShellConfigByArgs 从命令行参数构造 config
 func PtyShellConfigByArgs(logWriter io.Writer, args []string) (*PtyShellConfig, error) {
+	// 👇 根据操作系统决定默认 Shell
+	var defaultShell []string
+	if runtime.GOOS == "windows" {
+		// Windows 下通常用 COMSPEC 环境变量，它指向 cmd.exe 的绝对路径
+		// 如果找不到环境变量，回退到 "cmd.exe"
+		cmdPath := os.Getenv("COMSPEC")
+		if cmdPath == "" {
+			cmdPath = "cmd.exe"
+		}
+		defaultShell = []string{cmdPath}
+	} else {
+		// Linux/Mac 下尝试获取 SHELL 环境变量（比如 /bin/zsh）
+		// 如果找不到，回退到 "/bin/sh"
+		shPath := os.Getenv("SHELL")
+		if shPath == "" {
+			shPath = "/bin/sh"
+		}
+		defaultShell = []string{shPath}
+	}
 	config := &PtyShellConfig{
 		Logger: misc.NewLog(logWriter, "[:sh] ", log.LstdFlags|log.Lmsgprefix),
-		Args:   []string{"/bin/sh"},
+		Args:   defaultShell,
 	}
 
 	fs := flag.NewFlagSet("PtyShellConfig", flag.ContinueOnError)
@@ -71,30 +92,37 @@ func PtyShell_usage_flagSet(fs *flag.FlagSet) {
 func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	defer conn.Close()
 
+	config.Logger.Printf("Starting shell: %v for %s\n", config.Args, conn.RemoteAddr())
+
+	var proc misc.PtyProcess
 	var input io.ReadCloser
 	var output io.WriteCloser
 
-	cmd := exec.Command(config.Args[0], config.Args[1:]...)
-
 	if config.EnablePty {
-		ptmx, err := misc.PtyStart(cmd)
+		cmd, ptmx, err := misc.PtyStart(config.Args[0], config.Args[1:]...)
 		if err != nil {
-			config.Logger.Printf("Failed to start pty: %v\n", err)
+			conn.Write([]byte(fmt.Sprintf("Failed to start pty: %v\n", err)))
 			return
 		}
+		proc = cmd
 		input = ptmx
 		output = ptmx
 	} else {
+		cmd := exec.Command(config.Args[0], config.Args[1:]...)
 		// 创建管道
 		stdinPipe, err := cmd.StdinPipe()
 		if err != nil {
-			config.Logger.Printf("Error creating stdin pipe: %v\n", err)
+			conn.Write([]byte(fmt.Sprintf("Error creating stdin pipe: %v\n", err)))
 			return
 		}
 
 		stdoutPipe, err := cmd.StdoutPipe()
 		if err != nil {
-			config.Logger.Printf("Error creating stdout pipe: %v\n", err)
+			conn.Write([]byte(fmt.Sprintf("Error creating stdout pipe: %v\n", err)))
+			stdinPipe.Close()
+			if pr, ok := cmd.Stdin.(*os.File); ok {
+				pr.Close()
+			}
 			return
 		}
 
@@ -104,31 +132,44 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 			cmd.Stderr = os.Stderr
 		}
 
+		proc = &misc.StdProcess{Cmd: cmd}
 		input = stdoutPipe
 		output = stdinPipe
 
 		// 启动命令
 		if err := cmd.Start(); err != nil {
-			config.Logger.Printf("Command start error: %v\n", err)
+			// 不处理关闭pipe，cmd.Start失败时，Start里面会closeDescriptors把创建的pipe关闭
+			conn.Write([]byte(fmt.Sprintf("Command start error: %v\n", err)))
 			return
 		}
 	}
 
-	done := make(chan struct{})
+	done := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	wg.Add(3)
+
 	go func() {
+		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		io.Copy(output, conn)
-		output.Close()
-		close(done)
+	}()
+	go func() {
+		defer wg.Done()
+		defer func() { done <- struct{}{} }()
+		io.Copy(conn, input)
+	}()
+	go func() {
+		defer wg.Done()
+		defer func() { done <- struct{}{} }()
+		proc.Wait()
 	}()
 
-	io.Copy(conn, input)
-	conn.Close()
-
-	if cmd != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-	}
-
 	<-done
-	//config.Logger.Printf("App_shell_main_withconfig done\n")
+	conn.Close()
+	input.Close()
+
+	_ = proc.Kill()
+	_ = proc.Wait()
+	wg.Wait()
+	config.Logger.Printf("Shell session(%s) ended.\n", conn.RemoteAddr())
 }

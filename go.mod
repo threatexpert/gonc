@@ -10,6 +10,7 @@ require (
 	github.com/pion/dtls/v3 v3.0.9
 	github.com/pion/stun/v3 v3.0.2
 	github.com/pkg/errors v0.9.1
+	github.com/threatexpert/go-winpty v1.0.3
 	github.com/xtaci/kcp-go/v5 v5.6.60
 	github.com/xtaci/smux v1.5.50
 	golang.org/x/crypto v0.46.0

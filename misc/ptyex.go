@@ -6,6 +6,7 @@ package misc
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"syscall"
@@ -13,7 +14,8 @@ import (
 	"github.com/creack/pty"
 )
 
-func PtyStart(c *exec.Cmd) (*os.File, error) {
+func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, error) {
+	c := exec.Command(name, args...)
 
 	if c.SysProcAttr == nil {
 		c.SysProcAttr = &syscall.SysProcAttr{}
@@ -26,7 +28,7 @@ func PtyStart(c *exec.Cmd) (*os.File, error) {
 	if err != nil {
 		pty, tty, err2 = fallbackPtyOpen()
 		if err2 != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -44,10 +46,10 @@ func PtyStart(c *exec.Cmd) (*os.File, error) {
 
 	if err = c.Start(); err != nil {
 		_ = pty.Close() // Best effort.
-		return nil, err
+		return nil, nil, err
 	}
 
-	return pty, nil
+	return &StdProcess{Cmd: c}, pty, nil
 }
 
 // fallbackPtyOpen tries to find an available legacy /dev/ptyXY pseudoterminal
