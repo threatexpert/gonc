@@ -3,8 +3,14 @@ setlocal
 
 REM === Use Win7-compatible Go toolchain ===
 REM https://github.com/XTLS/go-win7/releases/download/patched-1.24.4/go-for-win7-windows-amd64.zip
-set "GOROOT=C:\go\go-1.24.3-win7"
+set "GOROOT=C:\go\go-1.24.4-win7"
 set "PATH=%GOROOT%\bin;%PATH%"
+
+REM === Validate GOROOT ===
+if not exist "%GOROOT%\bin\go.exe" (
+    echo ERROR: Go toolchain not found at "%GOROOT%"
+    exit /b 1
+)
 
 REM Verify Go toolchain
 go version

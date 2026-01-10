@@ -123,22 +123,24 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 	bidirectionalCopy(conn, targetConn)
 }
 
-func IsValidABC0IP(ipStr string) bool {
+func IsValidABC0IP(ipStr string) (bool, string) {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
-		return false
+		return false, ""
 	}
 
 	ip = ip.To4()
 	if ip == nil {
-		return false
+		return false, ""
 	}
 
-	// 检查最后一个字节是否为 0
+	// Check if the last octet is 0
 	if ip[3] != 0 {
-		return false
+		return false, ""
 	}
-	return true
+
+	abc := fmt.Sprintf("%d.%d.%d", ip[0], ip[1], ip[2])
+	return true, abc
 }
 
 func ExtractBCDFrom127(ipStr string) (b int, cd int, err error) {
@@ -172,9 +174,8 @@ func DNSLookupMagicIP(ipToken string, allowPublicIP bool) (string, int, error) {
 	}
 	b := parsed.To4()
 
-	donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
+	donotUsePublicMagicDNS, targetIpPref := IsValidABC0IP(MagicDNServer)
 	if donotUsePublicMagicDNS {
-		targetIpPref := strings.TrimRight(MagicDNServer, ".0")
 		targetIpD, targetPort, err := ExtractBCDFrom127(ipToken)
 		if err != nil {
 			return "", 0, fmt.Errorf("invalid ipToken: %v", err)
