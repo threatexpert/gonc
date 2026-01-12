@@ -1,0 +1,296 @@
+## gonc 简介
+
+README in [English](./README.md) 、 [中文](./README_zh.md)
+
+`gonc` 是一个基于 Golang 的 `netcat` 工具，旨在更方便地建立点对点通信。其主要特点包括：
+
+- 🔁 **自动化内网穿透**：零配置，双方仅需约定一个口令，使用参数`-p2p`既可自动发现彼此网络地址和穿透内网建立点对点连接，使用公共 STUN 和 MQTT 服务交换地址信息。
+
+- 🔒 **端到端双向认证的加密**：支持 TCP 的 TLS 和 UDP 的 DTLS 加密传输，可基于口令双向身份认证。
+
+- 🧩 **灵活的服务配置**：通过参数 `-e` 可灵活的设置为每个连接提供服务的应用程序，例如-e /bin/sh可提供远程cmdshell，还可以使用内置的虚拟命令便捷的使用socks5服务、http文件服务和流量转发功能。
+
+---
+
+[最新版本下载](https://www.gonc.cc/)
+
+[详细文档](https://www.gonc.cc/docs/)
+
+---
+
+## 使用示例
+
+### 基本用法
+- 可像 `nc` 一样使用：
+    ```bash
+    gonc www.baidu.com 80
+    gonc -tls www.baidu.com 443
+    gonc -l 4444  #监听模式
+    ```
+
+    nc只能根据IP和端口建立点对点的连接
+
+- 现在，还可以基于约定口令，建立点对点连接了，还能自动化内网穿透。
+
+    下图是gonc在家庭宽带（困难型NAT）环境和对端为手机移动网络（对称型NAT）之间建立P2P连接的过程。由于两边都有IPv6，因此两边都使用了-4强制使用IPv4来演示NAT打洞。
+
+    ![hole-punching](./hole-punching.gif)
+
+
+### P2P 传输文件的例子
+- 双方约定一个相同的口令，然后发送文件的一端，执行下面命令启动 HTTP 文件服务器，-httpserver参数后支持多个参数描述要发送的文件路径，可以是文件或目录：
+    ```bash
+    gonc -p2p <口令> -httpserver c:/RootDir1 c:/RootDir2
+    ```
+- 要下载文件的另一端有2种方式：
+    
+    1、自动下载完整目录，执行下面命令后，会递归下载所有文件到本地，中断重新执行会自动断点续传：
+    ```bash
+    gonc -p2p <口令> -download c:/SavePath
+    ```
+
+    2、这种不会自动开始下载，需手动打开浏览器访问 http://127.0.0.1:9999 浏览对端的文件列表和针对性下载文件
+    ```bash
+    gonc -p2p <口令> -httplocal-port 9999
+    ```
+
+    这时如果需要下载某个子目录，浏览器就不方便了，但可以这样再运行一个gonc命令：
+    
+
+    ```bash
+    gonc -http-download c:/SavePath http://127.0.0.1:9999/subdir
+    ```
+
+### 玩转 P2P 通信
+- 双方约定一个相同的口令，然后双方都执行下面命令：
+    ```bash
+    gonc -p2p <口令>
+    ```
+
+    双方就能基于口令发现彼此的网络地址，内网穿透 NAT ，双向认证和加密通讯。双方都用口令派生证书，基于 TLS 1.3 保证安全通信。（口令相当于证书私钥，建议使用 `gonc -psk .` 随机生成高强度的口令）
+
+    注意这条命令在两端的运行时差不能太久（30秒以内），否则错过NAT打洞时机会失败退出。因此还支持基于MQTT消息订阅的等待机制，使用-mqtt-wait和-mqtt-hello来同步双方开始P2P的时机。例如，下面用了-mqtt-wait可以持续等待，
+
+    ```bash
+    gonc -p2p <口令> -mqtt-wait
+    ```
+    另一端使用：
+    ```bash
+    gonc -p2p <口令> -mqtt-hello
+    ```
+
+    以上这样建立的裸连接，也只是可以互相打字发消息哦。如果你是懂nc的，现在要p2p传输数据的话，例如发送文件的命令应该类似是这样：
+
+    ```bash
+    cat 文件路径 | gonc -p2p 口令 -mqtt-wait    #linux风格
+    
+    或
+
+    gonc -p2p 口令 -mqtt-wait -send 文件路径    #用-send参数，兼容linux和windows
+    ```
+
+    另一端使用：
+
+    ```bash
+    gonc -p2p 口令 -mqtt-hello > 保存文件名
+    ```
+- 检查你的NAT类型
+
+    ```bash
+    gonc -nat-checker
+    ```
+
+    这会检查你的ipv6和ipv4的tcp和udp的NAT地址，并且研判端口经过NAT后的变化，如果没有列出tcp6或udp6的地址说明你没有ipv6。每行协议地址最后如果是(easy)，则表示该协议打洞成功率最高，(hard)则表示较为困难，(symm)类型是最难的，symm必须依赖对端是easy或hard才有可能P2P。
+
+
+### 反弹 Shell（类UNIX支持pseudo-terminal shell ）
+- 监听端（不使用 `-keep-open`，仅接受一次连接；未使用 `-psk`，无身份认证）：
+    ```bash
+    gonc -tls -exec ":sh /bin/bash" -l 1234
+    ```
+- 另一端连接获取 Shell（支持 TAB、Ctrl+C 等操作）：
+    ```bash
+    gonc -tls -pty x.x.x.x 1234
+    ```
+- 使用 P2P 方式反弹 Shell（`<口令>` 用于身份认证，基于 TLS 1.3 实现安全通信）：
+    ```bash
+    gonc -exec ":sh /bin/bash" -p2p <口令>
+    ```
+    另一端：
+    ```bash
+    gonc -pty -p2p <口令>
+    ```
+
+### 传输速度测试
+- 发送数据并统计传输速度（内置 `/dev/zero` 和 `/dev/urandom`）：
+    ```bash
+    gonc.exe -send /dev/zero -P x.x.x.x 1234
+    ```
+    输出示例：
+    ```
+    IN: 76.8 MiB (80543744 bytes), 3.3 MiB/s | OUT: 0.0 B (0 bytes), 0.0 B/s | 00:00:23
+    ```
+    另一端接收：
+    ```bash
+    gonc -P -l 1234 > NUL
+    ```
+
+### P2P 隧道与 Socks5/HTTP 代理
+- 等待建立隧道：
+    ```bash
+    gonc -p2p <口令> -linkagent
+    ```
+- 另一端将在本机监听端口3080提供socks5/HTTP代理服务访问远程：
+    ```bash
+    # link可开启远程代理反向访问，none则表示远程不监听端口
+    gonc -p2p <口令> -link "3080;none"
+    ```
+
+    使用透明代理特性：接下来例如你想连接远程网络的10.0.0.1:3389，你可以直接在本地远程桌面客户端填要连接的地址为：
+    
+    ```
+    10.0.0.1-3389.gonc.cc:3080
+    ```
+
+    该域名会被解析为类似127.b.c.d的IP，因此远程桌面客户端会连入本地的socks5代理端口3080，然后gonc根据连接一端的127.b.c.d地址去反解析出域名中的10.0.0.1-3389这个信息。
+
+- link的配置格式
+    ```bash
+    # 这表示基于建立的隧道，在本地和远程都监听1080代理端口，支持HTTP或SOCKS5协议互相访问，且端口支持透明代理特性
+    gonc -p2p <口令> -link "1080;1080"
+    
+    # 下面是URL格式的配置方式，-link的参数值要引号包起来，否则解析容易出问题
+    # 左边 x://0.0.0.0:1080?tproxy=1 和仅写1080等效，右边写法表示远程也要开启1080端口，但没启用透明代理特性
+    gonc -p2p <口令> -link "x://0.0.0.0:1080?tproxy=1;x://127.0.0.1:1080"
+    
+    # 左边的 f://127.0.0.1:1080?to=1.2.3.4:80 表示本地监听1080端口，并转发到远程去访问1.2.3.4:80；右边none表示远程不开端口
+    gonc -p2p <口令> -link "f://127.0.0.1:1080?to=1.2.3.4:80;none"
+
+    # 右边的 f://0.0.0.0:80?to=127.0.0.1:80 的描述方式表示远程监听80端口，转发到本地去访问127.0.0.1:80
+    gonc -p2p <口令> -link "none;f://0.0.0.0:80?to=127.0.0.1:80"
+
+    # 左边是代理协议+tls加密，可配置证书，右边通过outbound_bind指定出口IP（适用多IP环境）
+    gonc -p2p <口令> -link "x+tls://user:pass@0.0.0.0:1080?cert=ca.pem&key=key.pem;none?outbound_bind=10.0.0.5"
+
+    ```
+
+### 灵活服务配置
+- -exec可灵活的设置为每个连接提供服务的应用程序，除了指定/bin/bash这种提供shell命令的方式，也可以用来端口转发流量，不过下面这种每个连接进来就会开启一个新的gonc进程：
+    ```bash
+    gonc -keep-open -exec "gonc -tls www.baidu.com 443" -l 8000
+    ```
+- 避免大量子进程，使用内置命令方式调用nc模块：
+    ```bash
+    gonc -keep-open -exec ":nc -tls www.baidu.com 443" -l 8000
+    ```
+
+### Socks5 代理服务
+- 配置客户端模式：
+    ```bash
+    gonc -x s.s.s.s:port x.x.x.x 1234
+    ```
+- 内置 Socks5 服务端，使用-e :s5s提供socks5标准服务，支持-auth设置一个socks5的账号密码，用-keep-open可提供持续接受客户端连入socks5服务器，受益于golang的协程，可以获得不错的多客户端并发性能：
+    ```bash
+    gonc -e ":s5s -auth user:passwd" -keep-open -l 1080
+    ```
+- 使用高安全性 Socks5 over TLS，由于标准socks5是不加密的，我们可使用[`-e :s5s`](#)，结合[`-tls`](#)和[`-psk`](#)定制高安全性的socks5 over tls通讯，使用[`-P`](#)统计连接传输信息，还可以使用[`-acl`](#)对接入和代理目的地实现访问控制。acl.txt文件格式详见[acl-example.txt](./acl-example.txt)。
+
+    `gonc.exe -tls -psk randomString -e :s5s -keep-open -acl acl.txt -P -l 1080`
+
+     另一端使用:nc把socks5 over tls转为标准socks5，在本地127.0.0.1:3080提供本地客户端接入
+
+    `gonc.exe -e ":nc -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+
+### 多服务监听模式
+- 参考SSH的22端口，既可提供shell也提供sftp和端口转发功能，gonc使用 -e ":service" 也可监听在一个服务端口，基于tls+psk安全认证提供shell、socks5(支持CONNECNT+BIND)和文件服务。（请务必使用gonc -psk .生成高熵PSK替换randomString）
+
+    `gonc -k -l -local :2222 -tls -psk randomString -e ":service" -:sh "/bin/bash" -:s5s "-c -b" -:mux "httpserver /"`
+
+    另一端使用获得shell
+
+    `gonc -tls -psk randomString -remote <server-ip>:2222 -call :sh -pty`
+
+    另一端把socks5 over tls转为本地标准socks5端口1080
+
+    `gonc -e ":nc -tls -psk randomString -call :s5s <server-ip> 2222" -k -P -l -local 127.0.0.1:1080`
+
+    另一端把文件服务为本地标准HTTP端口8000
+
+    `gonc -tls -psk randomString -remote <server-ip>:2222 -call :mux -httplocal-port 8000`
+
+
+### 给其他应用建立通道
+- 帮WireGuard打洞组VPN
+
+    在被动等待连接的PC-S运行下面的参数（直接拿节点公钥来当口令，接口的监听端口51820）：
+
+    `gonc -p2p PS-S的公钥 -mqtt-wait -u -k -e ":nc -u 127.0.0.1 51820"`
+
+    其他发起主动连接的PC-C，设置WireGuard节点PS-S公钥的Endpoint = 127.0.0.1:51821，接口的监听端口51820，gonc运行下面的参数，-k可以让gonc在网络异常后自动重新建立连接。
+
+    `gonc -p2p PS-S的公钥 -mqtt-hello -u -k -e ":nc -u -local 127.0.0.1:51821 127.0.0.1 51820"`
+
+
+## P2P NAT 穿透能力
+
+### gonc如何建立P2P？
+
+ - 并发使用多个公用 STUN 服务，探测本地的 TCP / UDP NAT 映射，并智能识别 NAT 类型
+ - 通过基于口令(SessionKey)派生的哈希作为 MQTT 共享话题，借助公用 MQTT 服务安全交换地址信息
+ - 按优先级顺序尝试直连：IPv6 TCP > IPv4 TCP > IPv4 UDP，尽可能实现真正的点对点通信
+ - 没有设立中转服务器，不提供备用转发模式：要么连接失败，要么成功就是真的P2P
+
+### 如何部署中转服务器适应实在无法P2P的条件？
+
+ - 一个公网IP上支持UDP ASSOCIATE的Socks5服务器就可以，也可以用自己的VPS，运行gonc本身的socks5代理服务器便可让其成为中转服务器。
+
+    下面命令启动了仅支持UDP转发功能的socks5代理，-psk和-tls开启了加密和PSK口令认证。注意防火墙不能只开放1080，因为每次提供转发的UDP端口是随机。
+
+    `gonc -e ":s5s -u -c=0" -psk 口令 -tls -k -l 1080`
+
+ - P2P遇到困难的时候，只需要有一端的gonc使用-x参数再进行P2P就可以。你也可以把-x换为-x2，这样就是先P2P，失败了再尝试用中转
+
+    `gonc -p2p randomString -x "-psk 口令 -tls <socks5server-ip>:1080"`
+
+ - 下面例子是使用标准的socks5代理服务器（需服务器支持UDP）。
+
+    `gonc -p2p randomString -x "<socks5server-ip>:1080" -auth "user:password"`
+
+
+例如原本两端都是对称型NAT，无法P2P，现在一端使用了socks5代理（UDP模式），就相当于转为容易型的NAT了，于是就能很容易和其他建立连接，数据加密仍然是端到端的。
+
+
+### 内置的公用服务器（STUN和MQTT）：
+
+		"tcp://turn.cloudflare.com:80",
+		"udp://turn.cloudflare.com:53",
+		"udp://stun.l.google.com:19302",
+		"udp://stun.miwifi.com:3478",
+		"global.turn.twilio.com:3478",
+		"stun.nextcloud.com:443",
+
+ 		"tcp://broker.hivemq.com:1883",
+		"tcp://broker.emqx.io:1883",
+		"tcp://test.mosquitto.org:1883",
+
+
+### gonc的NAT穿透成功率如何？
+
+#### 除了两端都是对称类型的情况，其他都有非常高的成功率
+
+gonc将NAT类型分为3种：
+
+当固定一个内网端口去访问多个STUN服务器，根据多个STUN服务器反馈的地址研判：
+
+ 1. 容易型：NAT端口与内网端口都是保持不变的
+ 2. 困难型：NAT端口都变为另一个共同的端口号，相对1困难。
+ 3. 对称型：NAT端口每个都不一样，算是最困难的类型
+
+针对这些类型，gonc采用了如下一些NAT穿透策略：
+ - 使用多个STUN服务器(涵盖国内外和TCP/UDP协议)检测NAT地址并研判NAT类型，以及发现多IP出口的网络环境
+ - 双方都有ipv6地址时优先使用ipv6地址建立直连
+ - 有一端是容易型的才建立TCP P2P，因为与STUN服务器的TCP一旦断开容易影响这个洞，而确定是容易型后可以直接约定新的端口号，并避开使用与STUN服务器连接的源端口
+ - TCP两端都处于监听状态，复用端口，并相互dial对方建立直连
+ - 相对容易的一端延迟UDP发包，避免触发困难端的洞（端口号）变更
+ - 相对困难的一端使用小TTL值UDP包，降低触发对端的洞的防火墙策略
+ - 使用生日悖论，当简单策略无法打通时，相对困难的一端使用600个随机源端口，与另一端使用600个随机目的端口进行碰撞。
