@@ -238,16 +238,18 @@ For example, if both peers are behind symmetric NATs and P2P fails, having just 
 
 ### Used public servers（STUN & MQTT）：
 
-		"tcp://turn.cloudflare.com:80",
-		"udp://turn.cloudflare.com:53",
-		"udp://stun.l.google.com:19302",
-		"udp://stun.miwifi.com:3478",
-		"global.turn.twilio.com:3478",
-		"stun.nextcloud.com:443",
+    "tcp://turn.cloudflare.com:80",
+    "udp://turn.cloudflare.com:53",
+    "udp://stun.l.google.com:19302",
+    "udp://stun.miwifi.com:3478",
+    "global.turn.twilio.com:3478",
+    "stun.nextcloud.com:443",
 
- 		"tcp://broker.hivemq.com:1883",
-		"tcp://broker.emqx.io:1883",
-		"tcp://test.mosquitto.org:1883",
+    "tcp://broker.hivemq.com:1883",
+    "tcp://broker.emqx.io:1883",
+    "tcp://test.mosquitto.org:1883",
+    "tcp://mqtt.gonc.cc:1883"
+    
 
 ### How effective is gonc at NAT traversal?
 

@@ -262,16 +262,17 @@ README in [English](./README.md) 、 [中文](./README_zh.md)
 
 ### 内置的公用服务器（STUN和MQTT）：
 
-		"tcp://turn.cloudflare.com:80",
-		"udp://turn.cloudflare.com:53",
-		"udp://stun.l.google.com:19302",
-		"udp://stun.miwifi.com:3478",
-		"global.turn.twilio.com:3478",
-		"stun.nextcloud.com:443",
+    "tcp://turn.cloudflare.com:80",
+    "udp://turn.cloudflare.com:53",
+    "udp://stun.l.google.com:19302",
+    "udp://stun.miwifi.com:3478",
+    "global.turn.twilio.com:3478",
+    "stun.nextcloud.com:443",
 
- 		"tcp://broker.hivemq.com:1883",
-		"tcp://broker.emqx.io:1883",
-		"tcp://test.mosquitto.org:1883",
+    "tcp://broker.hivemq.com:1883",
+    "tcp://broker.emqx.io:1883",
+    "tcp://test.mosquitto.org:1883",
+    "tcp://mqtt.gonc.cc:1883"
 
 
 ### gonc的NAT穿透成功率如何？
