@@ -313,7 +313,7 @@ func ACL_inbound_allow(acl *ACL, remoteAddr net.Addr) bool {
 	return false
 }
 
-func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, address string) (net.Addr, bool, error) {
+func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, localIP, address string) (net.Addr, bool, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid address format: %w", err)
@@ -354,9 +354,17 @@ func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, address string) 
 			return nil, false, fmt.Errorf("no IP address found for host '%s' on network '%s'", host, ipNetwork)
 		}
 
+		var localAddr *net.UDPAddr
+		if localIP != "" {
+			localAddr, err = net.ResolveUDPAddr("udp", net.JoinHostPort(localIP, "0"))
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to resolve local bind address '%s': %w", localIP, err)
+			}
+		}
+
 		for _, ip := range ips {
 			//DialUDP到IP地址不会实际产生网络行为，但是可以判断这个IP对于本机是否“cannot assign requested address”
-			tmpConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: 53})
+			tmpConn, err := net.DialUDP("udp", localAddr, &net.UDPAddr{IP: ip, Port: 53})
 			if err == nil {
 				resolvedIP = ip
 				tmpConn.Close()

@@ -915,7 +915,7 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddr)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
 			sendSocks5Response(clientConn, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0)
@@ -1199,7 +1199,7 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 		}
 		d.LocalAddr = localAddr
 	}
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddr)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
 			config.Logger.Printf("Access control denied for target %s", targetAddr)
@@ -1380,7 +1380,7 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				config.Logger.Printf("UDP: %s->%s (first outbound packet of session)", remoteLocalUDPConn.LocalAddr().String(), net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			})
 
-			targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
+			targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			if resolveErr != nil {
 				if isDenied {
 					config.Logger.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)

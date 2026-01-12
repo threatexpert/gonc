@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,17 +52,19 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 		return
 	}
 
+	reqTarget := net.JoinHostPort(req.Host, strconv.Itoa(req.Port))
+
 	conn.SetReadDeadline(time.Time{})
 
 	if req.Command == "CONNECT" && config.EnableConnect {
 		err = handleDirectTCPConnect(&s5config, conn, req.Host, req.Port)
 		if err != nil {
-			config.Logger.Printf("SOCKS5 TCP Connect failed for %s: %v", conn.RemoteAddr(), err)
+			config.Logger.Printf("SOCKS5 TCP Connect failed for %s->%s: %v", conn.RemoteAddr(), reqTarget, err)
 		}
 	} else if req.Command == "BIND" && config.EnableBind {
 		err = handleTCPListen(&s5config, conn, req.Host, req.Port)
 		if err != nil {
-			config.Logger.Printf("SOCKS5 TCP Listen failed for %s: %v", conn.RemoteAddr(), err)
+			config.Logger.Printf("SOCKS5 TCP Listen failed for %s->%s: %v", conn.RemoteAddr(), reqTarget, err)
 		}
 	} else if req.Command == "UDP" && config.EnableUDP {
 		fakeTunnelC, rawS := net.Pipe()
@@ -85,7 +88,7 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 		sendSocks5Response(conn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
 	}
 
-	config.Logger.Printf("Disconnected from client %s (requested SOCKS5 command: %s).", conn.RemoteAddr(), req.Command)
+	config.Logger.Printf("Disconnected from client %s (requested SOCKS5 command: %s->%s).", conn.RemoteAddr(), req.Command, reqTarget)
 }
 
 func handleHTTPProxy(conn *netx.BufferedConn, config *AppS5SConfig) error {
@@ -182,7 +185,7 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *App
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddrStr)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddrStr)
 	if err != nil {
 		if isDenied {
 			// 被 ACL 拒绝：返回 403 Forbidden
@@ -287,7 +290,7 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SCon
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", req.Host)
+	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, req.Host)
 	if err != nil {
 		if isDenied {
 			clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
