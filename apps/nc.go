@@ -334,9 +334,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		}
 	}
 	configureDNS(config)
-
-	config.connConfig = preinitNegotiationConfig(config)
 	swriter.Enable(config.verbose)
+	config.connConfig = preinitNegotiationConfig(config)
 	return config, nil
 }
 
