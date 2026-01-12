@@ -2331,6 +2331,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		info, err := os.Stdin.Stat()
 		if err == nil && info.Mode()&os.ModeCharDevice != 0 && !binaryInputMode {
 			if ncconfig.enablePty {
+				misc.EnableVirtualTerminal()
 				ncconfig.term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
 				if err != nil {
 					ncconfig.Logger.Printf("MakeRaw error: %v\n", err)

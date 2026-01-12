@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 
+	"golang.org/x/sys/windows"
+
 	pty "github.com/threatexpert/go-winpty"
 )
 
@@ -43,4 +45,20 @@ func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, erro
 	}
 
 	return &WinPtyProcess{cmd: cmd}, pt, nil
+}
+
+func EnableVirtualTerminal() {
+	stdout := windows.Handle(os.Stdout.Fd())
+
+	// Variable to store the original console mode
+	var originalMode uint32
+
+	// Get the current console mode
+	if err := windows.GetConsoleMode(stdout, &originalMode); err == nil {
+		if originalMode&windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+			return
+		}
+		// Set the new mode with ENABLE_VIRTUAL_TERMINAL_PROCESSING added
+		windows.SetConsoleMode(stdout, originalMode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+	}
 }

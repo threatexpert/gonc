@@ -88,3 +88,7 @@ func fallbackPtyOpen() (pty, tty *os.File, err error) {
 	}
 	return nil, nil, errors.New("no available /dev/ptyXY devices")
 }
+
+func EnableVirtualTerminal() {
+
+}
