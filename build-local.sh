@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+
 app=gonc
 
 go mod init "$app"
