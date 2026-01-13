@@ -197,6 +197,11 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *App
 		return fmt.Errorf("resolve address failed: %w", err)
 	}
 
+	resolvedAddrStr := resolvedAddr.String()
+	if resolvedAddrStr != targetAddrStr {
+		config.Logger.Printf("HTTP: %s->%s(%s) connecting...", clientConn.RemoteAddr().String(), targetAddrStr, resolvedAddrStr)
+	}
+
 	// 4. 定义自定义 Dialer (处理 Localbind)
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -221,7 +226,7 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *App
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// 注意：这里忽略传入的 addr，直接使用上面 ACL 解析后的 resolvedAddr.String()
 			// 这样既利用了 ACL 的解析结果，又防止了 DNS 重绑定攻击
-			return dialer.DialContext(ctx, network, resolvedAddr.String())
+			return dialer.DialContext(ctx, network, resolvedAddrStr)
 		},
 	}
 
