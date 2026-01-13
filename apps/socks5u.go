@@ -915,6 +915,12 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
+	config.Logger.Printf(
+		"TCP: %s->%s connecting...",
+		clientConn.RemoteAddr(),
+		targetAddr,
+	)
+
 	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
@@ -925,8 +931,19 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 		return err
 	}
 
-	config.Logger.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr(), targetAddr)
-	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddr.String())
+	resolvedAddrStr := resolvedAddr.String()
+
+	// 如果解析结果和原始目标不一样，说明发生了域名解析
+	if resolvedAddrStr != targetAddr {
+		config.Logger.Printf(
+			"TCP: %s->%s(%s) connecting...",
+			clientConn.RemoteAddr(),
+			targetAddr,
+			resolvedAddrStr,
+		)
+	}
+
+	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddrStr)
 	if err != nil {
 		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
 		return fmt.Errorf("tunnel TCP connect failed: %v", err)

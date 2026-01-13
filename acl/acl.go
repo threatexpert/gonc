@@ -363,6 +363,11 @@ func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, localIP, address
 		}
 
 		for _, ip := range ips {
+			// 在 Dial 之前，先静态判断协议族是否一致
+			// 如果用户指定了 localAddr，且协议族不匹配，直接跳过
+			if localAddr != nil && !isFamilyMatch(localAddr.IP, ip) {
+				continue
+			}
 			//DialUDP到IP地址不会实际产生网络行为，但是可以判断这个IP对于本机是否“cannot assign requested address”
 			tmpConn, err := net.DialUDP("udp", localAddr, &net.UDPAddr{IP: ip, Port: 53})
 			if err == nil {
@@ -397,4 +402,19 @@ func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, localIP, address
 	default:
 		return nil, false, net.UnknownNetworkError(network)
 	}
+}
+
+// 辅助函数：判断两个 IP 是否协议族匹配
+func isFamilyMatch(ip1, ip2 net.IP) bool {
+	// 如果任意一个为空，假设不限制或者是 nil
+	// 这里假设 localAddr 如果不为 nil 则必须匹配
+	if len(ip1) == 0 || len(ip2) == 0 {
+		return true
+	}
+
+	// To4() 返回非 nil 表示是 IPv4
+	v4_1 := ip1.To4() != nil
+	v4_2 := ip2.To4() != nil
+
+	return v4_1 == v4_2
 }

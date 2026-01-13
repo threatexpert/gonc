@@ -300,7 +300,13 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SCon
 		return err
 	}
 
-	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddr.String())
+	resolvedAddrStr := resolvedAddr.String()
+
+	if resolvedAddrStr != req.Host {
+		config.Logger.Printf("HTTP-CONNECT: %s->%s(%s) connecting...", clientConn.RemoteAddr().String(), req.Host, resolvedAddrStr)
+	}
+
+	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddrStr)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return err
