@@ -91,19 +91,29 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 	config.Logger.Printf("Disconnected from client %s (requested SOCKS5 command: %s->%s).", conn.RemoteAddr(), req.Command, reqTarget)
 }
 
-func handleHTTPProxy(conn *netx.BufferedConn, config *AppS5SConfig) error {
+func handleHTTPProxy(conn *netx.BufferedConn, config *AppS5SConfig) {
 	req, err := handleHTTPProxyHandShake(conn, config.Username, config.Password)
 	if err != nil {
-		return err
+		config.Logger.Printf("HTTP proxy handshake failed for %s: %v", conn.RemoteAddr(), err)
+		return
 	}
 
 	if req.Method == http.MethodConnect {
 		// HTTPS 隧道：建立连接后必须保持长连接进行双向转发
-		return handleHTTPConnect(conn, req, config)
+		err = handleHTTPConnect(conn, req, config)
+		if err != nil {
+			config.Logger.Printf("HTTP CONNECT failed for %s->%s: %v", conn.RemoteAddr(), req.Host, err)
+			return
+		}
+		return
 	}
 
 	// 普通 HTTP
-	return handleHTTPForwardSimple(conn, req, config)
+	err = handleHTTPForwardSimple(conn, req, config)
+	if err != nil {
+		config.Logger.Printf("HTTP CONNECT failed for %s->%s: %v", conn.RemoteAddr(), req.Host, err)
+		return
+	}
 }
 
 func handleHTTPProxyHandShake(conn *netx.BufferedConn, username, password string) (*http.Request, error) {
