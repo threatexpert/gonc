@@ -313,94 +313,139 @@ func ACL_inbound_allow(acl *ACL, remoteAddr net.Addr) bool {
 	return false
 }
 
-func ResolveAddrWithACL(ctx context.Context, acl *ACL, network, localIP, address string) (net.Addr, bool, error) {
+// ResolveAddrWithACL 解析地址，根据 localIPs 的优先级选择最佳的本地和远程地址对
+// localIPs: 本地 IP 列表，索引越小优先级越高
+// 返回: (本地地址, 远程地址, 是否被ACL拒绝, 错误)
+func ResolveAddrWithACL(ctx context.Context, acl *ACL, network string, localIPs []string, address string) (net.Addr, net.Addr, bool, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, false, fmt.Errorf("invalid address format: %w", err)
+		return nil, nil, false, fmt.Errorf("invalid address format: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("invalid port: %w", err)
 	}
 
-	var resolvedIP net.IP
+	// 1. 获取候选的远程 IP 列表 (remoteCandidates)
+	var remoteCandidates []net.IP
 
-	// 尝试直接将主机部分解析为 IP 地址
+	// 尝试直接解析为 IP
 	ip := net.ParseIP(host)
 	if ip != nil {
-		// 如果主机本身就是 IP，直接使用
-		resolvedIP = ip
+		remoteCandidates = []net.IP{ip}
 	} else {
-		// 如果不是 IP，则它是一个域名。
-
-		// 阶段一：检查域名本身是否在拒绝列表中
+		// 这是一个域名，执行 ACL 域名检查
 		if acl != nil && acl.ShouldDeny(host, "outbound") {
-			return nil, true, fmt.Errorf("ACL rule denied access to domain: %s", host)
+			return nil, nil, true, fmt.Errorf("ACL rule denied access to domain: %s", host)
 		}
 
-		// 阶段二：执行 DNS 查询
-		// 将 "tcp" 或 "udp" 相关的 network 类型映射为 "ip" 相关的类型
+		// 确定 DNS 查询的网络类型
 		var ipNetwork string
 		switch network {
 		case "tcp4", "udp4":
 			ipNetwork = "ip4"
 		case "tcp6", "udp6":
 			ipNetwork = "ip6"
-		default: // "tcp", "udp", and others fall back to "ip"
+		default:
 			ipNetwork = "ip"
 		}
 
+		// DNS 查询
 		ips, err := net.DefaultResolver.LookupIP(ctx, ipNetwork, host)
 		if err != nil {
-			return nil, false, fmt.Errorf("DNS lookup failed for '%s' on network '%s': %w", host, ipNetwork, err)
+			return nil, nil, false, fmt.Errorf("DNS lookup failed for '%s': %w", host, err)
 		}
 		if len(ips) == 0 {
-			return nil, false, fmt.Errorf("no IP address found for host '%s' on network '%s'", host, ipNetwork)
+			return nil, nil, false, fmt.Errorf("no IP address found for host '%s'", host)
 		}
+		remoteCandidates = ips
+	}
 
-		var localAddr *net.UDPAddr
-		if localIP != "" {
-			localAddr, err = net.ResolveUDPAddr("udp", net.JoinHostPort(localIP, "0"))
-			if err != nil {
-				return nil, false, fmt.Errorf("failed to resolve local bind address '%s': %w", localIP, err)
-			}
-		}
-
-		for _, ip := range ips {
-			// 在 Dial 之前，先静态判断协议族是否一致
-			// 如果用户指定了 localAddr，且协议族不匹配，直接跳过
-			if localAddr != nil && !isFamilyMatch(localAddr.IP, ip) {
+	// 2. 准备本地候选 IP 列表
+	// 如果调用者没有提供 localIPs，我们放入一个 nil 值，表示让系统自动选择本地地址
+	var localCandidates []*net.UDPAddr
+	if len(localIPs) > 0 {
+		for _, lIP := range localIPs {
+			if lIP == "" {
 				continue
 			}
-			//DialUDP到IP地址不会实际产生网络行为，但是可以判断这个IP对于本机是否“cannot assign requested address”
-			tmpConn, err := net.DialUDP("udp", localAddr, &net.UDPAddr{IP: ip, Port: 53})
+			resolvedLocal, err := net.ResolveUDPAddr("udp", net.JoinHostPort(lIP, "0"))
+			if err != nil {
+				return nil, nil, false, err
+			}
+			localCandidates = append(localCandidates, resolvedLocal)
+		}
+	}
+	// 如果没有有效的本地指定 IP，加入一个 nil，代表"任意本地地址"
+	if len(localCandidates) == 0 {
+		localCandidates = []*net.UDPAddr{nil}
+	}
+
+	var selectedLocalIP net.IP
+	var selectedRemoteIP net.IP
+	var denied bool
+
+	// 3. 双重循环匹配：外层 Local (高优)，内层 Remote
+	// 逻辑：必须优先使用优先级高的 localIP。
+	// 即使 Remote 有多个 IP，只要 Remote 的某个 IP 能配合当前的 Local IP 连通，就立即选中。
+	found := false
+
+MatchLoop:
+	for _, localAddr := range localCandidates {
+		for _, remoteIP := range remoteCandidates {
+			// 3.1 协议族检查
+			// 如果指定了 localAddr，必须保证协议族一致
+			if localAddr != nil && !isFamilyMatch(localAddr.IP, remoteIP) {
+				continue
+			}
+
+			// 3.2 IP 级 ACL 检查 (Lazy check)
+			// 在这里检查是为了如果高优 IP 被封禁，可以回退到下一个 IP
+			if acl != nil && acl.ShouldDeny(remoteIP.String(), "outbound") {
+				// 记录一下被拒绝，但继续尝试其他组合，
+				// 除非遍历完所有组合都失败，否则不立即返回 ACL 错误
+				denied = true
+				continue
+			}
+
+			// 3.3 路由/连通性探测 (使用 UDP Dial 探测)
+			// 这一步核心在于验证：内核是否允许从 localAddr 路由到 remoteIP
+			probeConn, err := net.DialUDP("udp", localAddr, &net.UDPAddr{IP: remoteIP, Port: port})
 			if err == nil {
-				resolvedIP = ip
-				tmpConn.Close()
-				break
+				// 成功匹配！
+				selectedRemoteIP = remoteIP
+				// 如果 localAddr 是 nil (未指定)，我们需要获取系统自动分配的 IP
+				if localAddr == nil {
+					// 通过 LocalAddr() 获取系统选定的出站 IP
+					if udpAddr, ok := probeConn.LocalAddr().(*net.UDPAddr); ok {
+						selectedLocalIP = udpAddr.IP
+					}
+				} else {
+					selectedLocalIP = localAddr.IP
+				}
+
+				probeConn.Close()
+				found = true
+				break MatchLoop
 			}
 		}
-		if resolvedIP == nil {
-			return nil, false, fmt.Errorf("no valid IP address found for host '%s' on network '%s'", host, ipNetwork)
+	}
+
+	if !found {
+		if denied {
+			return nil, nil, true, fmt.Errorf("ACL rule denied access to IP from %s", host)
+		} else {
+			return nil, nil, false, fmt.Errorf("no reachable IP address pair found for host '%s' with provided local IPs", host)
 		}
 	}
 
-	// 阶段三：对最终解析出的 IP 地址进行 ACL 规则检查
-	ipStr := resolvedIP.String()
-	if acl != nil && acl.ShouldDeny(ipStr, "outbound") {
-		return nil, true, fmt.Errorf("ACL rule denied access to IP: %s (from %s)", ipStr, host)
-	}
-
-	// 所有检查通过，将端口字符串转换为整数
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, false, fmt.Errorf("invalid port number '%s': %w", portStr, err)
-	}
-
-	// 根据网络类型，构建并返回最终的 net.Addr 对象
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		return &net.TCPAddr{IP: resolvedIP, Port: port}, false, nil
+		return &net.TCPAddr{IP: selectedLocalIP, Port: 0}, &net.TCPAddr{IP: selectedRemoteIP, Port: port}, false, nil
 	case "udp", "udp4", "udp6":
-		return &net.UDPAddr{IP: resolvedIP, Port: port}, false, nil
+		return &net.UDPAddr{IP: selectedLocalIP, Port: 0}, &net.UDPAddr{IP: selectedRemoteIP, Port: port}, false, nil
 	default:
-		return nil, false, net.UnknownNetworkError(network)
+		return nil, nil, false, net.UnknownNetworkError(network)
 	}
 }
 

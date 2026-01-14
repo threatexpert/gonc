@@ -121,17 +121,17 @@ google.com
 	for _, tt := range tests2 {
 		t.Run(tt.address+"_"+tt.direction, func(t *testing.T) {
 			addrStr := ""
-			addr, denied, err := ResolveAddrWithACL(t.Context(), acl, tt.network, "", tt.address)
-			if addr != nil {
-				addrStr = addr.String()
+			_, rAddr, denied, err := ResolveAddrWithACL(t.Context(), acl, tt.network, nil, tt.address)
+			if rAddr != nil {
+				addrStr = rAddr.String()
 			}
 			if denied != tt.expect {
 				t.Errorf("ResolveAddrWithACL(%q, %q) = %v(%s); want %v, err=%v", tt.address, tt.direction, denied, addrStr, tt.expect, err)
 			}
 			addrStr = ""
-			addr2, denied2, _ := ResolveAddrWithACL(t.Context(), nil, tt.network, "", tt.address)
-			if addr2 != nil {
-				addrStr = addr2.String()
+			_, rAddr2, denied2, _ := ResolveAddrWithACL(t.Context(), nil, tt.network, nil, tt.address)
+			if rAddr2 != nil {
+				addrStr = rAddr2.String()
 			}
 			if denied2 {
 				t.Errorf("ResolveAddrWithACL(%q, %q) = %v(%s); want %v", tt.address, tt.direction, denied2, addrStr, false)

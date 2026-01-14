@@ -985,7 +985,9 @@ func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, loc
 	s5config := Socks5uConfig{
 		Logger:     cfg.Logger,
 		AccessCtrl: cfg.AccessCtrl,
-		Localbind:  localbind,
+	}
+	if localbind != "" {
+		s5config.Localbind = strings.Split(localbind, ",")
 	}
 	for {
 		stream, err := listener.Accept()

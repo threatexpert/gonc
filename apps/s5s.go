@@ -21,7 +21,7 @@ type AppS5SConfig struct {
 	EnableConnect bool
 	EnableUDP     bool
 	EnableBind    bool
-	Localbind     string
+	Localbind     []string
 	ServerIP      string
 	AccessCtrl    *acl.ACL
 	EnableSocks5  bool
@@ -39,13 +39,14 @@ func AppS5SConfigByArgs(logWriter io.Writer, args []string) (*AppS5SConfig, erro
 	fs.SetOutput(logWriter)
 
 	var authString string // 用于接收 -auth 的值
+	var localBind string
 	fs.StringVar(&authString, "auth", "", "Username and password for SOCKS5 authentication (format: user:pass)")
 	fs.BoolVar(&config.EnableConnect, "c", true, "Allow SOCKS5 CONNECT command")
 	fs.BoolVar(&config.EnableBind, "b", false, "Allow SOCKS5 BIND command")
 	fs.BoolVar(&config.EnableUDP, "u", false, "Allow SOCKS5 UDP ASSOCIATE command")
 	fs.BoolVar(&config.EnableSocks5, "socks5", true, "Enable SOCKS5-PROXY")
 	fs.BoolVar(&config.EnableHTTP, "http", false, "Enable HTTP-PROXY")
-	fs.StringVar(&config.Localbind, "local", "", "Set local bind address for outbound connections (format: ip)")
+	fs.StringVar(&localBind, "local", "", "Set local bind address(es) for outbound connections, comma-separated (e.g. 10.0.0.12,2001:db8::1)")
 	fs.StringVar(&config.ServerIP, "server-ip", "", "BIND/UDP ASSOCIATE uses this as server IP (format: ip)")
 
 	// 设置自定义的 Usage 函数
@@ -62,6 +63,17 @@ func AppS5SConfigByArgs(logWriter io.Writer, args []string) (*AppS5SConfig, erro
 	// 检查是否有未解析的（非标志）参数
 	if len(fs.Args()) > 0 {
 		return nil, fmt.Errorf("unknown positional arguments: %v", fs.Args())
+	}
+
+	if localBind != "" {
+		parts := strings.Split(localBind, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			config.Localbind = append(config.Localbind, p)
+		}
 	}
 
 	// 如果 -auth 标志被提供

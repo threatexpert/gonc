@@ -73,7 +73,7 @@ type Socks5uConfig struct {
 	Username   string
 	Password   string
 	ServerIP   string
-	Localbind  string
+	Localbind  []string
 	AccessCtrl *acl.ACL
 }
 
@@ -905,13 +905,7 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	dialer := &net.Dialer{}
-	if config.Localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
-		if err != nil {
-			return err
-		}
-		dialer.LocalAddr = localAddr
-	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
@@ -921,7 +915,7 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 		targetAddr,
 	)
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
+	lResolveAddr, rResolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
 			sendSocks5Response(clientConn, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0)
@@ -931,7 +925,8 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 		return err
 	}
 
-	resolvedAddrStr := resolvedAddr.String()
+	dialer.LocalAddr = lResolveAddr
+	resolvedAddrStr := rResolvedAddr.String()
 
 	// 如果解析结果和原始目标不一样，说明发生了域名解析
 	if resolvedAddrStr != targetAddr {
@@ -1207,16 +1202,7 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if config.Localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
-		if err != nil {
-			config.Logger.Printf("Failed to ResolveTCPAddr: %v", err)
-			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: %v\n", err)))
-			return
-		}
-		d.LocalAddr = localAddr
-	}
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
+	lresolvedAddr, rResolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
 			config.Logger.Printf("Access control denied for target %s", targetAddr)
@@ -1227,7 +1213,9 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 		return
 	}
 
-	targetConn, err := d.Dial("tcp", resolvedAddr.String())
+	d.LocalAddr = lresolvedAddr
+
+	targetConn, err := d.Dial("tcp", rResolvedAddr.String())
 	if err != nil {
 		config.Logger.Printf("Failed to connect to target %s: %v", targetAddr, err)
 		// 向流写入错误响应
@@ -1257,10 +1245,14 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 	// 远端创建一个通用的 UDP socket，用于向任意目标发送和接收 UDP 包
 	// 绑定到 0.0.0.0:0，让操作系统选择一个可用端口
-	localAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(config.Localbind, "0"))
-	if err != nil {
-		tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to ResolveUDPAddr: %v\n", err)))
-		return
+	var localAddr *net.UDPAddr
+	if len(config.Localbind) > 0 {
+		lAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(config.Localbind[0], "0"))
+		if err != nil {
+			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to ResolveUDPAddr: %v\n", err)))
+			return
+		}
+		localAddr = lAddr
 	}
 
 	remoteLocalUDPConn, err := net.ListenUDP("udp", localAddr)
@@ -1397,7 +1389,7 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				config.Logger.Printf("UDP: %s->%s (first outbound packet of session)", remoteLocalUDPConn.LocalAddr().String(), net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			})
 
-			targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
+			_, targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			if resolveErr != nil {
 				if isDenied {
 					config.Logger.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)

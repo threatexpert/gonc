@@ -195,7 +195,7 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *App
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddrStr)
+	lResolveAddr, rResolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddrStr)
 	if err != nil {
 		if isDenied {
 			// 被 ACL 拒绝：返回 403 Forbidden
@@ -207,7 +207,7 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *App
 		return fmt.Errorf("resolve address failed: %w", err)
 	}
 
-	resolvedAddrStr := resolvedAddr.String()
+	resolvedAddrStr := rResolvedAddr.String()
 	if resolvedAddrStr != targetAddrStr {
 		config.Logger.Printf("HTTP: %s->%s(%s) connecting...", clientConn.RemoteAddr().String(), targetAddrStr, resolvedAddrStr)
 	}
@@ -216,15 +216,7 @@ func handleHTTPForwardSimple(clientConn net.Conn, req *http.Request, config *App
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}
-	// 如果配置了本地出口 IP，进行绑定
-	if config.Localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
-		if err != nil {
-			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-			return fmt.Errorf("resolve local bind address failed: %w", err)
-		}
-		dialer.LocalAddr = localAddr
+		LocalAddr: lResolveAddr,
 	}
 
 	// 5. 定义自定义 Transport
@@ -294,18 +286,10 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SCon
 	defer config.Logger.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
 
 	dialer := &net.Dialer{}
-	if config.Localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
-		if err != nil {
-			return err
-		}
-		dialer.LocalAddr = localAddr
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, req.Host)
+	lResolvedAddr, rResolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, req.Host)
 	if err != nil {
 		if isDenied {
 			clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
@@ -314,8 +298,8 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SCon
 		}
 		return err
 	}
-
-	resolvedAddrStr := resolvedAddr.String()
+	dialer.LocalAddr = lResolvedAddr
+	resolvedAddrStr := rResolvedAddr.String()
 
 	if resolvedAddrStr != req.Host {
 		config.Logger.Printf("HTTP-CONNECT: %s->%s(%s) connecting...", clientConn.RemoteAddr().String(), req.Host, resolvedAddrStr)
