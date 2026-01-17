@@ -943,6 +943,7 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
 		return fmt.Errorf("tunnel TCP connect failed: %v", err)
 	}
+	defer targetConn.Close()
 	sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
 	bidirectionalCopy(clientConn, targetConn)
 	return nil
@@ -1854,6 +1855,7 @@ func (c *Socks5Client) Listen(network, address string) (net.Listener, error) {
 	}, nil
 }
 
+// timeout 是指于Socks5服务器建立BIND过程的超时时间，不是Listen的等待超时
 func (c *Socks5Client) RemoteListen(network, address string, timeout time.Duration) (*Socks5BindConn, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {

@@ -119,7 +119,7 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 		config.Logger.Println("DialTimeout failed:", err)
 		return
 	}
-
+	defer targetConn.Close()
 	bidirectionalCopy(conn, targetConn)
 }
 

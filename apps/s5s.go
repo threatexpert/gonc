@@ -98,6 +98,7 @@ func App_s5s_usage_flagSet(fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), "  :s5s -auth user:password")
 }
 
+// stats_in, stats_out是为了针对UDP代理时，对UDP的流量进行统计。因为参数1的conn已经纳入统计了
 func App_s5s_main_withconfig(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig, stats_in, stats_out *misc.ProgressStats) {
 	defer conn.Close()
 
