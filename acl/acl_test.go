@@ -35,6 +35,8 @@ func TestACL_ShouldDeny(t *testing.T) {
 2001:2222::/32
 google.com
 *.google-analytics.com
+*.baidu.com
+!news.baidu.com
 `
 
 	path, err := writeTempACL(conf)
@@ -76,6 +78,9 @@ google.com
 		{"8.8.4.4", "outbound", false},       // 不在列表中的 IP
 		{"172.32.0.1", "outbound", false},    // 在 CIDR 范围之外的 IP
 		{"2001:db8::2", "outbound", false},   // 不在列表中的 IPv6
+		{"www.baidu.com", "outbound", true},
+		{"tieba.baidu.com", "outbound", true},
+		{"news.baidu.com", "outbound", false},
 
 		// 交叉方向测试 (确保规则不会混淆)
 		{"8.8.8.8", "inbound", false},     // 出站规则不影响入站

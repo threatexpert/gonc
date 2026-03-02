@@ -1,5 +1,6 @@
 package acl
 
+// VERSION 1.1.0 (Reliability Update + Exception Support)
 import (
 	"bufio"
 	"context"
@@ -10,16 +11,25 @@ import (
 	"strings"
 )
 
+// 定义动作常量
+const (
+	ActionNone  = 0
+	ActionDeny  = 1 // 拒绝
+	ActionAllow = 2 // 允许 (例外)
+)
+
 // ============================================================================
 //  Radix Tree (基数树) - 用于高效的 IP/CIDR 查询
+//  升级：支持最长前缀匹配 (LPM) 和 动作区分
 // ============================================================================
 
 // radixNode 代表基数树中的一个节点。
 type radixNode struct {
 	// children[0] 代表比特 0, children[1] 代表比特 1。
 	children [2]*radixNode
-	// isLeaf 标记一个 CIDR 前缀是否在此节点结束。
-	isLeaf bool
+	// action 标记该节点是否为一个规则的终点，以及规则的类型 (Allow/Deny)。
+	// 0 表示此处无规则。
+	action int
 }
 
 // radixTree 是一个为 IP 前缀设计的二叉基数树。
@@ -32,8 +42,8 @@ func newRadixTree() *radixTree {
 	return &radixTree{root: &radixNode{}}
 }
 
-// Insert 将一个 CIDR 前缀添加到树中。
-func (t *radixTree) Insert(ipNet *net.IPNet) {
+// Insert 将一个 CIDR 前缀添加到树中，并指定动作 (Allow 或 Deny)。
+func (t *radixTree) Insert(ipNet *net.IPNet, action int) {
 	node := t.root
 	// 从掩码获取前缀长度
 	prefixLen, _ := ipNet.Mask.Size()
@@ -50,20 +60,25 @@ func (t *radixTree) Insert(ipNet *net.IPNet) {
 		}
 		node = node.children[bit]
 	}
-	// 标记此前缀的结束
-	node.isLeaf = true
+	// 标记此前缀的结束及其动作
+	// 注意：后加载的规则会覆盖先加载的同CIDR规则
+	node.action = action
 }
 
-// Contains 检查一个 IP 地址是否被树中的任何前缀所包含。
-// 它的效率是 O(k)，k 是 IP 地址的位数。
-func (t *radixTree) Contains(ip net.IP) bool {
+// Match 检查一个 IP 地址匹配到的动作。
+// 采用最长前缀匹配 (Longest Prefix Match) 原则。
+// 返回: ActionNone, ActionDeny, 或 ActionAllow
+func (t *radixTree) Match(ip net.IP) int {
 	node := t.root
+	lastMatchAction := ActionNone
+
 	// IP 地址的总位数 (IPv4 是 32, IPv6 是 128)
 	totalBits := len(ip) * 8
 	for i := 0; i < totalBits; i++ {
-		// 如果当前节点是一个前缀的终点，意味着给定的 IP 属于该前缀范围。
-		if node.isLeaf {
-			return true
+		// 如果当前节点有一个规则动作，记录它。
+		// 我们继续向下遍历以寻找更长（更具体）的匹配。
+		if node.action != ActionNone {
+			lastMatchAction = node.action
 		}
 
 		// 获取当前 IP 位的值
@@ -74,88 +89,135 @@ func (t *radixTree) Contains(ip net.IP) bool {
 		// 移动到下一个节点
 		node = node.children[bit]
 		if node == nil {
-			// 如果路径中断，说明没有任何更长的前缀能匹配，因此 IP 不被包含。
-			return false
+			// 路径中断，返回目前为止找到的最长匹配动作
+			return lastMatchAction
 		}
 	}
-	// 如果完整遍历了 IP 的所有位，最终还要检查最后一个节点是否是叶子节点。
-	// (例如，查询的 IP 本身就是一个被拒绝的地址)
-	return node.isLeaf
+	// 检查最后一个节点是否有动作 (例如 /32 或 /128 的精确匹配)
+	if node.action != ActionNone {
+		lastMatchAction = node.action
+	}
+	return lastMatchAction
 }
 
 // ============================================================================
-//  Domain Matcher (域名匹配器) - 用于高效的出站域名查询
+//  Domain Rule Set (域名规则集) - 内部辅助结构
 // ============================================================================
 
-// domainMatcher 持有用于出站域名匹配的规则。
-type domainMatcher struct {
+// domainRuleSet 存储一组域名匹配规则（无论是黑名单还是白名单都复用此结构）。
+type domainRuleSet struct {
 	fullWildcard    bool
 	exactMatches    map[string]struct{} // 精确匹配
 	prefixWildcards map[string]struct{} // 前缀通配符, 例如 "example.*"
 	suffixWildcards map[string]struct{} // 后缀通配符, 例如 "*.example.com"
 }
 
-// newDomainMatcher 创建一个新的域名匹配器。
-func newDomainMatcher() *domainMatcher {
-	return &domainMatcher{
+func newDomainRuleSet() *domainRuleSet {
+	return &domainRuleSet{
 		exactMatches:    make(map[string]struct{}),
 		prefixWildcards: make(map[string]struct{}),
 		suffixWildcards: make(map[string]struct{}),
 	}
 }
 
-// AddRule 将一条域名规则添加到匹配器中。
-func (dm *domainMatcher) AddRule(rule string) {
-	rule = strings.ToLower(strings.TrimSpace(rule))
+func (s *domainRuleSet) add(rule string) {
 	if rule == "*" {
-		dm.fullWildcard = true
+		s.fullWildcard = true
 		return
 	}
 	if strings.HasPrefix(rule, "*.") {
-		// 后缀通配符, e.g., "*.example.com" -> 存储 "example.com"
-		dm.suffixWildcards[rule[2:]] = struct{}{}
+		s.suffixWildcards[rule[2:]] = struct{}{}
 		return
 	}
 	if strings.HasSuffix(rule, ".*") {
-		// 前缀通配符, e.g., "example.*" -> 存储 "example"
-		dm.prefixWildcards[rule[:len(rule)-2]] = struct{}{}
+		s.prefixWildcards[rule[:len(rule)-2]] = struct{}{}
 		return
 	}
-	// 精确匹配
-	dm.exactMatches[rule] = struct{}{}
+	s.exactMatches[rule] = struct{}{}
 }
 
-// Match 检查一个域名是否应该被拒绝。
-// 它的效率是 O(L)，L 是域名中的标签数量，远好于 O(N)。
-func (dm *domainMatcher) Match(domain string) bool {
-	domain = strings.ToLower(strings.TrimSpace(domain))
-
-	// 1. 检查全局通配符
-	if dm.fullWildcard {
+func (s *domainRuleSet) match(domain string) bool {
+	if s.fullWildcard {
 		return true
 	}
-
-	// 2. 检查精确匹配
-	if _, ok := dm.exactMatches[domain]; ok {
+	if _, ok := s.exactMatches[domain]; ok {
 		return true
 	}
 
 	parts := strings.Split(domain, ".")
 
-	// 3. 检查前缀通配符 (例如 "evil.*" 匹配 "evil.com")
+	// 检查前缀通配符
 	if len(parts) > 0 {
-		if _, ok := dm.prefixWildcards[parts[0]]; ok {
+		if _, ok := s.prefixWildcards[parts[0]]; ok {
 			return true
 		}
 	}
 
-	// 4. 检查后缀通配符 (例如 "*.evil.com" 匹配 "sub.evil.com")
-	// 需要检查所有可能的后缀。例如，对于 "a.b.c"，我们需要检查 "b.c" 和 "c"。
+	// 检查后缀通配符
 	for i := 1; i < len(parts); i++ {
 		suffix := strings.Join(parts[i:], ".")
-		if _, ok := dm.suffixWildcards[suffix]; ok {
+		if _, ok := s.suffixWildcards[suffix]; ok {
 			return true
 		}
+	}
+	return false
+}
+
+// ============================================================================
+//  Domain Matcher (域名匹配器) - 用于高效的出站域名查询
+//  升级：支持 Exception (Allow) 优先逻辑
+// ============================================================================
+
+// domainMatcher 持有用于出站域名匹配的规则。
+type domainMatcher struct {
+	allowRules *domainRuleSet // 存储以 "!" 开头的例外规则
+	denyRules  *domainRuleSet // 存储普通拒绝规则
+}
+
+// newDomainMatcher 创建一个新的域名匹配器。
+func newDomainMatcher() *domainMatcher {
+	return &domainMatcher{
+		allowRules: newDomainRuleSet(),
+		denyRules:  newDomainRuleSet(),
+	}
+}
+
+// AddRule 将一条域名规则添加到匹配器中。
+// 如果规则以 "!" 开头，则添加到允许列表。
+func (dm *domainMatcher) AddRule(rule string) {
+	rule = strings.ToLower(strings.TrimSpace(rule))
+	if len(rule) == 0 {
+		return
+	}
+
+	// 检查是否为例外规则
+	if strings.HasPrefix(rule, "!") {
+		realRule := strings.TrimSpace(rule[1:])
+		if len(realRule) > 0 {
+			dm.allowRules.add(realRule)
+		}
+	} else {
+		dm.denyRules.add(rule)
+	}
+}
+
+// Match 检查一个域名是否应该被拒绝。
+// 逻辑：如果匹配 Allow 规则 -> 返回 False (不拒绝)
+//
+//	如果匹配 Deny 规则  -> 返回 True  (拒绝)
+//	否则               -> 返回 False
+func (dm *domainMatcher) Match(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+
+	// 1. 优先检查例外列表 (Whitelist)
+	// 如果在例外列表中找到，直接返回 false (不拒绝)，忽略后续的黑名单
+	if dm.allowRules.match(domain) {
+		return false
+	}
+
+	// 2. 检查黑名单 (Blacklist)
+	if dm.denyRules.match(domain) {
+		return true
 	}
 
 	return false
@@ -183,22 +245,28 @@ func (a *ACL) ShouldDeny(address string, direction string) bool {
 			return false // 无效的 IP 地址无法匹配，因此不拒绝
 		}
 
-		// 检查是否为 IPv4 地址 (net.IP 将其表示为 16 字节的 IPv6 地址)
+		var action int
+		// 检查是否为 IPv4 地址
 		if ipv4 := ip.To4(); ipv4 != nil {
-			return a.inboundIPv4.Contains(ipv4)
+			action = a.inboundIPv4.Match(ipv4)
+		} else {
+			action = a.inboundIPv6.Match(ip)
 		}
-		// 否则，它是一个 IPv6 地址
-		return a.inboundIPv6.Contains(ip)
+
+		// 只有明确匹配到 Deny 且没有更具体的 Allow 时才拒绝
+		return action == ActionDeny
 
 	} else if direction == "outbound" {
 		// 首先，尝试将地址解析为 IP
 		ip := net.ParseIP(address)
 		if ip != nil {
-			// 如果是有效的 IP 地址，则只根据出站 IP 规则进行检查
+			var action int
 			if ipv4 := ip.To4(); ipv4 != nil {
-				return a.outboundIPv4.Contains(ipv4)
+				action = a.outboundIPv4.Match(ipv4)
+			} else {
+				action = a.outboundIPv6.Match(ip)
 			}
-			return a.outboundIPv6.Contains(ip)
+			return action == ActionDeny
 		}
 
 		// 如果不是有效的 IP 地址，则假定为域名并根据域名规则进行检查
@@ -239,6 +307,20 @@ func LoadACL(path string) (*ACL, error) {
 			continue
 		}
 
+		// 检查行是否以 "!" 开头 (例外规则)
+		isException := false
+		cleanLine := line
+		if strings.HasPrefix(line, "!") {
+			isException = true
+			cleanLine = strings.TrimSpace(line[1:])
+		}
+
+		// 确定当前规则的动作
+		action := ActionDeny
+		if isException {
+			action = ActionAllow
+		}
+
 		// parseIPNet 是一个辅助函数，用于解析 IP/CIDR
 		parseIPNet := func(l string) (*net.IPNet, bool) {
 			_, ipNet, err := net.ParseCIDR(l)
@@ -260,33 +342,35 @@ func LoadACL(path string) (*ACL, error) {
 
 		switch currentSection {
 		case "deny_inbound":
-			if ipNet, ok := parseIPNet(line); ok {
+			if ipNet, ok := parseIPNet(cleanLine); ok {
 				if ipv4 := ipNet.IP.To4(); ipv4 != nil {
 					ipNet.IP = ipv4
-					acl.inboundIPv4.Insert(ipNet)
+					acl.inboundIPv4.Insert(ipNet, action)
 				} else {
 					ipNet.IP = ipNet.IP.To16()
 					if ipNet.IP != nil {
-						acl.inboundIPv6.Insert(ipNet)
+						acl.inboundIPv6.Insert(ipNet, action)
 					}
 				}
 			}
 
 		case "deny_outbound":
 			// 尝试将该行解析为 IP/CIDR
-			if ipNet, ok := parseIPNet(line); ok {
-				// 如果是 IP 或 CIDR, 添加到出站 IP 规则
+			if ipNet, ok := parseIPNet(cleanLine); ok {
+				// 如果是 IP 或 CIDR
 				if ipv4 := ipNet.IP.To4(); ipv4 != nil {
 					ipNet.IP = ipv4
-					acl.outboundIPv4.Insert(ipNet)
+					acl.outboundIPv4.Insert(ipNet, action)
 				} else {
 					ipNet.IP = ipNet.IP.To16()
 					if ipNet.IP != nil {
-						acl.outboundIPv6.Insert(ipNet)
+						acl.outboundIPv6.Insert(ipNet, action)
 					}
 				}
 			} else {
 				// 如果不是 IP, 则作为域名处理
+				// 注意：域名规则的 "!" 处理在 AddRule 内部或此处传递皆可。
+				// 为了保持一致性，我们直接传入原始行 (含 !)，让 AddRule 处理
 				acl.outbound.AddRule(line)
 			}
 		}
