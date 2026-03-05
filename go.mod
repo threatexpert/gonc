@@ -14,6 +14,7 @@ require (
 	github.com/xtaci/kcp-go/v5 v5.6.60
 	github.com/xtaci/smux v1.5.50
 	golang.org/x/crypto v0.46.0
+	golang.org/x/net v0.48.0
 	golang.org/x/sys v0.39.0
 	golang.org/x/term v0.38.0
 )
@@ -26,7 +27,6 @@ require (
 	github.com/pion/transport/v3 v3.1.1 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )

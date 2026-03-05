@@ -832,6 +832,10 @@ func CompareP2PAddresses(info *P2PAddressInfo) (sameNATIP bool, similarLAN bool)
 	natIP1 := extractIP(info.LocalNAT)
 	natIP2 := extractIP(info.RemoteNAT)
 	sameNATIP = (natIP1 != "" && natIP2 != "" && natIP1 == natIP2)
+	if !sameNATIP {
+		// LAN MODE
+		sameNATIP = IsSameLAN(natIP1, natIP2)
+	}
 
 	lanIP1 := extractIP(info.LocalLAN)
 	lanIP2 := extractIP(info.RemoteLAN)
