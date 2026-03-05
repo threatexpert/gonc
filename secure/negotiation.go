@@ -174,16 +174,16 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 	var keyingMaterial [32]byte
 	switch {
 	case strings.HasPrefix(cfg.SecureLayer, "tls"):
-		conn_tls := doTLS(ctxTimeout, cfg, nconn.ConnLayers[0], &keyingMaterial, logWriter)
-		if conn_tls == nil {
-			return nil, fmt.Errorf("failed to establish TLS connection")
+		conn_tls, err := doTLS(ctxTimeout, cfg, nconn.ConnLayers[0], &keyingMaterial, logWriter)
+		if err != nil {
+			return nil, fmt.Errorf("failed to establish TLS connection: %w", err)
 		}
 		nconn.ConnLayers = append([]net.Conn{conn_tls}, nconn.ConnLayers...)
 		connStack = append(connStack, cfg.SecureLayer)
 	case cfg.SecureLayer == "dtls":
-		conn_dtls := doDTLS(ctxTimeout, cfg, nconn.ConnLayers[0], &keyingMaterial, logWriter)
-		if conn_dtls == nil {
-			return nil, fmt.Errorf("failed to establish DTLS connection")
+		conn_dtls, err := doDTLS(ctxTimeout, cfg, nconn.ConnLayers[0], &keyingMaterial, logWriter)
+		if err != nil {
+			return nil, fmt.Errorf("failed to establish DTLS connection: %w", err)
 		}
 		nconn.ConnLayers = append([]net.Conn{conn_dtls}, nconn.ConnLayers...)
 		connStack = append(connStack, cfg.SecureLayer)
@@ -194,26 +194,24 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 		case "PSK":
 			k, err := DerivePSK(cfg.Key)
 			if err != nil {
-				fmt.Fprintf(logWriter, "%sFailed to derive key for secure stream: %v\n", cfg.Label, err)
-				return nil, err
+				return nil, fmt.Errorf("failed to derive key for secure stream: %w", err)
 			}
 			copy(keyingMaterial[:], k)
 		default:
-			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.Label)
 			return nil, fmt.Errorf("missing key type for secure stream")
 		}
 
 		if cfg.SecureLayer == "dss" {
 			connss, err := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to create secure packet connection: %w", err)
 			}
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 			fmt.Fprintf(logWriter, "%sCommunication(Datagram) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		} else {
 			connss, err := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to create secure stream connection: %w", err)
 			}
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
 			fmt.Fprintf(logWriter, "%sCommunication(Stream) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
@@ -228,15 +226,14 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 			if cfg.ReadIdleTimeoutSecond > 0 {
 				kcp_handshake_timeout_sec = cfg.ReadIdleTimeoutSecond
 			}
-			sess_kcp := doKCP(ctx, cfg, nconn.ConnLayers[0], time.Duration(kcp_handshake_timeout_sec)*time.Second, logWriter)
-			if sess_kcp == nil {
-				return nil, fmt.Errorf("failed to establish KCP session")
+			sess_kcp, err := doKCP(ctx, cfg, nconn.ConnLayers[0], time.Duration(kcp_handshake_timeout_sec)*time.Second, logWriter)
+			if err != nil {
+				return nil, fmt.Errorf("failed to establish KCP session: %w", err)
 			}
 			if cfg.KcpEncryption {
 				k, err := DerivePSK(cfg.Key)
 				if err != nil {
-					fmt.Fprintf(logWriter, "%sFailed to derive key for keyingMaterial: %v\n", cfg.Label, err)
-					return nil, err
+					return nil, fmt.Errorf("failed to derive key for keyingMaterial: %w", err)
 				}
 				copy(keyingMaterial[:], k)
 			}
@@ -284,7 +281,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 	return nconn, nil
 }
 
-func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeKeyingMaterial *[32]byte, logWriter io.Writer) net.Conn {
+func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeKeyingMaterial *[32]byte, logWriter io.Writer) (net.Conn, error) {
 	// 获取所有安全加密套件
 	safeCiphers := tls.CipherSuites()
 	// 获取所有不安全加密套件
@@ -331,9 +328,9 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeK
 		if config.Key != "" && config.KeyType == "PSK" {
 			tlsConfig.ClientAuth = tls.RequireAnyClientCert
 			tlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
-			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake (PSK-based mutual authentication)...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake (PSK-based mutual authentication)...\n", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-S handshake...\n", config.Label)
 		}
 		conn_tls = tls.Server(conn, tlsConfig)
 	} else {
@@ -341,18 +338,16 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeK
 		if config.Key != "" && config.KeyType == "PSK" {
 			tlsConfig.Certificates = certs
 			tlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
-			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake (PSK-based mutual authentication)...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake (PSK-based mutual authentication)...\n", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming TLS-C handshake...\n", config.Label)
 		}
 		conn_tls = tls.Client(conn, tlsConfig)
 	}
 	if err := conn_tls.HandshakeContext(ctx); err != nil {
-		fmt.Fprintf(logWriter, "failed: %v\n", err)
 		conn_tls.Close()
-		return nil
+		return nil, err
 	}
-	fmt.Fprintf(logWriter, "completed.\n")
 
 	if storeKeyingMaterial != nil {
 		state := conn_tls.ConnectionState()
@@ -360,18 +355,17 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeK
 		keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
 		if err != nil {
 			if config.ErrorOnFailKeyingMaterial {
-				fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
 				conn_tls.Close()
-				return nil
+				return nil, fmt.Errorf("failed to export keying material: %w", err)
 			}
 		} else {
 			copy(storeKeyingMaterial[:], keyingMaterial)
 		}
 	}
-	return conn_tls
+	return conn_tls, nil
 }
 
-func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeKeyingMaterial *[32]byte, logWriter io.Writer) net.Conn {
+func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeKeyingMaterial *[32]byte, logWriter io.Writer) (net.Conn, error) {
 	// 支持的 CipherSuites（pion 这里和 crypto/tls 不同）
 	allCiphers := []dtls.CipherSuiteID{
 		dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -396,9 +390,9 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 		if config.Key != "" && config.KeyType == "PSK" {
 			dtlsConfig.ClientAuth = dtls.RequireAnyClientCert
 			dtlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
-			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake (PSK-based mutual authentication)...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake (PSK-based mutual authentication)...\n", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-S handshake...\n", config.Label)
 		}
 		dtlsConn, err = dtls.Server(pktconn, conn.RemoteAddr(), dtlsConfig)
 	} else {
@@ -406,15 +400,14 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 		if config.Key != "" && config.KeyType == "PSK" {
 			dtlsConfig.Certificates = config.Certs
 			dtlsConfig.VerifyPeerCertificate = VerifyPeerCertificateByPSK(config.Key)
-			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake (PSK-based mutual authentication)...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake (PSK-based mutual authentication)...\n", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming DTLS-C handshake...\n", config.Label)
 		}
 		dtlsConn, err = dtls.Client(pktconn, conn.RemoteAddr(), dtlsConfig)
 	}
 	if err != nil {
-		fmt.Fprintf(logWriter, "DTLS initialization failed: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("DTLS initialization failed: %w", err)
 	}
 
 	//dtlsConn.HandshakeContext似乎有bug，无法在ctx取消后返回，
@@ -426,44 +419,40 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 		if err = dtlsConn.HandshakeContext(ctx); err != nil {
 			if netx.IsConnRefused(err) {
 				if !firstRefusedLogged {
-					fmt.Fprintf(logWriter, "(ECONNREFUSED)...")
+					fmt.Fprintf(logWriter, "ECONNREFUSED during handshake\n")
 					firstRefusedLogged = true
 				}
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			fmt.Fprintf(logWriter, "failed: %v\n", err)
 			dtlsConn.Close()
-			return nil
+			return nil, fmt.Errorf("DTLS handshake failed: %w", err)
 		}
 		break
 	}
 	conn.SetDeadline(time.Time{}) // 取消握手超时
-	fmt.Fprintf(logWriter, "completed.\n")
 
 	if storeKeyingMaterial != nil {
 		state, ok := dtlsConn.ConnectionState()
 		if !ok {
 			if config.ErrorOnFailKeyingMaterial {
-				fmt.Fprintf(logWriter, "failed to get DTLS connection state\n")
 				dtlsConn.Close()
-				return nil
+				return nil, fmt.Errorf("failed to get DTLS connection state: %w", err)
 			}
 		} else {
 			label := "EXPERIMENTAL-SERVER-KEY"
 			keyingMaterial, err := state.ExportKeyingMaterial(label, nil, 32)
 			if err != nil {
 				if config.ErrorOnFailKeyingMaterial {
-					fmt.Fprintf(logWriter, "failed to export keying material: %v\n", err)
 					dtlsConn.Close()
-					return nil
+					return nil, fmt.Errorf("failed to export keying material: %w", err)
 				}
 			} else {
 				copy(storeKeyingMaterial[:], keyingMaterial)
 			}
 		}
 	}
-	return dtlsConn
+	return dtlsConn, nil
 }
 
 func createKCPBlockCrypt(passphrase string, salt []byte) (kcp.BlockCrypt, error) {
@@ -496,7 +485,7 @@ func createKCPBlockCryptFromKey(key []byte) (kcp.BlockCrypt, error) {
 // 1、建立message模式的KCP，传进来的conn背后通常是个UDPConn，这里不希望封装后变成会粘包的net.Conn。
 // 2、因为Close KCP会话对方无感知的问题，这里会再封装一层netx.FramedConn，每次发送的数据都增加2字节的长度头，所以结束时对方还可以收到个长度为0的EOF帧
 // 3、ctx负责整个会话总体生命周期的，不仅是握手阶段，因为它还传递给了startUDPKeepAlive，保持心跳
-func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeout time.Duration, logWriter io.Writer) net.Conn {
+func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeout time.Duration, logWriter io.Writer) (net.Conn, error) {
 	var sess *kcp.UDPSession
 	var err error
 	var blockCrypt kcp.BlockCrypt
@@ -505,14 +494,12 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 		case "ECDHE":
 			blockCrypt, err = createKCPBlockCryptFromKey([]byte(config.Key))
 			if err != nil {
-				fmt.Fprintf(logWriter, "%screateKCPBlockCryptFromKey failed: %v\n", config.Label, err)
-				return nil
+				return nil, fmt.Errorf("failed to create KCP block crypt: %w", err)
 			}
 		case "PSK":
 			blockCrypt, err = createKCPBlockCrypt(config.Key, []byte("1234567890abcdef"))
 			if err != nil {
-				fmt.Fprintf(logWriter, "%screateKCPBlockCrypt failed: %v\n", config.Label, err)
-				return nil
+				return nil, fmt.Errorf("failed to create KCP block crypt: %w", err)
 			}
 		}
 	}
@@ -531,30 +518,28 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 
 	if !config.IsClient {
 		if blockCrypt == nil {
-			fmt.Fprintf(logWriter, "%sPerforming KCP-S handshake...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming KCP-S handshake...\n", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-S handshake...", config.Label, config.KeyType)
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-S handshake...\n", config.Label, config.KeyType)
 		}
 	} else {
 		if blockCrypt == nil {
-			fmt.Fprintf(logWriter, "%sPerforming KCP-C handshake...", config.Label)
+			fmt.Fprintf(logWriter, "%sPerforming KCP-C handshake...\n", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake...", config.Label, config.KeyType)
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake...\n", config.Label, config.KeyType)
 		}
 	}
 	sess, err = kcp.NewConn4(0, conn.RemoteAddr(), blockCrypt, 10, 3, true, buconn)
 	if err != nil {
-		fmt.Fprintf(logWriter, "NewConn failed: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("failed to create(NewConn) KCP connection: %w", err)
 	}
 
 	// 简单握手
 	handshake := []byte("HELLO")
 	_, err = sess.Write(handshake)
 	if err != nil {
-		fmt.Fprintf(logWriter, "send handshake failed: %v\n", err)
 		sess.Close()
-		return nil
+		return nil, fmt.Errorf("failed to send handshake(HELLO): %w", err)
 	}
 
 	// 设置握手超时
@@ -563,11 +548,9 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	buf := make([]byte, len(handshake))
 	n, err := io.ReadFull(sess, buf)
 	if err != nil || n != len(handshake) || !bytes.Equal(buf, handshake) {
-		fmt.Fprintf(logWriter, "recv handshake failed: %v\n", err)
 		sess.Close()
-		return nil
+		return nil, fmt.Errorf("failed to receive handshake(HELLO): %w", err)
 	}
-	fmt.Fprintf(logWriter, "completed.\n")
 
 	// 取消超时（恢复成无超时）
 	sess.SetReadDeadline(time.Time{})
@@ -591,7 +574,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	mtu -= 2         //KCPStreamConn: len header
 	sess.SetMtu(mtu) //如果用户-udp-size设置的值比较大，超过KCP内部限制的1500，会设置失败。
 
-	return netx.NewFramedConn(sess, sess)
+	return netx.NewFramedConn(sess, sess), nil
 }
 
 func configTCPKeepalive(conn net.Conn, keepAlive int) {

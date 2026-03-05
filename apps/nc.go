@@ -1655,10 +1655,10 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 		}
 		if genCertForced || ncconfig.tlsServerMode {
 			if ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "" {
-				fmt.Fprintf(ncconfig.LogWriter, "Loading cert...")
+				ncconfig.Logger.Printf("Loading cert...")
 				cert, err := secure.LoadCertificate(ncconfig.sslCertFile, ncconfig.sslKeyFile)
 				if err != nil {
-					fmt.Fprintf(ncconfig.LogWriter, "Error load certificate: %v\n", err)
+					ncconfig.Logger.Printf("Error load certificate: %v\n", err)
 					os.Exit(1)
 				}
 				certs = append(certs, *cert)
@@ -1666,34 +1666,34 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 				ncconfig.tlsRSACertEnabled = false
 			} else {
 				if !ncconfig.tlsECCertEnabled && !ncconfig.tlsRSACertEnabled {
-					fmt.Fprintf(ncconfig.LogWriter, "EC and RSA both are disabled\n")
+					ncconfig.Logger.Printf("EC and RSA both are disabled\n")
 					os.Exit(1)
 				}
 				if ncconfig.tlsECCertEnabled {
 					if ncconfig.presharedKey != "" {
-						fmt.Fprintf(ncconfig.LogWriter, "Generating ECDSA(PSK-derived) cert for secure communication...")
+						ncconfig.Logger.Printf("Generating ECDSA(PSK-derived) cert for secure communication...")
 					} else {
-						fmt.Fprintf(ncconfig.LogWriter, "Generating ECDSA(randomly) cert for secure communication...")
+						ncconfig.Logger.Printf("Generating ECDSA(randomly) cert for secure communication...")
 					}
 					cert, err := secure.GenerateECDSACertificate(ncconfig.tlsSNI, ncconfig.presharedKey)
 					if err != nil {
-						fmt.Fprintf(ncconfig.LogWriter, "Error generating EC certificate: %v\n", err)
+						ncconfig.Logger.Printf("Error generating EC certificate: %v\n", err)
 						os.Exit(1)
 					}
 					certs = append(certs, *cert)
 				}
 				if ncconfig.tlsRSACertEnabled {
-					fmt.Fprintf(ncconfig.LogWriter, "Generating RSA cert...")
+					ncconfig.Logger.Printf("Generating RSA cert...")
 					cert, err := secure.GenerateRSACertificate(ncconfig.tlsSNI)
 					if err != nil {
-						fmt.Fprintf(ncconfig.LogWriter, "Error generating RSA certificate: %v\n", err)
+						ncconfig.Logger.Printf("Error generating RSA certificate: %v\n", err)
 						os.Exit(1)
 					}
 					certs = append(certs, *cert)
 				}
 			}
 
-			fmt.Fprintf(ncconfig.LogWriter, "completed.\n")
+			ncconfig.Logger.Printf("Certificate initialization completed.")
 		}
 	}
 	return certs
@@ -1792,7 +1792,7 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 func usage_less(logWriter io.Writer, argv0 string) {
 	fmt.Fprintln(logWriter, "go-netcat "+VERSION)
 	fmt.Fprintln(logWriter, "Usage:")
-	fmt.Fprintf(logWriter, "    %s [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port\n", argv0)
+	fmt.Fprintln(logWriter, "   ", argv0, "[-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(logWriter, "         [-p2p sessionKey]")
 	fmt.Fprintln(logWriter, "         [-e \":builtin-command [args]\" or \"external-command [args]\"]")
 	fmt.Fprintln(logWriter, "         [-h] for full help")
