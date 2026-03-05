@@ -275,6 +275,9 @@ func MQTT_GenerateClientID(topicDesc, sessionUid string, seed int64) string {
 
 func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid, localIP string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, err error) {
 	brokerServers := MQTTBrokerServers
+	if len(brokerServers) == 0 {
+		return "", -1, fmt.Errorf("no MQTT broker servers configured")
+	}
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 
