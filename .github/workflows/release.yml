@@ -1,10 +1,11 @@
-name: Build
+name: Build Release
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,47 +16,45 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.24.3'
 
       - name: Build binaries
+        env:
+          LDFLAGS: "-s -w -buildid= -checklinkname=0"
+          BUILD_FLAGS: "-buildvcs=false -trimpath"
+          CGO_ENABLED: "0"
         run: |
-          # Darwin (macOS)
-          GOOS=darwin GOARCH=arm64 go build -o gonc-darwin-aarch64 .
-          GOOS=darwin GOARCH=amd64 go build -o gonc-darwin-x86_64 .
-          
-          # Linux GNU
-          GOOS=linux GOARCH=arm64 go build -o gonc-linux-gnu-aarch64 .
-          GOOS=linux GOARCH=amd64 go build -o gonc-linux-gnu-x86_64 .
-          GOOS=linux GOARCH=arm GOARM=7 go build -o gonc-linux-gnueabi-armv7 .
-          GOOS=linux GOARCH=arm GOARM=7 go build -o gonc-linux-gnueabihf-armv7 .
-          
-          # Linux MUSL
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o gonc-linux-musl-aarch64 .
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o gonc-linux-musl-x86_64 .
-          GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build -o gonc-linux-musleabi-armv5 .
-          GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o gonc-linux-musleabi-armv7 .
-          GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o gonc-linux-musleabihf-armv7 .
+          mkdir -p bin
           
           # Windows
-          GOOS=windows GOARCH=arm64 go build -o gonc-windows-arm64.exe .
-          GOOS=windows GOARCH=amd64 go build -o gonc-windows-x86_64.exe .
+          GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_windows_amd64.exe .
+          GOOS=windows GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_windows_arm64.exe .
+          
+          # Darwin (macOS)
+          GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_darwin_amd64 .
+          GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_darwin_arm64 .
+          
+          # Linux Common (PC & 64-bit ARM)
+          GOOS=linux GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_amd64 .
+          GOOS=linux GOARCH=386 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_386 .
+          GOOS=linux GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_arm64 .
+          
+          # Linux ARM 32-bit (精细化区分 v5 和 v7 软/硬浮点)
+          GOOS=linux GOARCH=arm GOARM=5 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_armv5 .
+          GOOS=linux GOARCH=arm GOARM=7,softfloat go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_armv7_softfloat .
+          GOOS=linux GOARCH=arm GOARM=7 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_armv7hf .
+          
+          # Linux MIPS (Routers / 软路由)
+          GOOS=linux GOARCH=mips GOMIPS=softfloat go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_mips .
+          GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_mipsle .
+          GOOS=linux GOARCH=mips64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_linux_mips64 .
+          
+          # Android
+          GOOS=android GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_android_arm64 .
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            gonc-darwin-aarch64
-            gonc-darwin-x86_64
-            gonc-linux-gnu-aarch64
-            gonc-linux-gnu-x86_64
-            gonc-linux-gnueabi-armv7
-            gonc-linux-gnueabihf-armv7
-            gonc-linux-musl-aarch64
-            gonc-linux-musl-x86_64
-            gonc-linux-musleabi-armv5
-            gonc-linux-musleabi-armv7
-            gonc-linux-musleabihf-armv7
-            gonc-windows-arm64.exe
-            gonc-windows-x86_64.exe
+          files: bin/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
