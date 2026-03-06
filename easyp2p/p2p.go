@@ -1681,8 +1681,16 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 	}
 
+	// 判断是否启用 LAN 直连探测
+	lanProbeEnabled := shouldTryLANProbe(inSameLAN, round, p2pInfo)
+	lanProbingStatus := "disabled"
+	if lanProbeEnabled {
+		lanProbingStatus = "enabled"
+	}
+
 	// Print connection info
 	p2pInfoPrint(logWriter, p2pInfo)
+	fmt.Fprintf(logWriter, "  - %-14s: %v\n", "LAN Probing", lanProbingStatus)
 	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 	if isClient {
 		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
@@ -1784,13 +1792,16 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 
 		// Verify the connection is from expected peer
-		clientIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		if err == nil && (clientIP == remoteIP || (sameNAT && similarLAN && IsSameLAN(clientIP, remoteIP))) {
+		peerIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		remoteLANIP := extractIP(p2pInfo.RemoteLAN)
+		if err == nil && (peerIP == remoteIP ||
+			(sameNAT && similarLAN && IsSameLAN(peerIP, remoteIP)) ||
+			(lanProbeEnabled && (peerIP == remoteLANIP || IsSameLAN(peerIP, localAddr.IP.String())))) {
 			tryCommit(conn, "accept")
 		} else {
 			conn.Close()
 			if err == nil {
-				err = fmt.Errorf("unexpected peer connection from %s", clientIP)
+				err = fmt.Errorf("unexpected peer connection from %s", peerIP)
 			}
 			errChan <- err
 		}
@@ -1838,6 +1849,22 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 				}
 			}
 			return false
+		}
+
+		// === LAN 直连探测 ===
+		// 在原有打洞逻辑开始前，并发启动一次 LAN 直连探测。
+		// 探测与打洞共享 ctx + commitOnce 竞争机制：
+		//   - 探测成功 → tryCommit 赢得竞争 → cancel() 终止打洞
+		//   - 探测失败 → 静默退出 → 打洞逻辑继续
+		if lanProbeEnabled {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			workerChan <- struct{}{} // Acquire worker slot
+			wg.Add(1)
+			go doLANProbe(network, p2pInfo, isClient, logWriter, tryConnect)
 		}
 
 		//相同子网的，以及easy对easy的，就尝试一下直接连接
