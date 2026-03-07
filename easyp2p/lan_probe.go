@@ -3,33 +3,51 @@ package easyp2p
 // ============================================================================
 // LAN Probe - 在 STUN+MQTT 流程中自动探测内网直连可达性
 //
-// 目的:
-//   当 CompareP2PAddresses 判定双方不在同一内网（sameNAT=false 或 similarLAN=false），
-//   但双方都持有私有 IP 地址时，通过实际的 TCP 直连探测来验证是否可以走内网路径。
-//   这覆盖了以下场景：
-//     1) 多出口 IP 的企业网络（公网IP不同但内网互通）
-//     2) 跨子网但有路由互通的私有网络（10.1.x vs 10.2.x）
-//     3) 混合使用不同私有段但实际同一物理网络的场景
+// 场景：双方都在同一物理内网，但因多出口IP或跨子网等原因，
+// CompareP2PAddresses 误判为不同网络。通过实际 TCP 直连探测来验证。
 //
-// 设计原则:
-//   - 仅在 round==1（首轮打洞）时触发一次探测
-//   - 与原有打洞逻辑完全并发，共享 ctx + commitOnce 竞争机制
-//   - 探测成功：tryCommit 赢得竞争，cancel() 终止原有打洞
-//   - 探测失败：静默退出，不影响原有逻辑
-//   - 探测超时：1.5 秒，对内网来说绑绑有余
+// 设计：
+//   - 通过 exchangeAddressPayload.Caps 协商，新版对新版才启用
+//   - Do_autoP2PEx2 筛选时保留最多一对 LANProbeOnly 地址对
+//   - Auto_P2P_TCP_NAT_Traversal 中对 LANProbeOnly 地址对只做 LAN 探测
+//
+// 兼容性：
+//   - 老版本不认识 Caps 字段，json.Unmarshal 自动忽略
+//   - 新版收到老版消息时 Caps 为 nil，不启用 LAN 探测
+//   - 不改变任何现有通信协议和打洞逻辑
 // ============================================================================
 
-import (
-	"fmt"
-	"io"
-	"net"
-	"time"
-)
+import "net"
 
 const (
-	// LAN 探测的 TCP 连接超时时间
-	lanProbeTimeout = 1500 * time.Millisecond
+	// CapLANProbe 能力标识，用于 exchangeAddressPayload.Caps 版本协商
+	CapLANProbe = "lan-probe"
 )
+
+// hasCap 检查能力列表中是否包含指定能力
+func hasCap(caps []string, cap string) bool {
+	for _, c := range caps {
+		if c == cap {
+			return true
+		}
+	}
+	return false
+}
+
+// bothPrivateLAN 检查两个地址（host:port 格式）是否都是私有 IP
+func bothPrivateLAN(lanAddr1, lanAddr2 string) bool {
+	ip1 := extractIP(lanAddr1)
+	ip2 := extractIP(lanAddr2)
+	if ip1 == "" || ip2 == "" {
+		return false
+	}
+	parsed1 := net.ParseIP(ip1)
+	parsed2 := net.ParseIP(ip2)
+	if parsed1 == nil || parsed2 == nil {
+		return false
+	}
+	return parsed1.IsPrivate() && parsed2.IsPrivate()
+}
 
 // shouldTryLANProbe 判断是否应该尝试 LAN 直连探测
 // 条件：
@@ -69,47 +87,4 @@ func shouldTryLANProbe(inSameLAN bool, round int, p2pInfo *P2PAddressInfo) bool 
 	}
 
 	return true
-}
-
-// doLANProbe 执行 LAN 直连探测（TCP 版本）
-// 这个函数设计为在一个独立的 goroutine 中运行，与原有打洞逻辑并发。
-// 它使用调用者提供的 tryConnect 函数来尝试连接，tryConnect 内部会调用
-// doHandshake + tryCommit，与原有打洞逻辑共享竞争机制。
-//
-// 参数:
-//   - network: 网络类型，如 "tcp4"
-//   - p2pInfo: P2P 地址信息
-//   - isClient: 当前节点的角色
-//   - logWriter: 日志输出
-//   - tryConnectFn: 尝试连接的函数（复用 doPunching 中的 tryConnect）
-//     签名: func(targetAddr string, localAddr *net.TCPAddr, reuseaddr bool, timeout_sec int, isClient bool, tag string) bool
-//
-// 注意: 此函数不需要返回值，成功与否完全通过 tryCommit 的竞争机制来体现。
-// 调用者（doPunching）在启动此 goroutine 前需要 wg.Add(1) 和 workerChan <- struct{}{}
-func doLANProbe(
-	network string,
-	p2pInfo *P2PAddressInfo,
-	isClient bool,
-	logWriter io.Writer,
-	tryConnectFn func(targetAddr string, localAddr *net.TCPAddr, reuseaddr bool, timeout_sec int, isClient bool, tag string) bool,
-) {
-	// 连接对方的 LAN 地址（incPort 之后的，即 p2pInfo.RemoteLAN）
-	remoteLANAddr := p2pInfo.RemoteLAN
-
-	fmt.Fprintf(logWriter, "  ↑ LAN probe: trying direct connect to peer LAN address %s ...\n", remoteLANAddr)
-
-	// 使用系统分配的随机端口，不与主打洞逻辑抢端口
-	// reuseaddr=false，因为不需要端口复用
-	// timeout 使用 lanProbeTimeout 对应的秒数（向上取整为 2 秒，因为 tryConnect 接受整数秒）
-	timeoutSec := int((lanProbeTimeout + time.Second - 1) / time.Second) // 向上取整
-	if timeoutSec < 1 {
-		timeoutSec = 1
-	}
-
-	success := tryConnectFn(remoteLANAddr, nil, false, timeoutSec, isClient, "lan-probe")
-
-	if success {
-		fmt.Fprintf(logWriter, "  ✓ LAN probe: direct LAN connection succeeded!\n")
-	}
-	// 失败则静默，tryConnect 内部会处理连接关闭
 }

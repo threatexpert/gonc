@@ -69,6 +69,7 @@ type P2PAddressInfo struct {
 	RemotePublicIPv4Count int
 	RemotePublicIPv6Count int
 	LocalBindIP           string
+	LANProbeOnly          bool
 }
 
 type securePayload struct {
@@ -522,6 +523,8 @@ type exchangeAddressPayload struct {
 	Addresses []PunchingAddressInfo `json:"addrs"`
 	// 公钥的 Base64 编码字符串
 	PubKey string `json:"pk"`
+	// [新增] 能力列表，用于版本协商（老版本会自动忽略此字段）
+	Caps []string `json:"caps,omitempty"`
 }
 
 type RelayPacketConn struct {
@@ -610,6 +613,9 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 
 	myInfoForExchange.Addresses, _, _ = DetectNATAddressInfo(networks, bind, relayConn, logWriter)
 
+	// [新增] 声明本端支持 LAN 直连探测能力
+	myInfoForExchange.Caps = []string{CapLANProbe}
+
 	var priv *ecdsa.PrivateKey
 	if needSharedKey && len(myInfoForExchange.Addresses) > 0 {
 		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -656,6 +662,8 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 
 	var finalResults []*P2PAddressInfo
 	haveCommonNetwork := false
+	peerSupportsLANProbe := hasCap(remotePayload.Caps, CapLANProbe) // [新增]
+	lanProbeAdded := false                                          // [新增]
 	LocalPublicIPv4Count := countUniquePublicIPs(myInfoForExchange.Addresses, "4")
 	LocalPublicIPv6Count := countUniquePublicIPs(myInfoForExchange.Addresses, "6")
 	RemotePublicIPv4Count := countUniquePublicIPs(remotePayload.Addresses, "4")
@@ -703,7 +711,13 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 
 			if myNATType == "symm" && rNATType == "symm" {
 				if !sameNAT || !similarLAN {
-					continue
+					// [修改] 新版对新版：双方都有私有LAN地址，保留一对做LAN探测
+					if peerSupportsLANProbe && !lanProbeAdded && bothPrivateLAN(myLAN, remoteLAN) {
+						item.LANProbeOnly = true
+						lanProbeAdded = true
+					} else {
+						continue
+					}
 				}
 				//对称型，但在相同内网，可以p2p
 			}
@@ -712,7 +726,13 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 				if !sameNAT || !similarLAN {
 					//TCP，如果不在相同内网，必须至少一端是easy的
 					if myNATType != "easy" && rNATType != "easy" {
-						continue
+						// [修改] 新版对新版：双方都有私有LAN地址，保留一对做LAN探测
+						if peerSupportsLANProbe && !lanProbeAdded && bothPrivateLAN(myLAN, remoteLAN) {
+							item.LANProbeOnly = true
+							lanProbeAdded = true
+						} else {
+							continue
+						}
 					}
 				}
 			}
@@ -1585,6 +1605,9 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		inSameLAN = true
 	}
 
+	// [新增] 判断是否启用 LAN 直连探测
+	lanProbeEnabled := shouldTryLANProbe(inSameLAN, round, p2pInfo) || p2pInfo.LANProbeOnly
+
 	randomSrcPort := false
 	randomDstPort := false
 	if !inSameLAN {
@@ -1633,7 +1656,10 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	if !inSameLAN {
 		if p2pInfo.LocalNATType != "easy" && p2pInfo.RemoteNATType != "easy" {
-			return nil, false, nil, fmt.Errorf("NAT type need at least one easy NAT for TCP hole punching")
+			// [修改] LANProbeOnly 模式下跳过此检查
+			if !lanProbeEnabled {
+				return nil, false, nil, fmt.Errorf("NAT type need at least one easy NAT for TCP hole punching")
+			}
 		}
 		//换本地端口，因为之前这个端口连接过stun服务器，可能不久后会被STUN服务器关闭（FIN或RST）都可能影响在这个洞建立的其他会话。
 		//p2p两端彼此约定增加100
@@ -1681,16 +1707,21 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 	}
 
-	// 判断是否启用 LAN 直连探测
-	lanProbeEnabled := shouldTryLANProbe(inSameLAN, round, p2pInfo)
-	lanProbingStatus := "disabled"
-	if lanProbeEnabled {
-		lanProbingStatus = "enabled"
+	// [新增] LANProbeOnly 模式下缩短超时
+	if lanProbeEnabled && p2pInfo.LANProbeOnly {
+		timeoutMax = 5
 	}
 
 	// Print connection info
 	p2pInfoPrint(logWriter, p2pInfo)
-	fmt.Fprintf(logWriter, "  - %-14s: %v\n", "LAN Probing", lanProbingStatus)
+	// [新增] 日志显示 LAN 探测状态
+	if lanProbeEnabled {
+		if p2pInfo.LANProbeOnly {
+			fmt.Fprintf(logWriter, "  - %-14s: enabled (LAN probe only mode)\n", "LAN Probe")
+		} else {
+			fmt.Fprintf(logWriter, "  - %-14s: enabled\n", "LAN Probe")
+		}
+	}
 	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 	if isClient {
 		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
@@ -1851,20 +1882,35 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			return false
 		}
 
-		// === LAN 直连探测 ===
-		// 在原有打洞逻辑开始前，并发启动一次 LAN 直连探测。
-		// 探测与打洞共享 ctx + commitOnce 竞争机制：
-		//   - 探测成功 → tryCommit 赢得竞争 → cancel() 终止打洞
-		//   - 探测失败 → 静默退出 → 打洞逻辑继续
+		// [新增] === LAN 直连探测 ===
 		if lanProbeEnabled {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
+			remoteLANAddr := p2pInfo.RemoteLAN
+			fmt.Fprintf(logWriter, "  ↑ LAN probe: trying direct connect to peer LAN address %s ...\n", remoteLANAddr)
 			workerChan <- struct{}{} // Acquire worker slot
 			wg.Add(1)
-			go doLANProbe(network, p2pInfo, isClient, logWriter, tryConnect)
+			go func() {
+				success := tryConnect(remoteLANAddr, localAddr, true, 3, isClient, "lan-probe")
+				if success {
+					fmt.Fprintf(logWriter, "  ✓ LAN probe: direct LAN connection succeeded!\n")
+				}
+			}()
+
+			if p2pInfo.LANProbeOnly {
+				// LANProbeOnly 模式：只等 LAN 探测结果，不做公网打洞
+				wg.Wait()
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				errChan <- fmt.Errorf("LAN probe failed, no other punching method available")
+				return
+			}
 		}
 
 		//相同子网的，以及easy对easy的，就尝试一下直接连接
