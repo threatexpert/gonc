@@ -1726,7 +1726,11 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	if isClient {
 		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
 	} else {
-		fmt.Fprintf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
+		if p2pInfo.LANProbeOnly {
+			fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Passive Mode")
+		} else {
+			fmt.Fprintf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
+		}
 	}
 
 	tryCommit := func(conn net.Conn, tag string) bool {
@@ -2021,7 +2025,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	go doAccept()
 	// Delay for passive side
-	if !isClient {
+	if !isClient && !p2pInfo.LANProbeOnly {
 		time.Sleep(2 * time.Second)
 	}
 	go doPunching()
