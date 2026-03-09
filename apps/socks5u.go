@@ -1577,7 +1577,7 @@ func (c *Socks5Client) socks5Handshake(conn net.Conn) error {
 		if authResp[1] != 0x00 { // Status: 0x00 for success
 			return fmt.Errorf("username/password authentication failed: status %d", authResp[1])
 		}
-		c.Config.Logger.Println("SOCKS5 username/password authentication successful.")
+		//c.Config.Logger.Println("SOCKS5 username/password authentication successful.")
 	} else if chosenMethod != AUTH_NO_AUTH {
 		return fmt.Errorf("unsupported authentication method chosen by server: %d", chosenMethod)
 	}
@@ -1709,7 +1709,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		}
 	}
 
-	socks5Conn, err := net.DialTimeout(c.Config.Network, serverAddress, timeout)
+	socks5Conn, err := c.Config.dialToServer(timeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", serverAddress, err)
 	}
@@ -1717,7 +1717,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		nconn, err := secure.DoNegotiation(ntconfig, socks5Conn, io.Discard)
 		if err != nil {
 			socks5Conn.Close()
-			return nil, fmt.Errorf("DoNegotiation to SOCKS5 proxy server failed: %w", err)
+			return nil, fmt.Errorf("DoNegotiation to SOCKS5 proxy server %s failed: %w", serverAddress, err)
 		}
 		socks5Conn = nconn
 		keyingMaterial = nconn.KeyingMaterial
@@ -1728,18 +1728,18 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		socks5Conn.SetDeadline(time.Now().Add(timeout))
 		if err := c.socks5Handshake(socks5Conn); err != nil {
 			socks5Conn.Close()
-			return nil, fmt.Errorf("SOCKS5 handshake failed: %w", err)
+			return nil, fmt.Errorf("SOCKS5 handshake(%s) failed: %w", serverAddress, err)
 		}
 		if _, err := sendSocks5RequestHeader(socks5Conn, CMD_CONNECT, host, port); err != nil {
 			socks5Conn.Close()
-			return nil, fmt.Errorf("send SOCKS5 CONNECT request error: %w", err)
+			return nil, fmt.Errorf("send SOCKS5 CONNECT request(%s) error: %w", serverAddress, err)
 		}
 		if _, err := readSocks5Response(socks5Conn); err != nil {
 			socks5Conn.Close()
-			return nil, fmt.Errorf("read SOCKS5 CONNECT response error: %w", err)
+			return nil, fmt.Errorf("read SOCKS5 CONNECT response(%s) error: %w", serverAddress, err)
 		}
 		socks5Conn.SetDeadline(time.Time{})
-		//config.Logger.Printf("Successfully connected to %s via SOCKS5 TCP proxy.", address)
+		//c.Config.Logger.Printf("Successfully connected to %s via SOCKS5 TCP proxy %s.", address, serverAddress)
 		return socks5Conn, nil
 
 	case "udp", "udp4", "udp6":
@@ -1758,7 +1758,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		serverTCPConn.SetDeadline(time.Now().Add(timeout))
 		if err := c.socks5Handshake(serverTCPConn); err != nil {
 			serverTCPConn.Close()
-			return nil, fmt.Errorf("SOCKS5 handshake for UDP ASSOCIATE failed: %w", err)
+			return nil, fmt.Errorf("SOCKS5 handshake(%s) for UDP ASSOCIATE failed: %w", serverAddress, err)
 		}
 
 		// 2. 发送 UDP ASSOCIATE 请求 (DST.ADDR 和 DST.PORT 通常是 0.0.0.0:0, 但也可以指定)
@@ -1766,7 +1766,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		_, err = sendSocks5RequestHeader(serverTCPConn, CMD_UDP_ASSOCIATE, host, port)
 		if err != nil {
 			serverTCPConn.Close()
-			return nil, fmt.Errorf("send SOCKS5 UDP ASSOCIATE request error: %w", err)
+			return nil, fmt.Errorf("send SOCKS5 UDP ASSOCIATE request(%s) error: %w", serverAddress, err)
 		}
 
 		// 3. 读取 UDP ASSOCIATE 响应，获取 SOCKS5 服务器返回的 UDP 绑定地址和端口
@@ -1776,7 +1776,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 		bindAddr, err := readSocks5Response(serverTCPConn)
 		if err != nil {
 			serverTCPConn.Close()
-			return nil, fmt.Errorf("read SOCKS5 UDP ASSOCIATE response error: %w", err)
+			return nil, fmt.Errorf("read SOCKS5 UDP ASSOCIATE response(%s) error: %w", serverAddress, err)
 		}
 
 		// 判断如果服务端给的地址是全0, 以及是否给了内网地址，客户端则用serverTCPConn.RemoteAddr()的地址
@@ -1872,7 +1872,7 @@ func (c *Socks5Client) RemoteListen(network, address string, timeout time.Durati
 		ntconfig = BuildNTConfigFromPCConfig(c.Config)
 	}
 
-	socks5Conn, err := net.DialTimeout(c.Config.Network, serverAddress, timeout)
+	socks5Conn, err := c.Config.dialToServer(timeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial SOCKS5 server %s error: %w", serverAddress, err)
 	}

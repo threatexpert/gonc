@@ -53,16 +53,17 @@ func getFullHttpHeader(conn net.Conn) (string, error) {
 // DialTimeout 实现 HttpConnectClient 的拨号逻辑
 func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	// 1. 连接HTTP代理服务器
-	proxyConn, err := net.DialTimeout(c.Config.Network, net.JoinHostPort(c.Config.ServerHost, c.Config.ServerPort), timeout)
+	serverAddress := net.JoinHostPort(c.Config.ServerHost, c.Config.ServerPort)
+	proxyConn, err := c.Config.dialToServer(timeout)
 	if err != nil {
-		return nil, fmt.Errorf("connect to HTTP proxy server failed: %w", err)
+		return nil, fmt.Errorf("connect to HTTP proxy server %s failed: %w", serverAddress, err)
 	}
 	if IsSecureNegotiationNeeded(c.Config) {
 		ntconfig := BuildNTConfigFromPCConfig(c.Config)
 		nconn, err := secure.DoNegotiation(ntconfig, proxyConn, io.Discard)
 		if err != nil {
 			proxyConn.Close()
-			return nil, fmt.Errorf("DoNegotiation to HTTP proxy server failed: %w", err)
+			return nil, fmt.Errorf("DoNegotiation to HTTP proxy server %s failed: %w", serverAddress, err)
 		}
 		proxyConn = nconn
 	}
@@ -82,7 +83,7 @@ func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Du
 	err = connectReq.Write(proxyConn)
 	if err != nil {
 		proxyConn.Close()
-		return nil, fmt.Errorf("write HTTP CONNECT request failed: %w", err)
+		return nil, fmt.Errorf("write HTTP CONNECT request(%s) failed: %w", serverAddress, err)
 	}
 
 	// 3. 读取HTTP代理服务器响应，不要直接bufio.NewReader(stringReader)，他可能读取过多数据并缓存在其内部
@@ -90,20 +91,20 @@ func (c *HttpConnectClient) DialTimeout(network, address string, timeout time.Du
 	header, err := getFullHttpHeader(proxyConn)
 	if err != nil {
 		proxyConn.Close()
-		return nil, fmt.Errorf("read HTTP Header failed: %w", err)
+		return nil, fmt.Errorf("read(%s) HTTP Header failed: %w", serverAddress, err)
 	}
 	stringReader := strings.NewReader(header)
 	bufReader := bufio.NewReader(stringReader)
 	resp, err := http.ReadResponse(bufReader, connectReq)
 	if err != nil {
 		proxyConn.Close()
-		return nil, fmt.Errorf("read HTTP CONNECT response failed: %w", err)
+		return nil, fmt.Errorf("read(%s) HTTP CONNECT response failed: %w", serverAddress, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		proxyConn.Close()
-		return nil, fmt.Errorf("HTTP CONNECT failed with status: %s", resp.Status)
+		return nil, fmt.Errorf("HTTP CONNECT(%s) failed with status: %s", serverAddress, resp.Status)
 	}
 	proxyConn.SetDeadline(time.Time{})
 	return proxyConn, nil
@@ -161,6 +162,13 @@ func (c *ProxyClient) DialTimeout(network, address string, timeout time.Duration
 	return c.Dialer.DialTimeout(network, address, timeout)
 }
 
+func (c *ProxyClient) Listen(network, address string) (net.Listener, error) {
+	if c.Dialer == nil {
+		return nil, fmt.Errorf("proxy client not initialized")
+	}
+	return c.Dialer.Listen(network, address)
+}
+
 func (c *ProxyClient) SupportBIND() bool {
 	// 目前仅 SOCKS5 支持 BIND
 	return c.ProxyProt == "socks5"
@@ -176,6 +184,16 @@ type ProxyClientConfig struct {
 	ServerPort       string
 	PresharedKey     string // -psk <psk-string>
 	KcpWithUDP       bool
+	UpstreamDialer   Dialer // 上游拨号器，用于链式代理。nil则使用net.DialTimeout直连
+}
+
+// dialToServer 通过上游拨号器（如果有）连接到代理服务器
+func (c *ProxyClientConfig) dialToServer(timeout time.Duration) (net.Conn, error) {
+	serverAddress := net.JoinHostPort(c.ServerHost, c.ServerPort)
+	if c.UpstreamDialer != nil {
+		return c.UpstreamDialer.DialTimeout(c.Network, serverAddress, timeout)
+	}
+	return net.DialTimeout(c.Network, serverAddress, timeout)
 }
 
 func BuildNTConfigFromPCConfig(config *ProxyClientConfig) *secure.NegotiationConfig {
@@ -334,12 +352,19 @@ func ProxyClientConfigByArgs(logWriter io.Writer, args []string) (*ProxyClientCo
 }
 
 func Proxy_usage_flagSet(fs *flag.FlagSet) {
-	fmt.Fprintln(fs.Output(), "-x Usage: [options] <host:port>")
-	fmt.Fprintln(fs.Output(), "Or:    [options]  <host> <port>")
-	fmt.Fprintln(fs.Output(), "\nOptions:")
-	fs.PrintDefaults() // 打印所有定义的标志及其默认值和说明
+	fmt.Fprintln(fs.Output(), "-x Usage:")
+	fmt.Fprintln(fs.Output(), "  Classic: [options] <host:port>")
+	fmt.Fprintln(fs.Output(), "  Or:      [options]  <host> <port>")
+	fmt.Fprintln(fs.Output(), "  URL:     <scheme>://[user:pass@]host:port[?psk=key]")
+	fmt.Fprintln(fs.Output(), "  Chain:   <url1>,<url2>[,<url3>...]")
+	fmt.Fprintln(fs.Output(), "\nClassic options:")
+	fs.PrintDefaults()
+	fmt.Fprintln(fs.Output(), "\nURL schemes: socks5, socks5s (socks5+tls), http (connect), https (connect+tls)")
 	fmt.Fprintln(fs.Output(), "\nExamples:")
 	fmt.Fprintln(fs.Output(), "  -x \"-tls -psk randomString <host:port>\"")
+	fmt.Fprintln(fs.Output(), "  -x socks5://user:pass@1.1.1.1:1080")
+	fmt.Fprintln(fs.Output(), "  -x socks5s://1.1.1.1:1080?psk=mykey")
+	fmt.Fprintln(fs.Output(), "  -x \"socks5://1.1.1.1:1080,https://2.2.2.2:8080\"")
 }
 
 func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {
@@ -365,4 +390,146 @@ func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {
 		return nil, fmt.Errorf("failed to convert socks5 connection to PacketConn")
 	}
 	return packetConn, nil
+}
+
+// getProxyClient 获取代理客户端：优先使用预构建的链式代理，否则从 Config 构建
+func getProxyClient(ncconfig *AppNetcatConfig) (*ProxyClient, error) {
+	if ncconfig.arg_proxyc_Client != nil {
+		return ncconfig.arg_proxyc_Client, nil
+	}
+	return NewProxyClient(ncconfig.arg_proxyc_Config)
+}
+
+// hasProxyConfig 检查是否配置了代理（包括单跳和链式）
+func hasProxyConfig(ncconfig *AppNetcatConfig) bool {
+	return ncconfig.arg_proxyc_Config != nil || ncconfig.arg_proxyc_Client != nil
+}
+
+// ParseProxyURL 解析 URL 格式的代理配置
+// 支持的格式:
+//
+//	socks5://[user:pass@]host:port[?psk=key]
+//	socks5s://[user:pass@]host:port[?psk=key]   (SOCKS5 + TLS)
+//	http://[user:pass@]host:port[?psk=key]       (HTTP CONNECT)
+//	https://[user:pass@]host:port[?psk=key]      (HTTP CONNECT + TLS)
+func ParseProxyURL(logWriter io.Writer, rawURL string) (*ProxyClientConfig, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+
+	config := &ProxyClientConfig{
+		Logger:  misc.NewLog(logWriter, "[:x] ", log.LstdFlags|log.Lmsgprefix),
+		Network: "tcp",
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "socks5":
+		config.Prot = "socks5"
+	case "socks5s":
+		config.Prot = "socks5"
+		config.TlsEnabled = true
+	case "http", "connect":
+		config.Prot = "http"
+	case "https":
+		config.Prot = "http"
+		config.TlsEnabled = true
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", scheme)
+	}
+
+	if u.User != nil {
+		config.User = u.User.Username()
+		config.Pass, _ = u.User.Password()
+	}
+
+	config.ServerHost = u.Hostname()
+	config.ServerPort = u.Port()
+	if config.ServerHost == "" || config.ServerPort == "" {
+		return nil, fmt.Errorf("proxy URL must include host and port: %s", rawURL)
+	}
+
+	// 解析 query 参数
+	q := u.Query()
+	if psk := q.Get("psk"); psk != "" {
+		config.PresharedKey = psk
+		if strings.HasPrefix(config.PresharedKey, "@") {
+			config.PresharedKey, err = secure.ReadPSKFile(config.PresharedKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read psk file: %v", err)
+			}
+		}
+	}
+
+	if config.TlsEnabled {
+		config.Cert, err = secure.GenerateECDSACertificate(config.ServerHost, config.PresharedKey)
+		if err != nil {
+			return nil, fmt.Errorf("error generating EC certificate: %v", err)
+		}
+	}
+
+	return config, nil
+}
+
+// splitProxyChain 按逗号分割代理链，但忽略 URL 中 userinfo 内的逗号
+// URL 中密码含逗号时应使用 %2C 编码
+func splitProxyChain(chain string) []string {
+	var parts []string
+	current := ""
+	for i := 0; i < len(chain); i++ {
+		if chain[i] == ',' {
+			trimmed := strings.TrimSpace(current)
+			if trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+			current = ""
+		} else {
+			current += string(chain[i])
+		}
+	}
+	if trimmed := strings.TrimSpace(current); trimmed != "" {
+		parts = append(parts, trimmed)
+	}
+	return parts
+}
+
+// IsProxyURLFormat 检测 -x 参数是否为 URL 格式
+func IsProxyURLFormat(s string) bool {
+	return strings.Contains(s, "://")
+}
+
+// ParseProxyChainURL 解析逗号分隔的代理链 URL，返回链式 ProxyClient
+// 例如: "socks5://user:pass@1.1.1.1:1080,https://2.2.2.2:8080"
+func ParseProxyChainURL(logWriter io.Writer, chain string) (*ProxyClient, error) {
+	parts := splitProxyChain(chain)
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty proxy chain")
+	}
+
+	// 解析所有代理配置
+	configs := make([]*ProxyClientConfig, 0, len(parts))
+	for _, part := range parts {
+		config, err := ParseProxyURL(logWriter, part)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy URL %q: %w", part, err)
+		}
+		configs = append(configs, config)
+	}
+
+	// 构建链式 dialer：从第一个代理开始，每个后续代理通过前一个代理连接
+	var prevDialer Dialer
+	for i, config := range configs {
+		if i > 0 {
+			config.UpstreamDialer = prevDialer
+		}
+		pc, err := NewProxyClient(config)
+		if err != nil {
+			return nil, fmt.Errorf("create proxy client for hop %d: %w", i+1, err)
+		}
+		prevDialer = pc
+	}
+
+	// 返回最后一个 ProxyClient（它内部已经链式嵌套了前面所有的代理）
+	return prevDialer.(*ProxyClient), nil
 }

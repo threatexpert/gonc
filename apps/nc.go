@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.12"
+	VERSION = "v2.4.13"
 )
 
 type AppNetcatConfig struct {
@@ -58,6 +58,7 @@ type AppNetcatConfig struct {
 	app_s5s_Config        *AppS5SConfig
 	app_s5c_Config        *AppS5CConfig
 	arg_proxyc_Config     *ProxyClientConfig
+	arg_proxyc_Client     *ProxyClient // 预构建的代理客户端（用于链式代理）
 	fallbackRelayMode     bool
 	app_sh_args           string
 	app_sh_Config         *PtyShellConfig
@@ -174,7 +175,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 
 	// 定义命令行参数
 	fs.StringVar(&config.proxyProt, "X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
-	fs.StringVar(&config.proxyAddr, "x", "", "\"[options: -tls -psk] ip:port\" for proxy_address")
+	fs.StringVar(&config.proxyAddr, "x", "", "proxy_address. Classic: \"[options: -tls -psk] ip:port\"; URL: \"socks5://[user:pass@]host:port[?psk=key]\"; Chain: \"socks5://host1:port,https://host2:port\"")
 	fs.StringVar(&config.proxyAddr2, "x2", "", "Proxy address (same format as -x). Only used if P2P connection fails.")
 	fs.StringVar(&config.auth, "auth", "", "user:password for proxy")
 	fs.StringVar(&config.sendfile, "send", "", "path to file to send (optional)")
@@ -669,14 +670,37 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.fallbackRelayMode = true
 	}
 	if xcommandline != "" {
-		xconfig, err := ProxyClientConfigByCommandline(ncconfig.LogWriter, ncconfig.proxyProt, ncconfig.auth, xcommandline)
-		if err != nil {
-			if err != flag.ErrHelp {
-				ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
+		if IsProxyURLFormat(xcommandline) {
+			// URL 格式: socks5://user:pass@host:port,https://host2:port2
+			parts := splitProxyChain(xcommandline)
+			if len(parts) == 1 {
+				// 单跳 URL，转为 ProxyClientConfig 保持兼容
+				xconfig, err := ParseProxyURL(ncconfig.LogWriter, parts[0])
+				if err != nil {
+					ncconfig.Logger.Printf("Error parse proxy URL: %v\n", err)
+					os.Exit(1)
+				}
+				ncconfig.arg_proxyc_Config = xconfig
+			} else {
+				// 多跳链式代理
+				chainClient, err := ParseProxyChainURL(ncconfig.LogWriter, xcommandline)
+				if err != nil {
+					ncconfig.Logger.Printf("Error parse proxy chain: %v\n", err)
+					os.Exit(1)
+				}
+				ncconfig.arg_proxyc_Client = chainClient
 			}
-			os.Exit(1)
+		} else {
+			// 旧格式: -x "ip:port" 或 -x "-tls -psk key ip:port"
+			xconfig, err := ProxyClientConfigByCommandline(ncconfig.LogWriter, ncconfig.proxyProt, ncconfig.auth, xcommandline)
+			if err != nil {
+				if err != flag.ErrHelp {
+					ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
+				}
+				os.Exit(1)
+			}
+			ncconfig.arg_proxyc_Config = xconfig
 		}
-		ncconfig.arg_proxyc_Config = xconfig
 	}
 	if ncconfig.natchecker {
 		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "nat-checker")
@@ -831,7 +855,10 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				}
 			}
 
-			if ncconfig.arg_proxyc_Config != nil {
+			if hasProxyConfig(ncconfig) {
+				if ncconfig.arg_proxyc_Client != nil {
+					return network, "", "", "", fmt.Errorf("proxy chain is not supported with p2p mode")
+				}
 				if ncconfig.arg_proxyc_Config.Prot != "socks5" {
 					return network, "", "", "", fmt.Errorf("only allow socks5 proxy with p2p")
 				}
@@ -914,7 +941,7 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 // runListenMode 在监听模式下启动服务器
 func runListenMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
-	if ncconfig.arg_proxyc_Config == nil {
+	if !hasProxyConfig(ncconfig) {
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
 			if err != nil {
@@ -1055,7 +1082,7 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	var listener net.Listener
 	var err error
 	socks5BindMode := false
-	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
+	proxyClient, err := getProxyClient(ncconfig)
 	if err != nil {
 		ncconfig.Logger.Printf("Error create proxy client: %v\n", err)
 		return 1
@@ -1218,7 +1245,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	var conn net.Conn
 	var err error
 
-	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
+	proxyClient, err := getProxyClient(ncconfig)
 	if err != nil {
 		ncconfig.Logger.Printf("Error create proxy client: %v\n", err)
 		return 1
@@ -1283,7 +1310,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	remoteTargetAddr := net.JoinHostPort(host, port)
 	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 		proxyRemoteAddr := ""
-		if ncconfig.arg_proxyc_Config != nil {
+		if hasProxyConfig(ncconfig) {
 			if pktConn, ok := conn.(*netx.ConnFromPacketConn); ok {
 				if s5conn, ok := pktConn.PacketConn.(*Socks5UDPPacketConn); ok {
 					proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
@@ -1298,7 +1325,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 			offTip = fmt.Sprintf("UDP closed for: %s", remoteTargetAddr)
 		}
 	} else {
-		if ncconfig.arg_proxyc_Config == nil {
+		if !hasProxyConfig(ncconfig) {
 			onTip = fmt.Sprintf("Connected to: %s", conn.RemoteAddr().String())
 			offTip = fmt.Sprintf("Disconnected from: %s", conn.RemoteAddr().String())
 		} else {
