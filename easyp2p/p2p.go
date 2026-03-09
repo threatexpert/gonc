@@ -293,15 +293,29 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 	errChan := make(chan error, 1)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer func() {
+
+	// backgroundCleanup: 如果为true，表示收到消息后由后台goroutine负责清理，defer不再清理
+	backgroundCleanup := false
+
+	cleanupClients := func() {
 		clientsMu.Lock()
 		for _, c := range clients {
 			c.Disconnect(250)
 		}
 		clientsMu.Unlock()
 		time.Sleep(500 * time.Millisecond)
+	}
+
+	defer func() {
+		if !backgroundCleanup {
+			cleanupClients()
+		}
 	}()
-	defer cancel() //放后面，因为要比上面的协程先执行，想实现cancel后不会有新的添加到clients
+	defer func() {
+		if !backgroundCleanup {
+			cancel()
+		}
+	}()
 
 	ready := make(chan struct{}, 1)
 	fail := make(chan struct{}, len(brokerServers))
@@ -472,6 +486,8 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 		return "", -1, fmt.Errorf("failed to connect to any MQTT broker")
 	}
 
+	stopPublish := make(chan struct{})
+
 	switch exmode {
 	case EXMODE_waitOnly, EXMODE_reply:
 		//不主动发布消息
@@ -479,8 +495,6 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 		// 广播数据
 		publishAtLeastN(clients, topic, qos, sendData, 2)
 		// 定时重发 goroutine
-		stopPublish := make(chan struct{})
-		defer close(stopPublish)
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
@@ -498,10 +512,25 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 
 	}
 
+	defer func() {
+		if !backgroundCleanup {
+			close(stopPublish)
+		}
+	}()
+
 	select {
 	case r := <-recvRemoteData:
 		if exmode != EXMODE_waitOnly {
 			publishAtLeastN(clients, topic, qos, sendData, 2)
+			// 后台继续发布几秒，确保对方收到，然后再清理连接
+			backgroundCleanup = true
+			go func() {
+				defer cancel()
+				defer cleanupClients()
+				defer close(stopPublish)
+				// 继续让ticker重发4秒，覆盖2个ticker周期
+				time.Sleep(5 * time.Second)
+			}()
 		}
 		return r.data, r.index, nil
 	case err := <-errChan:
