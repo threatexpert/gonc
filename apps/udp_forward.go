@@ -278,15 +278,11 @@ func (c *udpFwdClient) readFromTunnel() {
 	}
 }
 
+// close 仅关闭 stream 和信号，不操作 clients map（调用方负责 map 删除）
 func (c *udpFwdClient) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		c.tunnelStream.Close()
-
-		c.fwd.clientsMu.Lock()
-		delete(c.fwd.clients, c.clientAddr.String())
-		c.fwd.clientsMu.Unlock()
-
 		c.fwd.logger.Printf("[udp-fwd] Closed: %s", c.clientAddr)
 	})
 }
@@ -308,14 +304,21 @@ func (f *udpForwarder) cleanupLoop() {
 
 func (f *udpForwarder) cleanup() {
 	now := time.Now()
+
+	// 先在锁内收集过期项并从 map 删除，再在锁外 close（避免死锁）
+	var expired []*udpFwdClient
 	f.clientsMu.Lock()
 	for key, c := range f.clients {
 		if now.Sub(c.lastActive) > udpFwdSessionTimeout {
-			c.close()
+			expired = append(expired, c)
 			delete(f.clients, key)
 		}
 	}
 	f.clientsMu.Unlock()
+
+	for _, c := range expired {
+		c.close()
+	}
 }
 
 func (f *udpForwarder) closeAll() {
@@ -327,13 +330,17 @@ func (f *udpForwarder) closeAll() {
 	}
 
 	f.clientsMu.Lock()
+	all := make([]*udpFwdClient, 0, len(f.clients))
 	for _, c := range f.clients {
-		c.close()
+		all = append(all, c)
 	}
 	f.clients = make(map[string]*udpFwdClient)
 	f.clientsMu.Unlock()
-}
 
+	for _, c := range all {
+		c.close()
+	}
+}
 // --- 辅助函数（避免与 udp_tproxy.go 中的同名函数冲突）---
 
 func udpFwdTrimCRLF(s string) string {

@@ -58,6 +58,11 @@ type udpMagicIPSession struct {
 	relay      *udpTProxyRelay
 	lastActive time.Time
 	done       chan struct{}
+	// 缓存 DNSLookupMagicIP 的结果，同一个 magicIP 只解析一次
+	resolveOnce sync.Once
+	targetHost  string
+	targetPort  int
+	resolveErr  error
 }
 
 // udpClientSession 对应一个 (clientAddr + magicIP) 的转发会话
@@ -212,6 +217,14 @@ func (r *udpTProxyRelay) getOrCreateMagicSession(magicIPStr string, magicIP net.
 	return sess
 }
 
+// resolveTarget 缓存 DNSLookupMagicIP 结果，同一个 magicIP 只查一次
+func (ms *udpMagicIPSession) resolveTarget() (string, int, error) {
+	ms.resolveOnce.Do(func() {
+		ms.targetHost, ms.targetPort, ms.resolveErr = DNSLookupMagicIP(ms.magicIP.String(), ms.relay.allowPublic)
+	})
+	return ms.targetHost, ms.targetPort, ms.resolveErr
+}
+
 // readLoop 专用 socket 收包循环
 func (ms *udpMagicIPSession) readLoop() {
 	buf := make([]byte, 65535)
@@ -260,8 +273,8 @@ func (ms *udpMagicIPSession) handlePacket(srcAddr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	// 解析 magic IP -> 真实目标
-	targetHost, targetPort, err := DNSLookupMagicIP(ms.magicIP.String(), ms.relay.allowPublic)
+	// 使用缓存的解析结果
+	targetHost, targetPort, err := ms.resolveTarget()
 	if err != nil {
 		ms.clientsMu.Unlock()
 		ms.relay.logger.Printf("[udp-tproxy] MagicIP lookup %s failed: %v", ms.magicIP, err)
@@ -419,17 +432,21 @@ func (cs *udpClientSession) readFromTunnel() {
 	}
 }
 
+// close 关闭客户端会话（仅关闭 stream 和信号，不操作 clients map）
+// 调用方负责从 map 中删除
 func (cs *udpClientSession) close() {
 	cs.closeOnce.Do(func() {
 		close(cs.done)
 		cs.tunnelStream.Close()
-
-		cs.magicSession.clientsMu.Lock()
-		delete(cs.magicSession.clients, cs.clientAddr.String())
-		cs.magicSession.clientsMu.Unlock()
-
 		cs.logger.Printf("[udp-tproxy] Closed: %s -> %s:%d", cs.clientAddr, cs.targetHost, cs.targetPort)
 	})
+}
+
+// removeFromMap 从 magicSession.clients 中删除自己（供非 cleanup 场景调用）
+func (cs *udpClientSession) removeFromMap() {
+	cs.magicSession.clientsMu.Lock()
+	delete(cs.magicSession.clients, cs.clientAddr.String())
+	cs.magicSession.clientsMu.Unlock()
 }
 
 // --- 清理 ---
@@ -458,17 +475,25 @@ func (r *udpTProxyRelay) cleanup() {
 	r.mu.RUnlock()
 
 	for key, ms := range snap {
+		// 收集过期的 client sessions
+		var expired []*udpClientSession
 		ms.clientsMu.Lock()
 		for ck, cs := range ms.clients {
 			if now.Sub(cs.lastActive) > udpTProxySessionTimeout {
-				cs.close()
-				delete(ms.clients, ck)
+				expired = append(expired, cs)
+				delete(ms.clients, ck) // 先从 map 删除
 			}
 		}
-		rem := len(ms.clients)
+		remaining := len(ms.clients)
 		ms.clientsMu.Unlock()
 
-		if rem == 0 && now.Sub(ms.lastActive) > udpTProxySessionTimeout {
+		// 在锁外执行 close（避免死锁）
+		for _, cs := range expired {
+			cs.close()
+		}
+
+		// 清理空的 magic session
+		if remaining == 0 && now.Sub(ms.lastActive) > udpTProxySessionTimeout {
 			r.mu.Lock()
 			if s, ok := r.magicSessions[key]; ok && s == ms {
 				delete(r.magicSessions, key)
@@ -501,6 +526,7 @@ func (r *udpTProxyRelay) closeAll() {
 		for _, cs := range ms.clients {
 			cs.close()
 		}
+		ms.clients = make(map[string]*udpClientSession)
 		ms.clientsMu.Unlock()
 		select {
 		case <-ms.done:
