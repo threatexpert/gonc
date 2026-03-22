@@ -8,42 +8,32 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/threatexpert/gonc/v2/netx"
 )
-
-// =============================================================================
-// UDP Forward for f:// mode (proto=udp / proto=all)
-//
-// 固定目标的 UDP 端口转发：
-//   本地 UDP listen → 收到客户端 UDP 包 → 通过 mux tunnel 转发 → 远端 UDP 发出
-//
-// 与 tproxy 不同：目标地址是配置时确定的（to=host:port），无需 magic IP 解析。
-// 远端复用现有的 handleRemoteUDPAssociate，零改动。
-// =============================================================================
 
 const (
 	udpFwdSessionTimeout  = 120 * time.Second
 	udpFwdCleanupInterval = 30 * time.Second
 )
 
-// udpForwarder 管理一个 UDP 端口转发实例
 type udpForwarder struct {
-	udpConn    *net.UDPConn
-	targetHost string
-	targetPort int
-	session    interface{} // mux session
-	muxcfg     *MuxSessionConfig
-	logger     *log.Logger
+	udpConn     *net.UDPConn
+	targetHost  string
+	targetPort  int
+	session     interface{}
+	muxcfg      *MuxSessionConfig
+	logger      *log.Logger
+	sessionDead int32 // atomic: mux session 失效后标记为 1
 
-	clients   map[string]*udpFwdClient // key = clientAddr
+	clients   map[string]*udpFwdClient
 	clientsMu sync.RWMutex
 
 	done chan struct{}
 }
 
-// udpFwdClient 对应一个客户端地址的转发会话
 type udpFwdClient struct {
 	clientAddr   *net.UDPAddr
 	tunnelStream net.Conn
@@ -53,13 +43,10 @@ type udpFwdClient struct {
 	closeOnce    sync.Once
 }
 
-// startUDPForward 启动 UDP 端口转发（在 runLinkListener 中调用）
 func startUDPForward(muxcfg *MuxSessionConfig, session interface{}, listenAddr string, targetHost string, targetPort int, doneChan <-chan struct{}) {
 	logger := muxcfg.Logger
 
-	lc := net.ListenConfig{
-		Control: netx.ControlUDP,
-	}
+	lc := net.ListenConfig{Control: netx.ControlUDP}
 	pc, err := lc.ListenPacket(context.Background(), "udp4", listenAddr)
 	if err != nil {
 		logger.Printf("[udp-fwd] Failed to listen UDP on %s: %v", listenAddr, err)
@@ -93,6 +80,9 @@ func startUDPForward(muxcfg *MuxSessionConfig, session interface{}, listenAddr s
 	fwd.readLoop()
 }
 
+// readLoop 收包循环
+// 已有会话：同步转发（无 goroutine，保序）
+// 新会话：异步建立
 func (f *udpForwarder) readLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -110,49 +100,73 @@ func (f *udpForwarder) readLoop() {
 			return
 		}
 
+		// 串行检查状态（readLoop 是单线程，无竞态窗口）
+		select {
+		case <-f.done:
+			return
+		default:
+		}
+		if atomic.LoadInt32(&f.sessionDead) != 0 {
+			continue
+		}
+
+		clientKey := srcAddr.String()
+
+		// 快速路径：已有会话，同步转发，直接用 buf
+		f.clientsMu.RLock()
+		c, exists := f.clients[clientKey]
+		f.clientsMu.RUnlock()
+
+		if exists {
+			c.sendToTunnel(buf[:n])
+			continue
+		}
+
+		// 慢速路径：新会话，copy + 开协程
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buf[:n])
-		go f.handlePacket(srcAddr, dataCopy)
+		go f.handleNewClient(srcAddr, dataCopy)
 	}
 }
 
-func (f *udpForwarder) handlePacket(srcAddr *net.UDPAddr, data []byte) {
-	clientKey := srcAddr.String()
-
-	f.clientsMu.RLock()
-	c, exists := f.clients[clientKey]
-	f.clientsMu.RUnlock()
-
-	if exists {
-		c.sendToTunnel(data)
+// handleNewClient 仅处理新客户端首包（独立 goroutine 中运行）
+func (f *udpForwarder) handleNewClient(srcAddr *net.UDPAddr, data []byte) {
+	select {
+	case <-f.done:
+		return
+	default:
+	}
+	if atomic.LoadInt32(&f.sessionDead) != 0 {
 		return
 	}
 
+	clientKey := srcAddr.String()
+
 	f.clientsMu.Lock()
-	if c, exists = f.clients[clientKey]; exists {
+	if c, exists := f.clients[clientKey]; exists {
 		f.clientsMu.Unlock()
 		c.sendToTunnel(data)
 		return
 	}
 
-	// 打开 mux stream
 	stream, err := openMuxStream(f.session)
 	if err != nil {
 		f.clientsMu.Unlock()
-		f.logger.Printf("[udp-fwd] Open mux stream failed: %v", err)
+		atomic.StoreInt32(&f.sessionDead, 1)
+		f.logger.Printf("[udp-fwd] Open mux stream failed (marking dead): %v", err)
 		return
 	}
 	sw := newStreamWrapper(stream,
 		muxSessionRemoteAddr(f.session),
 		muxSessionLocalAddr(f.session))
 
-	// 发送 UDP Associate 请求
 	targetAddr := net.JoinHostPort(f.targetHost, strconv.Itoa(f.targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_UDP, targetAddr)
 	if _, err = sw.Write([]byte(requestLine)); err != nil {
 		f.clientsMu.Unlock()
 		sw.Close()
-		f.logger.Printf("[udp-fwd] Send tunnel request failed: %v", err)
+		atomic.StoreInt32(&f.sessionDead, 1)
+		f.logger.Printf("[udp-fwd] Send tunnel request failed (marking dead): %v", err)
 		return
 	}
 
@@ -161,19 +175,21 @@ func (f *udpForwarder) handlePacket(srcAddr *net.UDPAddr, data []byte) {
 	if err != nil {
 		f.clientsMu.Unlock()
 		sw.Close()
-		f.logger.Printf("[udp-fwd] Read tunnel response failed: %v", err)
+		atomic.StoreInt32(&f.sessionDead, 1)
+		f.logger.Printf("[udp-fwd] Read tunnel response failed (marking dead): %v", err)
 		return
 	}
 	resp = udpFwdTrimCRLF(resp)
 	if len(resp) < 2 || resp[:2] != "OK" {
 		f.clientsMu.Unlock()
 		sw.Close()
-		f.logger.Printf("[udp-fwd] Tunnel UDP associate failed: %s", resp)
+		atomic.StoreInt32(&f.sessionDead, 1)
+		f.logger.Printf("[udp-fwd] Tunnel UDP associate failed (marking dead): %s", resp)
 		return
 	}
 	sw.SetReadDeadline(time.Time{})
 
-	c = &udpFwdClient{
+	c := &udpFwdClient{
 		clientAddr:   srcAddr,
 		tunnelStream: sw,
 		fwd:          f,
@@ -189,7 +205,6 @@ func (f *udpForwarder) handlePacket(srcAddr *net.UDPAddr, data []byte) {
 	c.sendToTunnel(data)
 }
 
-// sendToTunnel 封装为 SOCKS5 UDP 格式写入 tunnel
 func (c *udpFwdClient) sendToTunnel(data []byte) {
 	c.lastActive = time.Now()
 
@@ -232,7 +247,6 @@ func (c *udpFwdClient) sendToTunnel(data []byte) {
 	}
 }
 
-// readFromTunnel 从 tunnel 读回包，剥离 SOCKS5 头，发回客户端
 func (c *udpFwdClient) readFromTunnel() {
 	defer c.close()
 
@@ -278,7 +292,6 @@ func (c *udpFwdClient) readFromTunnel() {
 	}
 }
 
-// close 仅关闭 stream 和信号，不操作 clients map（调用方负责 map 删除）
 func (c *udpFwdClient) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
@@ -305,7 +318,6 @@ func (f *udpForwarder) cleanupLoop() {
 func (f *udpForwarder) cleanup() {
 	now := time.Now()
 
-	// 先在锁内收集过期项并从 map 删除，再在锁外 close（避免死锁）
 	var expired []*udpFwdClient
 	f.clientsMu.Lock()
 	for key, c := range f.clients {
@@ -341,7 +353,8 @@ func (f *udpForwarder) closeAll() {
 		c.close()
 	}
 }
-// --- 辅助函数（避免与 udp_tproxy.go 中的同名函数冲突）---
+
+// --- 辅助函数 ---
 
 func udpFwdTrimCRLF(s string) string {
 	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {

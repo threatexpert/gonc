@@ -8,69 +8,53 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/threatexpert/gonc/v2/netx"
 )
 
-// =============================================================================
-// UDP Transparent Proxy for TProxy mode
-//
-// 当 tproxy=1 时，在同一端口上额外监听 UDP。
-// 客户端发往 127.x.y.z:port 的 UDP 包，通过 MagicIP 解析出真实目标地址，
-// 然后通过 mux tunnel 的 UDP Associate 转发到远端。
-//
-// 关键设计：
-//   - 主 socket (0.0.0.0:port) 通过 syscall IP_PKTINFO + ReadMsgUDP 获取首包 dst IP
-//   - 为每个 magic IP 创建专用 socket (magicIP:port, SO_REUSEADDR)
-//   - 专用 socket 的回包源地址天然正确，Linux/Windows 通用
-//   - 不依赖 golang.org/x/net/ipv4（Windows 上 SetControlMessage 未实现）
-//   - 平台差异封装在 udp_pktinfo_unix.go / udp_pktinfo_windows.go 中
-// =============================================================================
-
 const (
-	udpTProxySessionTimeout  = 120 * time.Second // UDP 会话超时
-	udpTProxyCleanupInterval = 30 * time.Second  // 清理间隔
-	udpOOBSize               = 256               // OOB buffer 大小
+	udpTProxySessionTimeout  = 120 * time.Second
+	udpTProxyCleanupInterval = 30 * time.Second
+	udpOOBSize               = 256
 )
 
-// udpTProxyRelay 管理整个 UDP 透明代理
 type udpTProxyRelay struct {
-	mainConn    *net.UDPConn // 主 socket: 0.0.0.0:port
+	mainConn    *net.UDPConn
 	listenPort  int
 	allowPublic bool
-	session     interface{} // mux session
+	session     interface{}
 	muxcfg      *MuxSessionConfig
 	logger      *log.Logger
 
-	magicSessions map[string]*udpMagicIPSession // key = magicIP string
+	magicSessions map[string]*udpMagicIPSession
 	mu            sync.RWMutex
 
 	done chan struct{}
 }
 
-// udpMagicIPSession 对应一个 magic IP 的专用 socket
 type udpMagicIPSession struct {
-	magicIP    net.IP
-	udpConn    *net.UDPConn
-	clients    map[string]*udpClientSession // key = clientAddr
-	clientsMu  sync.RWMutex
-	relay      *udpTProxyRelay
-	lastActive time.Time
-	done       chan struct{}
-	// 缓存 DNSLookupMagicIP 的结果，同一个 magicIP 只解析一次
+	magicIP     net.IP
+	udpConn     *net.UDPConn
+	clients     map[string]*udpClientSession
+	clientsMu   sync.RWMutex
+	relay       *udpTProxyRelay
+	lastActive  time.Time
+	done        chan struct{}
+	sessionDead int32 // atomic: mux session 失效后标记为 1，不再尝试建新会话
+
 	resolveOnce sync.Once
 	targetHost  string
 	targetPort  int
 	resolveErr  error
 }
 
-// udpClientSession 对应一个 (clientAddr + magicIP) 的转发会话
 type udpClientSession struct {
 	clientAddr   *net.UDPAddr
 	targetHost   string
 	targetPort   int
-	tunnelStream net.Conn // mux stream
+	tunnelStream net.Conn
 	magicSession *udpMagicIPSession
 	lastActive   time.Time
 	done         chan struct{}
@@ -78,14 +62,10 @@ type udpClientSession struct {
 	logger       *log.Logger
 }
 
-// startUDPTProxy 启动 UDP 透明代理（在 runLinkListener 中调用）
 func startUDPTProxy(muxcfg *MuxSessionConfig, session interface{}, listenPort int, allowPublic bool, doneChan <-chan struct{}) {
 	logger := muxcfg.Logger
 
-	// 创建主 UDP socket (SO_REUSEADDR)
-	lc := net.ListenConfig{
-		Control: netx.ControlUDP,
-	}
+	lc := net.ListenConfig{Control: netx.ControlUDP}
 	bindAddr := fmt.Sprintf("0.0.0.0:%d", listenPort)
 	pc, err := lc.ListenPacket(context.Background(), "udp4", bindAddr)
 	if err != nil {
@@ -94,7 +74,6 @@ func startUDPTProxy(muxcfg *MuxSessionConfig, session interface{}, listenPort in
 	}
 	mainConn := pc.(*net.UDPConn)
 
-	// 通过 syscall 启用 IP_PKTINFO（见 udp_pktinfo_unix.go / udp_pktinfo_windows.go）
 	if err := enablePktInfo(mainConn); err != nil {
 		logger.Printf("[udp-tproxy] Failed to enable IP_PKTINFO: %v", err)
 		mainConn.Close()
@@ -127,7 +106,6 @@ func startUDPTProxy(muxcfg *MuxSessionConfig, session interface{}, listenPort in
 	relay.mainReadLoop()
 }
 
-// mainReadLoop 使用 ReadMsgUDP + OOB 解析获取 dst IP
 func (r *udpTProxyRelay) mainReadLoop() {
 	buf := make([]byte, 65535)
 	oob := make([]byte, udpOOBSize)
@@ -151,7 +129,13 @@ func (r *udpTProxyRelay) mainReadLoop() {
 			continue
 		}
 
-		// 平台特定的 OOB 解析（见 udp_pktinfo_*.go）
+		// 检查 relay 是否已关闭
+		select {
+		case <-r.done:
+			return
+		default:
+		}
+
 		dstIP, err := parseDstIPFromOOB(oob[:oobn])
 		if err != nil || dstIP == nil {
 			continue
@@ -168,9 +152,10 @@ func (r *udpTProxyRelay) mainReadLoop() {
 			continue
 		}
 
+		// 主 socket 收到的首包：必须 copy + 异步（因为后续专用 socket 接管）
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buf[:n])
-		go magicSess.handlePacket(srcAddr, dataCopy)
+		go magicSess.handleNewClient(srcAddr, dataCopy)
 	}
 }
 
@@ -189,10 +174,7 @@ func (r *udpTProxyRelay) getOrCreateMagicSession(magicIPStr string, magicIP net.
 		return sess
 	}
 
-	// 创建绑定到 magicIP:port 的专用 socket (SO_REUSEADDR)
-	lc := net.ListenConfig{
-		Control: netx.ControlUDP,
-	}
+	lc := net.ListenConfig{Control: netx.ControlUDP}
 	bindAddr := net.JoinHostPort(magicIPStr, strconv.Itoa(r.listenPort))
 	pc, err := lc.ListenPacket(context.Background(), "udp4", bindAddr)
 	if err != nil {
@@ -217,7 +199,6 @@ func (r *udpTProxyRelay) getOrCreateMagicSession(magicIPStr string, magicIP net.
 	return sess
 }
 
-// resolveTarget 缓存 DNSLookupMagicIP 结果，同一个 magicIP 只查一次
 func (ms *udpMagicIPSession) resolveTarget() (string, int, error) {
 	ms.resolveOnce.Do(func() {
 		ms.targetHost, ms.targetPort, ms.resolveErr = DNSLookupMagicIP(ms.magicIP.String(), ms.relay.allowPublic)
@@ -226,6 +207,8 @@ func (ms *udpMagicIPSession) resolveTarget() (string, int, error) {
 }
 
 // readLoop 专用 socket 收包循环
+// 已有会话：同步转发（无 goroutine 开销，保序）
+// 新会话：异步建立（因为有阻塞握手）
 func (ms *udpMagicIPSession) readLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -247,33 +230,58 @@ func (ms *udpMagicIPSession) readLoop() {
 			continue
 		}
 
+		// 串行检查 relay 和 session 状态（在 readLoop 线程内，无竞态窗口）
+		select {
+		case <-ms.relay.done:
+			return
+		default:
+		}
+		if atomic.LoadInt32(&ms.sessionDead) != 0 {
+			continue // mux 已死，静默丢弃
+		}
+
+		ms.lastActive = time.Now()
+		clientKey := srcAddr.String()
+
+		// 快速路径：已有会话，同步转发，直接用 buf（sendToTunnel 内会 copy）
+		ms.clientsMu.RLock()
+		cs, exists := ms.clients[clientKey]
+		ms.clientsMu.RUnlock()
+
+		if exists {
+			cs.sendToTunnel(buf[:n])
+			continue
+		}
+
+		// 慢速路径：新会话，copy 数据 + 开协程（阻塞握手）
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buf[:n])
-		go ms.handlePacket(srcAddr, dataCopy)
+		go ms.handleNewClient(srcAddr, dataCopy)
 	}
 }
 
-func (ms *udpMagicIPSession) handlePacket(srcAddr *net.UDPAddr, data []byte) {
-	ms.lastActive = time.Now()
-	clientKey := srcAddr.String()
-
-	ms.clientsMu.RLock()
-	cs, exists := ms.clients[clientKey]
-	ms.clientsMu.RUnlock()
-
-	if exists {
-		cs.sendToTunnel(data)
+// handleNewClient 仅处理新客户端的首包（在独立 goroutine 中运行）
+func (ms *udpMagicIPSession) handleNewClient(srcAddr *net.UDPAddr, data []byte) {
+	// 再次检查（可能在排队期间状态变了）
+	select {
+	case <-ms.relay.done:
+		return
+	default:
+	}
+	if atomic.LoadInt32(&ms.sessionDead) != 0 {
 		return
 	}
 
+	clientKey := srcAddr.String()
+
 	ms.clientsMu.Lock()
-	if cs, exists = ms.clients[clientKey]; exists {
+	// double-check：可能另一个 goroutine 已经创建了
+	if cs, exists := ms.clients[clientKey]; exists {
 		ms.clientsMu.Unlock()
 		cs.sendToTunnel(data)
 		return
 	}
 
-	// 使用缓存的解析结果
 	targetHost, targetPort, err := ms.resolveTarget()
 	if err != nil {
 		ms.clientsMu.Unlock()
@@ -281,46 +289,47 @@ func (ms *udpMagicIPSession) handlePacket(srcAddr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	// 打开 mux stream
 	stream, err := openMuxStream(ms.relay.session)
 	if err != nil {
 		ms.clientsMu.Unlock()
-		ms.relay.logger.Printf("[udp-tproxy] Open mux stream failed: %v", err)
+		atomic.StoreInt32(&ms.sessionDead, 1) // 标记为 dead，后续包全部丢弃
+		ms.relay.logger.Printf("[udp-tproxy] Open mux stream failed (marking dead): %v", err)
 		return
 	}
 	sw := newStreamWrapper(stream,
 		muxSessionRemoteAddr(ms.relay.session),
 		muxSessionLocalAddr(ms.relay.session))
 
-	// 发送 UDP Associate 请求
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_UDP, targetAddr)
 	if _, err = sw.Write([]byte(requestLine)); err != nil {
 		ms.clientsMu.Unlock()
 		sw.Close()
-		ms.relay.logger.Printf("[udp-tproxy] Send tunnel request failed: %v", err)
+		atomic.StoreInt32(&ms.sessionDead, 1)
+		ms.relay.logger.Printf("[udp-tproxy] Send tunnel request failed (marking dead): %v", err)
 		return
 	}
 
-	// 等待 OK
 	sw.SetReadDeadline(time.Now().Add(25 * time.Second))
 	resp, err := netx.ReadString(sw, '\n', 1024)
 	if err != nil {
 		ms.clientsMu.Unlock()
 		sw.Close()
-		ms.relay.logger.Printf("[udp-tproxy] Read tunnel response failed: %v", err)
+		atomic.StoreInt32(&ms.sessionDead, 1)
+		ms.relay.logger.Printf("[udp-tproxy] Read tunnel response failed (marking dead): %v", err)
 		return
 	}
 	resp = trimCRLF(resp)
 	if len(resp) < 2 || resp[:2] != "OK" {
 		ms.clientsMu.Unlock()
 		sw.Close()
-		ms.relay.logger.Printf("[udp-tproxy] Tunnel UDP associate failed: %s", resp)
+		atomic.StoreInt32(&ms.sessionDead, 1)
+		ms.relay.logger.Printf("[udp-tproxy] Tunnel UDP associate failed (marking dead): %s", resp)
 		return
 	}
 	sw.SetReadDeadline(time.Time{})
 
-	cs = &udpClientSession{
+	cs := &udpClientSession{
 		clientAddr:   srcAddr,
 		targetHost:   targetHost,
 		targetPort:   targetPort,
@@ -340,6 +349,8 @@ func (ms *udpMagicIPSession) handlePacket(srcAddr *net.UDPAddr, data []byte) {
 }
 
 // sendToTunnel 封装为 SOCKS5 UDP 格式写入 tunnel
+// 注意：此函数可能在 readLoop 线程中同步调用，也可能在 handleNewClient goroutine 中调用
+// 内部会 make 新 buffer，不持有调用方的 buf 引用
 func (cs *udpClientSession) sendToTunnel(data []byte) {
 	cs.lastActive = time.Now()
 
@@ -349,7 +360,6 @@ func (cs *udpClientSession) sendToTunnel(data []byte) {
 	default:
 	}
 
-	// SOCKS5 UDP header: RSV(2) + FRAG(1) + ATYP(1) + ADDR(var) + PORT(2)
 	targetIP := net.ParseIP(cs.targetHost)
 	var hdr []byte
 
@@ -373,7 +383,7 @@ func (cs *udpClientSession) sendToTunnel(data []byte) {
 		return
 	}
 
-	// [2 bytes length] + [socks5 udp packet] — 原子写入
+	// 分配新 buffer，不持有调用方 data 的引用
 	combined := make([]byte, 2+len(fullPacket))
 	binary.BigEndian.PutUint16(combined[0:2], uint16(len(fullPacket)))
 	copy(combined[2:], fullPacket)
@@ -384,7 +394,6 @@ func (cs *udpClientSession) sendToTunnel(data []byte) {
 	}
 }
 
-// readFromTunnel 从 tunnel 读取回包，剥离 SOCKS5 头，发回客户端
 func (cs *udpClientSession) readFromTunnel() {
 	defer cs.close()
 
@@ -421,32 +430,21 @@ func (cs *udpClientSession) readFromTunnel() {
 
 		cs.lastActive = time.Now()
 
-		// 剥离 SOCKS5 UDP 头
 		payload, err := udpStripSocks5Header(pktBuf[:pktLen])
 		if err != nil {
 			continue
 		}
 
-		// 通过专用 socket 回包（源 IP 天然正确）
 		cs.magicSession.udpConn.WriteToUDP(payload, cs.clientAddr)
 	}
 }
 
-// close 关闭客户端会话（仅关闭 stream 和信号，不操作 clients map）
-// 调用方负责从 map 中删除
 func (cs *udpClientSession) close() {
 	cs.closeOnce.Do(func() {
 		close(cs.done)
 		cs.tunnelStream.Close()
 		cs.logger.Printf("[udp-tproxy] Closed: %s -> %s:%d", cs.clientAddr, cs.targetHost, cs.targetPort)
 	})
-}
-
-// removeFromMap 从 magicSession.clients 中删除自己（供非 cleanup 场景调用）
-func (cs *udpClientSession) removeFromMap() {
-	cs.magicSession.clientsMu.Lock()
-	delete(cs.magicSession.clients, cs.clientAddr.String())
-	cs.magicSession.clientsMu.Unlock()
 }
 
 // --- 清理 ---
@@ -475,24 +473,21 @@ func (r *udpTProxyRelay) cleanup() {
 	r.mu.RUnlock()
 
 	for key, ms := range snap {
-		// 收集过期的 client sessions
 		var expired []*udpClientSession
 		ms.clientsMu.Lock()
 		for ck, cs := range ms.clients {
 			if now.Sub(cs.lastActive) > udpTProxySessionTimeout {
 				expired = append(expired, cs)
-				delete(ms.clients, ck) // 先从 map 删除
+				delete(ms.clients, ck)
 			}
 		}
 		remaining := len(ms.clients)
 		ms.clientsMu.Unlock()
 
-		// 在锁外执行 close（避免死锁）
 		for _, cs := range expired {
 			cs.close()
 		}
 
-		// 清理空的 magic session
 		if remaining == 0 && now.Sub(ms.lastActive) > udpTProxySessionTimeout {
 			r.mu.Lock()
 			if s, ok := r.magicSessions[key]; ok && s == ms {
