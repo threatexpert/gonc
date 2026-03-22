@@ -284,7 +284,7 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 
 #### **(2) 转发协议 (`f://`)**
 
-端口转发模式 (Port Forwarding)。监听一端的端口，将流量转发到另一端可达的目标地址。
+端口转发模式 (Port Forwarding)。支持TCP/UDP，监听一端的端口，将流量转发到另一端可达的目标地址。
 
 **语法格式**：
 `f://ip:port?to=target:port&[params]`
@@ -298,6 +298,8 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | 参数 | 示例 | 说明 |
 | --- | --- | --- |
 | **`outbound_bind`** | `outbound_bind=10.0.0.5` | 指定连接目标地址时使用的源 IP。 |
+| **`proto`** | `proto=udp` 或 `proto=all` | 不指定proto参数时默认仅开启TCP端口，proto=udp表示仅UDP转发。 |
+
 
 #### **(3) TLS 加密扩展 (`+tls`)**
 
