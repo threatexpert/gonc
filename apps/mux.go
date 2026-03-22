@@ -508,6 +508,13 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 		ln.Close()
 	}()
 
+	// 启动 UDP 透明代理（与 TCP 监听并行）
+	if scheme == "x" && rtConfig.UseTProxy {
+		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+		listenPort, _ := strconv.Atoi(portStr)
+		go startUDPTProxy(muxcfg, session, listenPort, rtConfig.TProxyAllowPublicIP, doneChan)
+	}
+
 	handleConn := func(c net.Conn, magicIP string) {
 		// tls处理
 		var keyingMaterial [32]byte
