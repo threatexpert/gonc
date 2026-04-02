@@ -771,8 +771,8 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 			cancel()
 		}()
 
-		buf := make([]byte, 65535)     // SOCKS5 UDP 数据包最大长度
-		lengthBytes := make([]byte, 2) // 用于存储长度前缀
+		// 预分配帧缓冲区: [2字节长度前缀][SOCKS5 UDP 数据]
+		frameBuf := make([]byte, 2+65535)
 
 		for {
 			select {
@@ -782,7 +782,7 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 			}
 			// 设置读取超时，以便在 localUDPConn 关闭时能退出循环
 			localUDPConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, cliAddr, err := localUDPConn.ReadFrom(buf) // 读取 SOCKS5 客户端发来的 UDP 数据报
+			n, cliAddr, err := localUDPConn.ReadFrom(frameBuf[2:]) // 直接读入偏移2处，预留长度前缀
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
@@ -805,23 +805,16 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 			})
 
 			// 封装数据包：[Length (2 bytes)] [SOCKS5 UDP Header + Data]
-			// 确保数据包长度在 2 字节可表示的范围内
 			if n > 65535 {
 				config.Logger.Printf("UDP packet too large (%d bytes) for 2-byte length prefix. Dropping.", n)
 				continue
 			}
-			binary.BigEndian.PutUint16(lengthBytes, uint16(n)) // 写入长度
+			binary.BigEndian.PutUint16(frameBuf[0:2], uint16(n))
 
-			// 写入长度前缀
-			_, err = tunnelStream.Write(lengthBytes)
+			// 一次 Write 发送完整帧
+			_, err = tunnelStream.Write(frameBuf[:2+n])
 			if err != nil {
-				config.Logger.Printf("Error writing length prefix to tunnel stream: %v", err)
-				return
-			}
-			// 写入完整的 SOCKS5 UDP 数据报
-			_, err = tunnelStream.Write(buf[:n])
-			if err != nil {
-				config.Logger.Printf("Error writing SOCKS5 UDP packet to tunnel stream: %v", err)
+				config.Logger.Printf("Error writing SOCKS5 UDP frame to tunnel stream: %v", err)
 				return
 			}
 		}
@@ -1446,8 +1439,9 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 			cancel()
 		}()
 
+		// 预分配帧缓冲区: [2字节长度前缀][SOCKS5 UDP 头(最大22字节)][数据]
+		frameBuf := make([]byte, 2+22+65535)
 		respBuf := make([]byte, 65535) // 用于接收 UDP 响应
-		lengthBytes := make([]byte, 2) // 用于存储长度前缀
 
 		for {
 			select {
@@ -1466,55 +1460,45 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				return // 非临时错误或连接关闭，退出此 goroutine
 			}
 
-			// 1. 构建 SOCKS5 UDP 响应数据报 (封装原始源地址)
-			// +----+------+------+----------+----------+----------+
-			// | RSV| FRAG | ATYP | BND.ADDR | BND.PORT |   DATA   |
-			// +----+------+------+----------+----------+----------+
-
-			var respATYP byte
-			var respAddrBytes []byte
+			// 在 frameBuf 中直接构建: [长度前缀(2)][SOCKS5 UDP 头][DATA]
+			off := 2 // 预留长度前缀位置
+			frameBuf[off] = SOCKS5_UDP_RSV >> 8
+			frameBuf[off+1] = SOCKS5_UDP_RSV & 0xFF // RSV
+			frameBuf[off+2] = SOCKS5_UDP_FRAG       // FRAG
+			off += 3
 
 			if ipv4 := udpSrcAddr.IP.To4(); ipv4 != nil {
-				respATYP = ATYP_IPV4
-				respAddrBytes = ipv4
+				frameBuf[off] = ATYP_IPV4
+				off++
+				off += copy(frameBuf[off:], ipv4) // BND.ADDR (4 bytes)
 			} else if ipv6 := udpSrcAddr.IP.To16(); ipv6 != nil {
-				respATYP = ATYP_IPV6
-				respAddrBytes = ipv6
+				frameBuf[off] = ATYP_IPV6
+				off++
+				off += copy(frameBuf[off:], ipv6) // BND.ADDR (16 bytes)
 			} else {
 				config.Logger.Printf("Cannot determine ATYP for source IP %s. Skipping.", udpSrcAddr.IP)
 				continue
 			}
 
-			// SOCKS5 UDP header itself
-			socks5UdpHeader := []byte{
-				SOCKS5_UDP_RSV >> 8, SOCKS5_UDP_RSV & 0xFF, // RSV
-				SOCKS5_UDP_FRAG, // FRAG
-				respATYP,        // ATYP
-			}
-			socks5UdpHeader = append(socks5UdpHeader, respAddrBytes...)                                     // BND.ADDR
-			socks5UdpHeader = append(socks5UdpHeader, byte(udpSrcAddr.Port>>8), byte(udpSrcAddr.Port&0xFF)) // BND.PORT
+			frameBuf[off] = byte(udpSrcAddr.Port >> 8)
+			frameBuf[off+1] = byte(udpSrcAddr.Port & 0xFF) // BND.PORT
+			off += 2
 
-			// 完整 SOCKS5 UDP 响应包（包含头和数据）
-			fullSocks5UdpPacket := append(socks5UdpHeader, respBuf[:nResp]...)
+			off += copy(frameBuf[off:], respBuf[:nResp])
 
-			// 2. 添加长度前缀
-			// 确保数据包长度在 2 字节可表示的范围内
-			if len(fullSocks5UdpPacket) > 65535 {
-				config.Logger.Printf("Response SOCKS5 UDP packet too large (%d bytes) for 2-byte length prefix. Dropping.", len(fullSocks5UdpPacket))
+			// 填入长度前缀 (不含前缀自身的2字节)
+			packetLen := off - 2
+			if packetLen > 65535 {
+				config.Logger.Printf("Response SOCKS5 UDP packet too large (%d bytes). Dropping.", packetLen)
 				continue
 			}
-			binary.BigEndian.PutUint16(lengthBytes, uint16(len(fullSocks5UdpPacket)))
+			binary.BigEndian.PutUint16(frameBuf[0:2], uint16(packetLen))
 
-			// 3. 将封装好的数据包写入隧道流，发回给本地 SOCKS5 代理
-			_, err = tunnelStream.Write(lengthBytes)
+			// 一次 Write 发送完整帧
+			_, err = tunnelStream.Write(frameBuf[:off])
 			if err != nil {
-				config.Logger.Printf("Error writing length prefix for UDP response to tunnel stream: %v", err)
-				return // 写入失败，退出
-			}
-			_, err = tunnelStream.Write(fullSocks5UdpPacket)
-			if err != nil {
-				config.Logger.Printf("Error writing SOCKS5 UDP response to tunnel stream: %v", err)
-				return // 写入失败，退出
+				config.Logger.Printf("Error writing SOCKS5 UDP response frame to tunnel stream: %v", err)
+				return
 			}
 		}
 	}(cancelRoot)
@@ -1839,6 +1823,8 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 			client:        c,
 			serverTCPConn: serverTCPConn,
 			localUDPConn:  localUDPConn, // 这里的 localUDPConn 已经 Dial 到 SOCKS5 服务器的 UDP 地址了
+			readBuf:       make([]byte, 65535),
+			writeBuf:      make([]byte, 65535),
 		}
 		wrapper, err := netx.NewConnFromPacketConn(s5uPacketConn, true, address)
 		if err != nil {
@@ -2053,6 +2039,10 @@ type Socks5UDPPacketConn struct {
 	// 它的底层类型是 *net.UDPConn
 	localUDPConn net.Conn
 
+	// 预分配缓冲区，避免每次 ReadFrom/WriteTo 分配
+	readBuf  []byte // ReadFrom 接收用
+	writeBuf []byte // WriteTo 组装用
+
 	// 标记是否已关闭
 	closed sync.Once
 }
@@ -2068,9 +2058,9 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 		return 0, nil, net.ErrClosed
 	}
 	// 1. 从已连接的 localUDPConn 读取完整的 SOCKS5 UDP 响应报文。
-	//    这会从 SOCKS5 服务器的 UDP 端口接收数据。
-	respBuf := make([]byte, 65535)
-	nResp, err := pc.localUDPConn.Read(respBuf) // 使用 Read() 是正确的
+	//    复用预分配缓冲区，避免每次调用分配 64KB。
+	respBuf := pc.readBuf
+	nResp, err := pc.localUDPConn.Read(respBuf)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -2095,7 +2085,8 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 		if nResp < headerOffset+4+2 {
 			return 0, nil, fmt.Errorf("malformed IPv4 SOCKS5 UDP response")
 		}
-		ip := net.IP(respBuf[headerOffset : headerOffset+4])
+		ip := make(net.IP, 4)
+		copy(ip, respBuf[headerOffset:headerOffset+4])
 		headerOffset += 4
 		sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
 		sourceAddr = &net.UDPAddr{IP: ip, Port: sourcePort}
@@ -2105,7 +2096,8 @@ func (pc *Socks5UDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err err
 		if nResp < headerOffset+16+2 {
 			return 0, nil, fmt.Errorf("malformed IPv6 SOCKS5 UDP response")
 		}
-		ip := net.IP(respBuf[headerOffset : headerOffset+16])
+		ip := make(net.IP, 16)
+		copy(ip, respBuf[headerOffset:headerOffset+16])
 		headerOffset += 16
 		sourcePort = int(respBuf[headerOffset])<<8 | int(respBuf[headerOffset+1])
 		sourceAddr = &net.UDPAddr{IP: ip, Port: sourcePort}
@@ -2187,21 +2179,20 @@ func (pc *Socks5UDPPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err erro
 		return 0, fmt.Errorf("failed to parse target host for SOCKS5 header: %w", err)
 	}
 
-	// 构建 SOCKS5 UDP 请求报头
-	header := []byte{
-		SOCKS5_UDP_RSV >> 8, SOCKS5_UDP_RSV & 0xFF, // RSV
-		0x00, // FRAG
-		atyp, // ATYP
-	}
-	header = append(header, addrBytes...)
-	header = append(header, byte(port>>8), byte(port&0xFF))
+	// 在预分配缓冲区中原地构建 SOCKS5 UDP 请求报文
+	buf := pc.writeBuf
+	buf[0] = SOCKS5_UDP_RSV >> 8
+	buf[1] = SOCKS5_UDP_RSV & 0xFF // RSV
+	buf[2] = 0x00                   // FRAG
+	buf[3] = atyp                   // ATYP
+	off := 4
+	off += copy(buf[off:], addrBytes)
+	buf[off] = byte(port >> 8)
+	buf[off+1] = byte(port & 0xFF)
+	off += 2
+	off += copy(buf[off:], b)
 
-	// 将SOCKS5头部和用户数据拼接
-	fullPacket := append(header, b...)
-
-	// 将完整的SOCKS5包写入已连接的UDP Conn，发往SOCKS5服务器。
-	// 使用 Write() 是正确的。
-	_, err = pc.localUDPConn.Write(fullPacket)
+	_, err = pc.localUDPConn.Write(buf[:off])
 	if err != nil {
 		return 0, err
 	}
