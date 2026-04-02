@@ -775,6 +775,11 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 		lengthBytes := make([]byte, 2) // 用于存储长度前缀
 
 		for {
+			select {
+			case <-ctxRoot.Done():
+				return
+			default:
+			}
 			// 设置读取超时，以便在 localUDPConn 关闭时能退出循环
 			localUDPConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, cliAddr, err := localUDPConn.ReadFrom(buf) // 读取 SOCKS5 客户端发来的 UDP 数据报
@@ -837,6 +842,11 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 		packetBuf := make([]byte, 65535)
 
 		for {
+			select {
+			case <-ctxRoot.Done():
+				return
+			default:
+			}
 			// 设置读取超时，以便在 tunnelStream 关闭时能退出循环
 			tunnelStream.SetReadDeadline(time.Now().Add(5 * time.Second))
 
@@ -892,13 +902,10 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 		}
 	}(cancelRoot)
 
-	select {
-	case <-ctxRoot.Done():
-		localUDPConn.Close()
-		tunnelStream.Close()
-	default:
-	}
-	// 等待两个转发 goroutine 结束
+	// 等待任一 goroutine 触发 cancel，然后关闭连接强制另一个退出
+	<-ctxRoot.Done()
+	localUDPConn.Close()
+	tunnelStream.Close()
 	wg.Wait()
 }
 
@@ -1240,7 +1247,7 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 }
 
 // handleRemoteUDPAssociate 是运行在远程的
-// 它只创建一个 UDP socket (localUDPConn)，
+// 它只创建一个 UDP socket (remoteLocalUDPConn)，
 // 所有从 tunnelStream 接收的 SOCKS5 UDP 数据报都通过这个 socket 发送出去，
 // 并且所有从这个 socket 接收的 UDP 响应包都封装后通过 tunnelStream 传回本地代理。
 func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
@@ -1293,9 +1300,15 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 		}()
 
 		lengthBytes := make([]byte, 2)
-		packetBuf := make([]byte, 65535) // 用于接收完整的 SOCKS5 UDP 数据报
+		packetBuf := make([]byte, 65535)                 // 用于接收完整的 SOCKS5 UDP 数据报
+		targetAddrCache := make(map[string]*net.UDPAddr) // 缓存目标地址解析结果
 
 		for {
+			select {
+			case <-ctxRoot.Done():
+				return
+			default:
+			}
 			// 设置读取超时，以便在 tunnelStream 关闭时能退出循环
 			tunnelStream.SetReadDeadline(time.Now().Add(5 * time.Second))
 
@@ -1390,21 +1403,32 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				config.Logger.Printf("UDP: %s->%s (first outbound packet of session)", remoteLocalUDPConn.LocalAddr().String(), net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			})
 
-			_, targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
-			if resolveErr != nil {
-				if isDenied {
-					config.Logger.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
-
-				} else {
-					config.Logger.Printf("Failed to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
+			// 查缓存
+			cacheKey := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+			cachedAddr, cacheHit := targetAddrCache[cacheKey]
+			if !cacheHit {
+				_, resolvedAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, cacheKey)
+				if resolveErr != nil {
+					if isDenied {
+						config.Logger.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
+					} else {
+						config.Logger.Printf("Failed to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
+					}
+					targetAddrCache[cacheKey] = nil // 缓存失败结果
+					continue
 				}
-				continue
+				cachedAddr = resolvedAddr.(*net.UDPAddr)
+				targetAddrCache[cacheKey] = cachedAddr
+			}
+
+			if cachedAddr == nil {
+				continue // 之前解析失败的目标
 			}
 
 			// 4. 将 SOCKS5 UDP 包中的 DATA 部分通过 remoteLocalUDPConn 发送给目标服务器
-			_, err = remoteLocalUDPConn.WriteToUDP(packetBuf[dataOffset:packetLength], targetAddr.(*net.UDPAddr))
+			_, err = remoteLocalUDPConn.WriteToUDP(packetBuf[dataOffset:packetLength], cachedAddr)
 			if err != nil {
-				config.Logger.Printf("Error writing UDP data to target %s: %v", targetAddr, err)
+				config.Logger.Printf("Error writing UDP data to target %s: %v", cachedAddr, err)
 				// 这里通常不直接 return，因为可能只是单个包发送失败
 				// 但如果错误是连接关闭，那也会在 ReadFromUDP/WriteToUDP 时检测到并退出
 			}
@@ -1426,6 +1450,11 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 		lengthBytes := make([]byte, 2) // 用于存储长度前缀
 
 		for {
+			select {
+			case <-ctxRoot.Done():
+				return
+			default:
+			}
 			// 设置读取超时，以便在 remoteLocalUDPConn 关闭时能退出循环
 			remoteLocalUDPConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			nResp, udpSrcAddr, err := remoteLocalUDPConn.ReadFromUDP(respBuf) // 从实际目标接收 UDP 响应
@@ -1490,13 +1519,10 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 		}
 	}(cancelRoot)
 
-	select {
-	case <-ctxRoot.Done():
-		tunnelStream.Close()
-		remoteLocalUDPConn.Close()
-	default:
-	}
-	// 等待两个转发 goroutine 结束
+	// 等待任一 goroutine 触发 cancel，然后关闭连接强制另一个退出
+	<-ctxRoot.Done()
+	tunnelStream.Close()
+	remoteLocalUDPConn.Close()
 	wg.Wait()
 	config.Logger.Printf("Remote UDP associate for stream from %s ended.", tunnelStream)
 }

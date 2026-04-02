@@ -14,6 +14,7 @@ import (
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/misc"
 	"github.com/threatexpert/gonc/v2/netx"
+	"github.com/threatexpert/gonc/v2/secure"
 )
 
 func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SConfig, stats_in, stats_out *misc.ProgressStats) {
@@ -67,23 +68,10 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 			config.Logger.Printf("SOCKS5 TCP Listen failed for %s->%s: %v", conn.RemoteAddr(), reqTarget, err)
 		}
 	} else if req.Command == "UDP" && config.EnableUDP {
-		fakeTunnelC, rawS := net.Pipe()
-		fakeTunnelS := misc.NewStatConn(rawS, stats_in, stats_out)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func(c net.Conn) {
-			defer wg.Done()
-			defer c.Close()
-			handleSocks5ClientOnStream(&s5config, c)
-		}(fakeTunnelS)
-
-		err = handleUDPAssociateViaTunnel(&s5config, conn, keyingMaterial, fakeTunnelC, req.Host, req.Port)
+		err = handleDirectUDPAssociate(&s5config, conn, keyingMaterial, stats_in, stats_out)
 		if err != nil {
 			config.Logger.Printf("SOCKS5 UDP Associate failed for %s: %v", conn.RemoteAddr(), err)
 		}
-		fakeTunnelC.Close()
-		fakeTunnelS.Close()
-		wg.Wait()
 	} else {
 		sendSocks5Response(conn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
 	}
@@ -316,5 +304,259 @@ func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SCon
 
 	// 双向拷贝，直到一方断开
 	bidirectionalCopy(clientConn, targetConn)
+	return nil
+}
+
+// handleDirectUDPAssociate 处理 standalone SOCKS5 服务器的 UDP ASSOCIATE 命令
+// 不经过 tunnel/net.Pipe，直接在 clientUDP 和 targetUDP 之间转发
+func handleDirectUDPAssociate(config *Socks5uConfig, clientConn net.Conn, keyingMaterial [32]byte, stats_in, stats_out *misc.ProgressStats) error {
+	// 1. 创建面向客户端的 UDP 监听
+	cliIP, _, _ := net.SplitHostPort(clientConn.LocalAddr().String())
+	localUDPAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(cliIP, "0"))
+	if err != nil {
+		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		return fmt.Errorf("resolve local UDP addr error: %w", err)
+	}
+
+	localUDPConn, err := net.ListenUDP("udp", localUDPAddr)
+	if err != nil {
+		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		return fmt.Errorf("listen local UDP error: %w", err)
+	}
+	defer localUDPConn.Close()
+
+	// 2. 创建面向目标的 UDP socket
+	var remoteBindAddr *net.UDPAddr
+	if len(config.Localbind) > 0 {
+		remoteBindAddr, err = net.ResolveUDPAddr("udp", net.JoinHostPort(config.Localbind[0], "0"))
+		if err != nil {
+			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+			return fmt.Errorf("resolve remote bind addr error: %w", err)
+		}
+	}
+
+	remoteUDPConn, err := net.ListenUDP("udp", remoteBindAddr)
+	if err != nil {
+		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+		return fmt.Errorf("listen remote UDP error: %w", err)
+	}
+	defer remoteUDPConn.Close()
+
+	// 3. 回复 SOCKS5 客户端成功响应
+	bindIP := config.ServerIP
+	bindPort := localUDPConn.LocalAddr().(*net.UDPAddr).Port
+	err = sendSocks5Response(clientConn, REP_SUCCEEDED, bindIP, bindPort)
+	if err != nil {
+		return fmt.Errorf("send UDP associate response error: %w", err)
+	}
+
+	config.Logger.Printf("UDP-Direct: local=%s, remote=%s", localUDPConn.LocalAddr(), remoteUDPConn.LocalAddr())
+
+	// 4. 如果有加密密钥，包装面向客户端的 UDP socket
+	var pktConnLocal net.PacketConn = localUDPConn
+	if keyingMaterial != [32]byte{} {
+		pktConnLocal, err = secure.NewSecureUDPConn(localUDPConn, keyingMaterial)
+		if err != nil {
+			return fmt.Errorf("create secure UDP conn error: %w", err)
+		}
+		defer pktConnLocal.Close()
+	}
+
+	// 5. 获取客户端 IP 用于安全校验
+	clientAddr := clientConn.RemoteAddr()
+	var clientIP net.IP
+	switch a := clientAddr.(type) {
+	case *net.TCPAddr:
+		clientIP = a.IP
+	case *net.UDPAddr:
+		clientIP = a.IP
+	}
+
+	var clientActualUDPAddr *net.UDPAddr // 记录客户端的实际 UDP 源地址
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	var once sync.Once
+	closeDone := func() {
+		once.Do(func() {
+			close(done)
+			pktConnLocal.Close()
+			remoteUDPConn.Close()
+			clientConn.Close()
+		})
+	}
+
+	wg.Add(3)
+
+	// Goroutine A: client UDP → 解析 SOCKS5 头 → target UDP
+	go func() {
+		defer wg.Done()
+		defer closeDone()
+
+		buf := make([]byte, 65535)
+		var firstPacketLogged bool
+
+		// 本地目标地址缓存，避免每包调用 ResolveAddrWithACL（内含 DialUDP 探测）
+		type resolvedTarget struct {
+			addr *net.UDPAddr
+		}
+		targetCache := make(map[string]*resolvedTarget) // key: "host:port"
+
+		for {
+			n, cliAddr, err := pktConnLocal.ReadFrom(buf)
+			if err != nil {
+				break
+			}
+			stats_in.Update(int64(n))
+
+			cliUDPAddr, ok := cliAddr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+
+			// 安全校验：只接受来自客户端 IP 的包
+			if clientIP != nil && !cliUDPAddr.IP.Equal(clientIP) {
+				continue
+			}
+
+			if clientActualUDPAddr == nil {
+				clientActualUDPAddr = cliUDPAddr
+				config.Logger.Printf("UDP: %s associated", clientActualUDPAddr)
+			}
+
+			// 解析 SOCKS5 UDP 报头
+			if n < 10 {
+				continue
+			}
+			frag := buf[2]
+			atyp := buf[3]
+			if frag != SOCKS5_UDP_FRAG {
+				continue
+			}
+
+			var targetHost string
+			var targetPort int
+			var dataOffset int
+
+			switch atyp {
+			case ATYP_IPV4:
+				if n < 10 {
+					continue
+				}
+				targetHost = net.IPv4(buf[4], buf[5], buf[6], buf[7]).String()
+				targetPort = int(buf[8])<<8 | int(buf[9])
+				dataOffset = 10
+			case ATYP_DOMAINNAME:
+				domainLen := int(buf[4])
+				if n < 5+domainLen+2 {
+					continue
+				}
+				targetHost = string(buf[5 : 5+domainLen])
+				targetPort = int(buf[5+domainLen])<<8 | int(buf[5+domainLen+1])
+				dataOffset = 5 + domainLen + 2
+			case ATYP_IPV6:
+				if n < 22 {
+					continue
+				}
+				targetHost = net.IP(buf[4 : 4+16]).String()
+				targetPort = int(buf[20])<<8 | int(buf[21])
+				dataOffset = 22
+			default:
+				continue
+			}
+
+			if !firstPacketLogged {
+				firstPacketLogged = true
+				config.Logger.Printf("UDP: first packet -> %s:%d", targetHost, targetPort)
+			}
+
+			// 查缓存，命中则直接发送，跳过 ResolveAddrWithACL（内含 DialUDP 探测）
+			cacheKey := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+			cached, hit := targetCache[cacheKey]
+			if !hit {
+				_, targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, cacheKey)
+				if resolveErr != nil {
+					if isDenied {
+						config.Logger.Printf("Denied UDP to %s:%d: %v", targetHost, targetPort, resolveErr)
+					}
+					// 解析失败也缓存（nil addr），避免重复尝试
+					targetCache[cacheKey] = &resolvedTarget{addr: nil}
+					continue
+				}
+				cached = &resolvedTarget{addr: targetAddr.(*net.UDPAddr)}
+				targetCache[cacheKey] = cached
+			}
+
+			if cached.addr == nil {
+				continue // 之前解析失败的目标
+			}
+
+			_, err = remoteUDPConn.WriteToUDP(buf[dataOffset:n], cached.addr)
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// Goroutine B: target UDP → 构造 SOCKS5 头 → client UDP
+	go func() {
+		defer wg.Done()
+		defer closeDone()
+
+		// 预分配: [SOCKS5 头(最大22字节)][数据]
+		frameBuf := make([]byte, 22+65535)
+		respBuf := make([]byte, 65535)
+
+		for {
+			nResp, udpSrcAddr, err := remoteUDPConn.ReadFromUDP(respBuf)
+			if err != nil {
+				break
+			}
+
+			if clientActualUDPAddr == nil {
+				continue
+			}
+
+			// 在 frameBuf 中构造 SOCKS5 UDP 响应
+			frameBuf[0] = SOCKS5_UDP_RSV >> 8
+			frameBuf[1] = SOCKS5_UDP_RSV & 0xFF // RSV
+			frameBuf[2] = SOCKS5_UDP_FRAG       // FRAG
+			off := 3
+
+			if ipv4 := udpSrcAddr.IP.To4(); ipv4 != nil {
+				frameBuf[off] = ATYP_IPV4
+				off++
+				off += copy(frameBuf[off:], ipv4)
+			} else if ipv6 := udpSrcAddr.IP.To16(); ipv6 != nil {
+				frameBuf[off] = ATYP_IPV6
+				off++
+				off += copy(frameBuf[off:], ipv6)
+			} else {
+				continue
+			}
+
+			frameBuf[off] = byte(udpSrcAddr.Port >> 8)
+			frameBuf[off+1] = byte(udpSrcAddr.Port & 0xFF)
+			off += 2
+
+			off += copy(frameBuf[off:], respBuf[:nResp])
+
+			_, err = pktConnLocal.WriteTo(frameBuf[:off], clientActualUDPAddr)
+			if err != nil {
+				break
+			}
+			stats_out.Update(int64(off))
+		}
+	}()
+
+	// Goroutine C: 监控 TCP 控制连接断开
+	go func() {
+		defer wg.Done()
+		defer closeDone()
+		buf := make([]byte, 1)
+		clientConn.Read(buf)
+	}()
+
+	<-done
+	wg.Wait()
 	return nil
 }
