@@ -2512,6 +2512,7 @@ func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.N
 	nconn, err := secure.DoNegotiation(cfg, conn, ncconfig.LogWriter)
 	if err != nil {
 		conn.Close()
+		fmt.Fprintf(ncconfig.LogWriter, "%sError: %v\n", cfg.Label, err)
 		return 1
 	}
 
@@ -2780,6 +2781,9 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err
 		}
+		if !connInfo.RelayUsed && relayConn != nil {
+			relayConn.Close()
+		}
 	}
 
 	rawconn := connInfo.Conns[0]
@@ -2806,7 +2810,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
 	statusMode := "P2P"
-	if connInfo.RelayUsed {
+	if connInfo.RelayMode {
 		statusMode = "Relay"
 	}
 	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)

@@ -635,11 +635,10 @@ func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout
 
 	var conn net.Conn
 	var isClient bool
-	var relayUsed bool
 
 	if result.Transport == "udp" {
 		p2pInfo.Network = "udp4"
-		conn, isClient, _, relayUsed, err = Auto_P2P_UDP_NAT_Traversal(
+		conn, isClient, _, _, err = Auto_P2P_UDP_NAT_Traversal(
 			ctx, "udp4", sessionKey, p2pInfo, false, 0, nil, logWriter)
 	} else {
 		p2pInfo.Network = "tcp4"
@@ -652,7 +651,7 @@ func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout
 
 	return &P2PConnInfo{
 		Conns: []net.Conn{conn}, SharedKey: sharedKey, IsClient: isClient,
-		RelayUsed: relayUsed, NetworksUsed: []string{p2pInfo.Network},
+		RelayUsed: false, RelayMode: false, NetworksUsed: []string{p2pInfo.Network},
 		PeerAddress: conn.RemoteAddr().String(),
 	}, nil
 }

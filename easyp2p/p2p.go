@@ -953,11 +953,15 @@ func p2pInfoPrint(logWriter io.Writer, p2pInfo *P2PAddressInfo) {
 	}
 }
 
+// 统计不含 relay 的独立公网出口 IP 数量
 func countUniquePublicIPs(infos []PunchingAddressInfo, ver string) int {
 	uniqueIPs := make(map[string]struct{})
 
 	for _, info := range infos {
 		if !strings.HasSuffix(info.Network, ver) {
+			continue
+		}
+		if info.NatType == "relay" {
 			continue
 		}
 		host, _, err := net.SplitHostPort(info.Nat)
@@ -975,6 +979,7 @@ type P2PConnInfo struct {
 	SharedKey    [32]byte
 	IsClient     bool
 	RelayUsed    bool
+	RelayMode    bool
 	NetworksUsed []string
 	PeerAddress  string
 }
@@ -1022,7 +1027,7 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 	var role int = 0 // 0: unknown, 1: client, 2: server
 	var mconn []net.Conn
 	var sharedKey [32]byte
-	var isRelayUsed bool
+	var relayMode bool
 	var networksUsed []string
 
 	for round, p2pInfo = range p2pInfos {
@@ -1046,7 +1051,7 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 			}
 			err = err2
 		} else {
-			conn, isRoleClient, _, relayUsed, err2 := Auto_P2P_UDP_NAT_Traversal(ctx, p2pInfo.Network, sessionUid, p2pInfo, false, round+1, relayConn, logWriter)
+			conn, isRoleClient, _, _relayMode, err2 := Auto_P2P_UDP_NAT_Traversal(ctx, p2pInfo.Network, sessionUid, p2pInfo, false, round+1, relayConn, logWriter)
 			if err2 == nil {
 				mconn = append(mconn, conn)
 				if role == 0 {
@@ -1057,8 +1062,8 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 					}
 					sharedKey = p2pInfo.SharedKey
 				}
-				if !isRelayUsed {
-					isRelayUsed = relayUsed
+				if !relayMode {
+					relayMode = _relayMode
 				}
 				networksUsed = append(networksUsed, p2pInfo.Network)
 				if !multipathEnabled {
@@ -1080,7 +1085,8 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 			Conns:        mconn,
 			SharedKey:    sharedKey,
 			IsClient:     CorS[role],
-			RelayUsed:    isRelayUsed,
+			RelayMode:    relayMode,
+			RelayUsed:    relayConn != nil && p2pInfo.LocalNATType == "relay",
 			NetworksUsed: networksUsed,
 			PeerAddress:  mconn[0].RemoteAddr().String(),
 		}
@@ -1195,7 +1201,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	errChan := make(chan error)
 
 	var uconn net.PacketConn
-	var isSharedUDPConn, isRelayUsed bool
+	var isSharedUDPConn, relayMode bool
 	if relayConn != nil && p2pInfo.LocalNATType == "relay" {
 		//本端用了relay的conn对象
 		uconn = relayConn
@@ -1209,7 +1215,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	if p2pInfo.LocalNATType == "relay" || p2pInfo.RemoteNATType == "relay" {
 		//任意一端有relay，ttl还原正常值，也不采用生日悖论打洞
-		isRelayUsed = true
+		relayMode = true
 		ttl = 64
 		randomSrcPort = false
 		randomDstPort = false
@@ -1227,7 +1233,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	if round > 0 {
 		err = Mqtt_P2P_Round_Sync(ctx, sessionUid, p2pInfo, isClient, round, 25*time.Second, logWriter)
 		if err != nil {
-			return nil, false, nil, isRelayUsed, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
+			return nil, false, nil, relayMode, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
 		}
 	}
 
@@ -1491,7 +1497,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	var uconnBrandnew net.Conn
 	select {
 	case addrPair := <-gotHoleCh:
-		if isRelayUsed {
+		if relayMode {
 			fmt.Fprintf(logWriter, "UDP relay connection established (RSP)!\n")
 		} else {
 			fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
@@ -1509,7 +1515,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			uconnBrandnew.Write(punchPayload)
 		}
 	case <-recvChan:
-		if isRelayUsed {
+		if relayMode {
 			fmt.Fprintf(logWriter, "UDP relay connection established!\n")
 		} else {
 			fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
@@ -1537,9 +1543,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	cancel()
 	stopPunching()
 	if errFin != nil {
-		return nil, false, nil, isRelayUsed, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
+		return nil, false, nil, relayMode, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
 	}
-	return uconnBrandnew, isClient, sharedKey, isRelayUsed, nil
+	return uconnBrandnew, isClient, sharedKey, relayMode, nil
 }
 
 func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPacketConn, error) {
