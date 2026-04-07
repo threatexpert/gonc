@@ -372,6 +372,15 @@ func handleDirectUDPAssociate(config *Socks5uConfig, clientConn net.Conn, keying
 		clientIP = a.IP
 	}
 
+	const udpIdleTimeout = 5 * time.Minute
+	// refreshDeadlines 刷新两个 UDP socket 的读超时，任一方向有数据即可续命
+	refreshDeadlines := func() {
+		deadline := time.Now().Add(udpIdleTimeout)
+		localUDPConn.SetReadDeadline(deadline)
+		remoteUDPConn.SetReadDeadline(deadline)
+	}
+	refreshDeadlines()
+
 	var clientActualUDPAddr *net.UDPAddr // 记录客户端的实际 UDP 源地址
 	var wg sync.WaitGroup
 	done := make(chan struct{})
@@ -406,6 +415,7 @@ func handleDirectUDPAssociate(config *Socks5uConfig, clientConn net.Conn, keying
 			if err != nil {
 				break
 			}
+			refreshDeadlines()
 			stats_in.Update(int64(n))
 
 			cliUDPAddr, ok := cliAddr.(*net.UDPAddr)
@@ -511,6 +521,7 @@ func handleDirectUDPAssociate(config *Socks5uConfig, clientConn net.Conn, keying
 			if err != nil {
 				break
 			}
+			refreshDeadlines()
 
 			if clientActualUDPAddr == nil {
 				continue
