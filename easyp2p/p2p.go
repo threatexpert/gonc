@@ -1503,7 +1503,8 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 			var wg sync.WaitGroup
 
-			fmt.Fprintf(logWriter, "  ↑ Sending Random Src Ports hole-punching packets to %d IP. TTL=%d; total=%d\n", 1+len(p2pInfo.RemoteUDP4NATAlternative), ttl, PunchingRandomPortCount)
+			totalSent := PunchingRandomPortCount * (1 + len(p2pInfo.RemoteUDP4NATAlternative))
+			fmt.Fprintf(logWriter, "  ↑ Sending Random Src Ports hole-punching packets to %d IP. TTL=%d; total=%d\n", 1+len(p2pInfo.RemoteUDP4NATAlternative), ttl, totalSent)
 
 			randSrcPorts := generateRandomPorts(PunchingRandomPortCount + 50)
 
