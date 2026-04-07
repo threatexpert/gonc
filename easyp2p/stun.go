@@ -29,6 +29,25 @@ var (
 	}
 )
 
+func NetworksForStun(network string) ([]string, error) {
+	switch network {
+	case "any":
+		return []string{"tcp6", "tcp4", "udp4"}, nil
+	case "any6":
+		return []string{"tcp6"}, nil
+	case "any4":
+		return []string{"tcp4", "udp4"}, nil
+	case "tcp":
+		return []string{"tcp6", "tcp4"}, nil
+	case "udp":
+		return []string{"udp6", "udp4"}, nil
+	case "tcp6", "tcp4", "udp6", "udp4":
+		return []string{network}, nil
+	default:
+		return nil, fmt.Errorf("unsupported network type: '%s'", network)
+	}
+}
+
 // GetPublicIP 获取公网IP，返回第一个成功响应的STUN服务器的结果
 func GetPublicIP(network, bind string, timeout time.Duration) (index int, localAddr, natAddr string, err error) {
 	// 1. result 结构体包含连接和客户端
@@ -301,6 +320,32 @@ type STUNResult struct {
 	Err     error  // Error, if any, encountered during the STUN request
 }
 
+// validateNatIP checks that the NAT IP returned by a STUN server is valid:
+// it must not be a private/reserved IP, and must not be the STUN server's own IP.
+func validateNatIP(natIP net.IP, remoteAddr net.Addr) error {
+	if natIP == nil {
+		return fmt.Errorf("NAT IP is nil")
+	}
+
+	// Check private/reserved ranges
+	if natIP.IsPrivate() || natIP.IsLoopback() || natIP.IsLinkLocalUnicast() || natIP.IsLinkLocalMulticast() || natIP.IsUnspecified() {
+		return fmt.Errorf("NAT IP %s is a private/reserved address", natIP)
+	}
+
+	// Check if NAT IP equals the STUN server's IP
+	if remoteAddr != nil {
+		remoteHost, _, err := net.SplitHostPort(remoteAddr.String())
+		if err == nil {
+			remoteIP := net.ParseIP(remoteHost)
+			if remoteIP != nil && remoteIP.Equal(natIP) {
+				return fmt.Errorf("NAT IP %s is the same as STUN server IP", natIP)
+			}
+		}
+	}
+
+	return nil
+}
+
 // GetPublicIPs attempts to discover public IP addresses using STUN servers.
 // It collects as many unique NAT IP addresses (by IP address only, ignoring port)
 // as possible within the specified timeout, and returns all results (unique successful ones and errors).
@@ -454,6 +499,12 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			}
 			if callErr != nil {
 				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN response error: %v", callErr)}
+				return
+			}
+
+			// Validate the returned NAT IP: reject private IPs and IPs matching the STUN server itself
+			if err := validateNatIP(xorAddr.IP, conn.RemoteAddr()); err != nil {
+				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN result invalid from %s: %v", stunAddr, err)}
 				return
 			}
 

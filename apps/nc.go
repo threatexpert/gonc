@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.13"
+	VERSION = "v2.5.0"
 )
 
 type AppNetcatConfig struct {
@@ -1414,8 +1414,20 @@ func runHTTPDownload(console net.Conn, ncconfig *AppNetcatConfig) int {
 }
 
 func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
-
-	networksToTryStun := []string{"tcp6", "tcp4", "udp6", "udp4"}
+	network := "any"
+	if ncconfig.udpProtocol {
+		network = "udp"
+	}
+	if ncconfig.useIPv4 {
+		network += "4"
+	} else if ncconfig.useIPv6 {
+		network += "6"
+	}
+	networksToTryStun, err := easyp2p.NetworksForStun(network)
+	if err != nil {
+		ncconfig.Logger.Printf("failed: %v\n", err)
+		return 1
+	}
 
 	ncconfig.Logger.Printf("STUN Results (Local -> NAT -> STUNServer)\n")
 	ncconfig.Logger.Printf("-----------\n")

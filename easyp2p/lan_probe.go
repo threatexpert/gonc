@@ -24,16 +24,6 @@ const (
 	CapLANProbe = "lan-probe"
 )
 
-// hasCap 检查能力列表中是否包含指定能力
-func hasCap(caps []string, cap string) bool {
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // bothPrivateLAN 检查两个地址（host:port 格式）是否都是私有 IP
 func bothPrivateLAN(lanAddr1, lanAddr2 string) bool {
 	ip1 := extractIP(lanAddr1)

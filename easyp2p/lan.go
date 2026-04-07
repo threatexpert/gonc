@@ -630,20 +630,20 @@ func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout
 	p2pInfo := &P2PAddressInfo{
 		LocalLAN: localAddr, LocalNAT: localAddr, LocalNATType: "easy",
 		RemoteLAN: remoteAddr, RemoteNAT: remoteAddr, RemoteNATType: "easy",
-		SharedKey: sharedKey,
 	}
+	sessCtx := &P2PSessionContext{SharedKey: sharedKey}
 
 	var conn net.Conn
 	var isClient bool
 
 	if result.Transport == "udp" {
 		p2pInfo.Network = "udp4"
-		conn, isClient, _, _, err = Auto_P2P_UDP_NAT_Traversal(
-			ctx, "udp4", sessionKey, p2pInfo, false, 0, nil, logWriter)
+		conn, isClient, _, err = Auto_P2P_UDP_NAT_Traversal(
+			ctx, "udp4", sessionKey, p2pInfo, sessCtx, 0, nil, logWriter)
 	} else {
 		p2pInfo.Network = "tcp4"
-		conn, isClient, _, err = Auto_P2P_TCP_NAT_Traversal(
-			ctx, "tcp4", sessionKey, p2pInfo, false, 0, logWriter)
+		conn, isClient, err = Auto_P2P_TCP_NAT_Traversal(
+			ctx, "tcp4", sessionKey, p2pInfo, sessCtx, 0, logWriter)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("LAN traversal: %w", err)
