@@ -503,13 +503,43 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	easyp2p.MQTTBrokerServers = parseMultiItems(ncconfig.mqttServers, true)
 
 	if ncconfig.stunSrv != "" {
-		if strings.HasPrefix(ncconfig.stunSrv, "@") {
+		if strings.HasPrefix(ncconfig.stunSrv, "http://") || strings.HasPrefix(ncconfig.stunSrv, "https://") {
+			// 支持通过 URL 获取配置，设置 10 秒超时避免阻塞初始化
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Get(ncconfig.stunSrv)
+			if err != nil {
+				ncconfig.Logger.Printf("fetch stun server list from URL failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				ncconfig.Logger.Printf("fetch stun server list returned bad status: %s\n", resp.Status)
+				os.Exit(1)
+			}
+
+			data, err := io.ReadAll(resp.Body)
+			if err != nil {
+				ncconfig.Logger.Printf("read stun server response body failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 兼容处理 Windows (\r\n) 和 Linux (\n) 的换行符
+			cleanData := strings.ReplaceAll(string(data), "\r\n", "\n")
+			lines := strings.Split(cleanData, "\n")
+			ncconfig.stunSrv = strings.Join(lines, ",")
+
+		} else if strings.HasPrefix(ncconfig.stunSrv, "@") {
+			// 原有的本地文件读取逻辑
 			data, err := os.ReadFile(strings.TrimPrefix(ncconfig.stunSrv, "@"))
 			if err != nil {
 				ncconfig.Logger.Printf("read stun server file failed: %v\n", err)
 				os.Exit(1)
 			}
-			lines := strings.Split(string(data), "\n")
+
+			// 同样兼容一下换行符
+			cleanData := strings.ReplaceAll(string(data), "\r\n", "\n")
+			lines := strings.Split(cleanData, "\n")
 			ncconfig.stunSrv = strings.Join(lines, ",")
 		}
 	}
