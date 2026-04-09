@@ -5,6 +5,7 @@ package apps
 
 import (
 	"os"
+	"os/signal"
 	"syscall"
 )
 
@@ -48,4 +49,20 @@ func daemonize(ncconfig *AppNetcatConfig) error {
 	// Parent should exit immediately.
 	os.Exit(0)
 	return nil
+}
+
+func ensureSignalHandler() {
+	if signal.Ignored(os.Interrupt) {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+		go func() {
+			sig := <-sigCh
+			exitCode := 1
+			if sysSig, ok := sig.(syscall.Signal); ok {
+				exitCode = 128 + int(sysSig)
+			}
+			os.Exit(exitCode)
+		}()
+	}
 }

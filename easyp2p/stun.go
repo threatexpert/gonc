@@ -363,13 +363,17 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 	if strings.HasPrefix(netLower, "tcp") {
 		netProto = "tcp"
 	} else {
-		localAddr, err := net.ResolveUDPAddr("udp", bind)
+		listenNetwork := "udp4"
+		if isIPv6 {
+			listenNetwork = "udp6"
+		}
+		localAddr, err := net.ResolveUDPAddr(listenNetwork, bind)
 		if err != nil {
 			return nil, err
 		}
 		basedUDPConn := shPktCon
 		if basedUDPConn == nil {
-			sharedUDPConn, err := net.ListenUDP("udp", localAddr)
+			sharedUDPConn, err := net.ListenUDP(listenNetwork, localAddr)
 			if err != nil {
 				return nil, err
 			}

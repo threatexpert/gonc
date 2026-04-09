@@ -39,11 +39,37 @@ func bothPrivateLAN(lanAddr1, lanAddr2 string) bool {
 	return parsed1.IsPrivate() && parsed2.IsPrivate()
 }
 
+// isGatewayWithInternal 判断是否为网关+内网机器的场景：
+// 一方 LAN==NAT（即网关本身），另一方 LAN 为私有 IP，且双方 NAT IP 相同
+func isGatewayWithInternal(p2pInfo *P2PAddressInfo) bool {
+	localNATIP := extractIP(p2pInfo.LocalNAT)
+	remoteNATIP := extractIP(p2pInfo.RemoteNAT)
+	if localNATIP == "" || remoteNATIP == "" || localNATIP != remoteNATIP {
+		return false
+	}
+
+	localLANIP := extractIP(p2pInfo.LocalLAN)
+	remoteLANIP := extractIP(p2pInfo.RemoteLAN)
+	localIsGateway := localLANIP == localNATIP
+	remoteIsGateway := remoteLANIP == remoteNATIP
+
+	// 恰好一方是网关（LAN==NAT），另一方是内网机器（LAN 为私有 IP）
+	if localIsGateway && !remoteIsGateway {
+		remoteParsed := net.ParseIP(remoteLANIP)
+		return remoteParsed != nil && remoteParsed.IsPrivate()
+	}
+	if remoteIsGateway && !localIsGateway {
+		localParsed := net.ParseIP(localLANIP)
+		return localParsed != nil && localParsed.IsPrivate()
+	}
+	return false
+}
+
 // shouldTryLANProbe 判断是否应该尝试 LAN 直连探测
 // 条件：
 //  1. 当前不被认为是同一内网 (inSameLAN == false)
 //  2. 是首轮打洞 (round == 1)
-//  3. 双方的 LAN 地址都是私有 IP
+//  3. 双方的 LAN 地址都是私有 IP，或者是网关+内网机器的场景
 //  4. 双方的 LAN 地址和 NAT 地址不同（说明确实在 NAT 后面）
 func shouldTryLANProbe(inSameLAN bool, round int, p2pInfo *P2PAddressInfo) bool {
 	if inSameLAN {
@@ -58,6 +84,12 @@ func shouldTryLANProbe(inSameLAN bool, round int, p2pInfo *P2PAddressInfo) bool 
 
 	if localLANIP == "" || remoteLANIP == "" {
 		return false
+	}
+
+	// 网关+内网场景：一方运行在网关上（LAN==NAT），另一方在其内网
+	// 这种情况下网关可以直接访问内网机器的 LAN 地址
+	if isGatewayWithInternal(p2pInfo) {
+		return true
 	}
 
 	// 双方都必须有私有地址

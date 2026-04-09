@@ -52,3 +52,6 @@ func daemonize(ncconfig *AppNetcatConfig) error {
 	os.Exit(0)
 	return nil
 }
+
+func ensureSignalHandler() {
+}

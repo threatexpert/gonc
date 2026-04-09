@@ -1843,11 +1843,14 @@ func Mqtt_P2P_Round_Sync(ctx context.Context, sessionUid string, sessCtx *P2PSes
 		msgSend = fmt.Sprintf("S%d", round)
 		msgNeed = fmt.Sprintf("C%d", round)
 	}
+	filter := func(msg string) (bool, error) {
+		return msg == msgNeed, nil
+	}
 
 	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ...\n", round)
 	topicCID := MQTT_GenerateClientID(TopicDesc_RoundSync, sessionUid, 0)
-	msgRecv, _, err := MQTT_SecureExchange[string](
-		ctx, EXMODE_mutual, msgSend, topicCID, "gonc-exchange-sync", sessionUid, sessCtx.LocalBindIP, timeout, nil)
+	msgRecv, _, err := MQTT_SecureExchange(
+		ctx, EXMODE_mutual, msgSend, topicCID, "gonc-exchange-sync", sessionUid, sessCtx.LocalBindIP, timeout, filter)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
 	}
@@ -2106,6 +2109,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		remoteLANIP := extractIP(p2pInfo.RemoteLAN)
 		if err == nil && (peerIP == remoteIP ||
 			(sameNAT && similarLAN && IsSameLAN(peerIP, remoteIP)) ||
+			(sameNAT && remoteLANIP != "" && peerIP == remoteLANIP) ||
 			(lanProbeEnabled && (peerIP == remoteLANIP || IsSameLAN(peerIP, localAddr.IP.String())))) {
 			tryCommit(conn, "accept")
 		} else {

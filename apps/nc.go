@@ -442,6 +442,7 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	}
 	config.ConsoleMode = true
 	misc.EnableVirtualTerminal()
+	ensureSignalHandler()
 
 	return App_Netcat_main_withconfig(console, config)
 }
