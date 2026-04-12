@@ -752,7 +752,7 @@ func configureSecurity(ncconfig *AppNetcatConfig) error {
 			panic(err)
 		}
 		fmt.Fprintf(os.Stdout, "%s\n", ncconfig.presharedKey)
-		os.Exit(1)
+		os.Exit(0)
 	}
 	if ncconfig.presharedKey != "" {
 		if strings.HasPrefix(ncconfig.presharedKey, "@") {
