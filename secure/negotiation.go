@@ -412,8 +412,6 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 		return nil, fmt.Errorf("DTLS initialization failed: %w", err)
 	}
 
-	fmt.Fprintf(logWriter, "%sDTLS-C handshake completed successfully\n", config.Label)
-
 	//dtlsConn.HandshakeContext似乎有bug，无法在ctx取消后返回，
 	//dtlsConn.SetDeadline似乎也有bug
 	//这里从conn加一个SetDeadline
@@ -434,6 +432,9 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 		}
 		break
 	}
+
+	fmt.Fprintf(logWriter, "%sDTLS handshake completed successfully\n", config.Label)
+
 	conn.SetDeadline(time.Time{}) // 取消握手超时
 
 	if storeKeyingMaterial != nil {
