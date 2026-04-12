@@ -23,6 +23,11 @@ func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, erro
 	c.SysProcAttr.Setsid = true
 	c.SysProcAttr.Setctty = true
 
+	c.Env = os.Environ()
+	if os.Getenv("TERM") == "" {
+		c.Env = append(c.Env, "TERM=xterm")
+	}
+
 	var err2 error
 	pty, tty, err := pty.Open()
 	if err != nil {
