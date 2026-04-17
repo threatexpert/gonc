@@ -171,9 +171,15 @@ func bidirectionalCopy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 	errCh := make(chan ChanError, 2)
 	go streamCopy(stream, local, errCh, 1)
 	go streamCopy(local, stream, errCh, 2)
-	for i := 0; i < 2; i++ {
-		<-errCh
+	<-errCh // 等第一个方向结束
+	// 给另一个方向最多30秒完成
+	if conn, ok := stream.(net.Conn); ok {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}
+	if conn, ok := local.(net.Conn); ok {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	}
+	<-errCh // 等第二个方向
 }
 
 func App_mux_usage(logWriter io.Writer) {

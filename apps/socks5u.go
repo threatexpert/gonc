@@ -1171,7 +1171,9 @@ func handleSocks5ClientOnStream(config *Socks5uConfig, tunnelStream net.Conn) {
 	defer tunnelStream.Close()
 
 	// 读取流的第一个请求行
+	tunnelStream.SetReadDeadline(time.Now().Add(30 * time.Second))
 	requestLine, err := netx.ReadString(tunnelStream, '\n', 1024)
+	tunnelStream.SetReadDeadline(time.Time{}) // 读完重置
 	if err != nil {
 		config.Logger.Printf("Failed to read request line from mux stream: %v", err)
 		return
