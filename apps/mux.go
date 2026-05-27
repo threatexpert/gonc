@@ -418,6 +418,7 @@ type linkRuntimeConfig struct {
 	TargetPort          int
 	ForwardTarget       string
 	ForwardProto        string // "tcp"(默认), "udp", "all"
+	ProxyProto          string // "" 关闭；"v2" 在 stream OK 后注入 PROXY v2 头给对端透传到目标业务
 }
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
@@ -449,6 +450,18 @@ func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.
 			return nil, fmt.Errorf("failed to load/generate TLS certificate: %v", err)
 		}
 		cfg.NtConfig.Certs = []tls.Certificate{*cert}
+	}
+
+	// 通用参数：PROXY protocol 注入开关。仅支持 "v2"
+	if pp := params.Get("pp"); pp != "" {
+		if pp != "v2" {
+			return nil, fmt.Errorf("invalid pp value '%s', only 'v2' is supported", pp)
+		}
+		if scheme == "raw" {
+			muxcfg.Logger.Printf("[link] pp=v2 has no effect on raw scheme, ignored")
+		} else {
+			cfg.ProxyProto = pp
+		}
 	}
 
 	// 2. Scheme 特定配置分析
@@ -589,7 +602,15 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 			}
 		}
 
-		ServeProxyOnTunnel(&s5config, c, keyingMaterial, streamWithCloseWrite, cmd, tHost, tPort)
+		var proxyHeader []byte
+		if rtConfig.ProxyProto == "v2" {
+			proxyHeader = BuildProxyV2HeaderFromConns(c)
+			if proxyHeader == nil {
+				muxcfg.Logger.Printf("[link] pp=v2: skip header (non-TCP addr): %s -> %s", c.RemoteAddr(), c.LocalAddr())
+			}
+		}
+
+		ServeProxyOnTunnel(&s5config, c, keyingMaterial, streamWithCloseWrite, cmd, tHost, tPort, proxyHeader)
 	}
 
 	for {
@@ -628,6 +649,11 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	if err != nil {
 		return fmt.Errorf("local config parse error: %v", err)
 	}
+	// 同时解析 R-Config（用来知道对端 listener 是否启用 pp=v2）
+	_, _, rParams, err := parseLinkConfig(rConf)
+	if err != nil {
+		return fmt.Errorf("remote config parse error: %v", err)
+	}
 
 	localActive := "0"
 	if lScheme != "none" {
@@ -641,6 +667,11 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 	sendConf += fmt.Sprintf("%speer_active=%s", separator, localActive)
 	separator = "&"
+
+	// 若本端（L）开了 pp=v2，需告知对端"我会发 PROXY v2 头"，对端作为 dialer 才会读
+	if lParams.Get("pp") == "v2" {
+		sendConf += fmt.Sprintf("%speer_pp=v2", separator)
+	}
 
 	if !strings.HasPrefix(rConf, "none") {
 		// 追加 owner 参数
@@ -668,6 +699,14 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 	cfg.Logger.Printf("[link] Remote ready (%s).", ack)
 
+	// 解析 ACK 中的 caps（兼容老版本 R：没有 caps 字段即视为空集合）
+	caps := parseAckCaps(ack)
+
+	// 任一侧配置了 pp=v2，对端必须支持 pp_v2 能力位，否则握手失败
+	if (lParams.Get("pp") == "v2" || rParams.Get("pp") == "v2") && !caps["pp_v2"] {
+		return fmt.Errorf("remote does not support pp_v2 capability (ACK=%q). please upgrade the peer", ack)
+	}
+
 	cfg.SessionConn.SetDeadline(time.Time{})
 
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, true)
@@ -676,9 +715,11 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 
 	remoteActive := !strings.HasPrefix(rConf, "none")
+	// 作为 dialer，是否要从 stream 读 PROXY v2 头取决于"对端 listener 是否启用了 pp=v2"
+	expectPP := rParams.Get("pp") == "v2"
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive)
+		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive, expectPP)
 		close(sessionDone)
 	}()
 
@@ -770,10 +811,10 @@ func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done 
 		return err
 	}
 
-	// 单向模式：drainOnly = true
+	// 单向模式：drainOnly = true；legacy 流程不支持 pp=v2
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, "", true)
+		startRemoteStreamAcceptLoop(cfg, session, "", true, false)
 		close(sessionDone)
 	}()
 
@@ -929,9 +970,9 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 			}
 		}()
 
-		ackMsg = fmt.Sprintf("OK:%s", actualAddr)
+		ackMsg = fmt.Sprintf("OK:%s;%s", actualAddr, buildAckCaps())
 	} else {
-		ackMsg = "OK:none"
+		ackMsg = "OK:none;" + buildAckCaps()
 	}
 
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
@@ -952,9 +993,12 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 
 	cfg.Logger.Printf("[linkagent] Session established. OwnerID=%s", rParams.Get("owner"))
 
+	// 作为 dialer，是否要从 stream 读 PROXY v2 头取决于对端（L）listener 是否启用 pp=v2，
+	// 这个信息由 L 通过 rConf 中的 peer_pp=v2 字段传过来。
+	expectPP := rParams.Get("peer_pp") == "v2"
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive)
+		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive, expectPP)
 		close(sessionDone)
 	}()
 
@@ -1014,11 +1058,14 @@ func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 }
 
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
-func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool) error {
+// expectProxyHeader：握手期协商出"对端是 listener 且开启了 pp=v2"则为 true，
+// 此时每条 stream 在 OK 之后会先收到一个完整的 PROXY v2 头部，本侧需消费并透传到 target。
+func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool, expectProxyHeader bool) error {
 	listener := newMuxListener(session)
 	s5config := Socks5uConfig{
-		Logger:     cfg.Logger,
-		AccessCtrl: cfg.AccessCtrl,
+		Logger:            cfg.Logger,
+		AccessCtrl:        cfg.AccessCtrl,
+		ExpectProxyHeader: expectProxyHeader,
 	}
 	if localbind != "" {
 		s5config.Localbind = strings.Split(localbind, ",")
@@ -1107,7 +1154,7 @@ func handleSocks5uMode(cfg *MuxSessionConfig) error {
 	}
 
 	cfg.Logger.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
-	err = startRemoteStreamAcceptLoop(cfg, session, "", false)
+	err = startRemoteStreamAcceptLoop(cfg, session, "", false, false)
 	cfg.Logger.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
 	return err
 }
@@ -1140,6 +1187,33 @@ func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 	cfg.Logger.Println("httpserver ready on mux")
 
 	return server.Start()
+}
+
+// supportedCaps 本进程对外宣告的能力位（写进 R 端的 ACK）。新增能力时追加到这里即可。
+var supportedCaps = []string{"pp_v2"}
+
+// buildAckCaps 返回形如 "caps=pp_v2,xxx" 的片段。
+func buildAckCaps() string {
+	return "caps=" + strings.Join(supportedCaps, ",")
+}
+
+// parseAckCaps 从 ACK 中解析 caps。ACK 形如 "OK:<addr>;caps=pp_v2,xxx"。
+// 老版本 ACK 没有 caps 段，返回空集合。
+func parseAckCaps(ack string) map[string]bool {
+	out := make(map[string]bool)
+	for _, seg := range strings.Split(ack, ";") {
+		seg = strings.TrimSpace(seg)
+		if !strings.HasPrefix(seg, "caps=") {
+			continue
+		}
+		for _, c := range strings.Split(seg[len("caps="):], ",") {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				out[c] = true
+			}
+		}
+	}
+	return out
 }
 
 func sendHello(conn net.Conn, mode string) error {

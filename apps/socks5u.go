@@ -75,6 +75,9 @@ type Socks5uConfig struct {
 	ServerIP   string
 	Localbind  []string
 	AccessCtrl *acl.ACL
+	// ExpectProxyHeader：若为 true，从 mux stream 收到 OK 之后会先读取一个完整的
+	// PROXY v2 头部（用于解析源/目的地址记日志），并原样转发到 targetConn。
+	ExpectProxyHeader bool
 }
 
 type Socks5Request struct {
@@ -495,8 +498,130 @@ func sendSocks5Response(conn net.Conn, rep byte, bindAddr string, bindPort int) 
 	return nil
 }
 
+// PROXY protocol v2 常量（HAProxy spec）
+const (
+	proxyV2VerCmdPROXY  byte = 0x21 // v2 + PROXY
+	proxyV2FamProtoTCP4 byte = 0x11
+	proxyV2FamProtoTCP6 byte = 0x21
+	proxyV2MaxBodyLen        = 1024
+)
+
+var proxyV2Sig = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+
+// BuildProxyV2Header 构造 PROXY v2 PROXY 命令头部。
+// 若 src/dst 均为 IPv4 则用 TCP/IPv4 (28 字节)，否则 TCP/IPv6 (52 字节，必要时 v4 映射到 v6)。
+func BuildProxyV2Header(src, dst *net.TCPAddr) []byte {
+	srcV4 := src.IP.To4()
+	dstV4 := dst.IP.To4()
+	isV4 := srcV4 != nil && dstV4 != nil
+
+	var size int
+	var addrLen uint16
+	if isV4 {
+		addrLen = 12
+		size = 16 + 12
+	} else {
+		addrLen = 36
+		size = 16 + 36
+	}
+
+	h := make([]byte, size)
+	copy(h[:12], proxyV2Sig)
+	h[12] = proxyV2VerCmdPROXY
+	if isV4 {
+		h[13] = proxyV2FamProtoTCP4
+		binary.BigEndian.PutUint16(h[14:16], addrLen)
+		copy(h[16:20], srcV4)
+		copy(h[20:24], dstV4)
+		binary.BigEndian.PutUint16(h[24:26], uint16(src.Port))
+		binary.BigEndian.PutUint16(h[26:28], uint16(dst.Port))
+	} else {
+		h[13] = proxyV2FamProtoTCP6
+		binary.BigEndian.PutUint16(h[14:16], addrLen)
+		copy(h[16:32], src.IP.To16())
+		copy(h[32:48], dst.IP.To16())
+		binary.BigEndian.PutUint16(h[48:50], uint16(src.Port))
+		binary.BigEndian.PutUint16(h[50:52], uint16(dst.Port))
+	}
+	return h
+}
+
+// BuildProxyV2HeaderFromConns 从一个 accepted client conn 抽出 src/dst 构造头部。
+// src 用 c.RemoteAddr()，dst 用 c.LocalAddr()（客户端原本连到的本机 listener 地址）。
+func BuildProxyV2HeaderFromConns(c net.Conn) []byte {
+	src, _ := c.RemoteAddr().(*net.TCPAddr)
+	dst, _ := c.LocalAddr().(*net.TCPAddr)
+	if src == nil || dst == nil {
+		return nil
+	}
+	return BuildProxyV2Header(src, dst)
+}
+
+// ReadProxyV2Header 从 r 读出完整的 PROXY v2 头部。
+// 返回原始字节（用于原样转发给目标）+ 解析出的 src/dst（仅供日志，LOCAL 命令时为 nil）。
+func ReadProxyV2Header(r io.Reader) (raw []byte, src, dst *net.TCPAddr, err error) {
+	head := make([]byte, 16)
+	if _, err = io.ReadFull(r, head); err != nil {
+		return nil, nil, nil, fmt.Errorf("read PROXY v2 prefix: %w", err)
+	}
+	for i := 0; i < 12; i++ {
+		if head[i] != proxyV2Sig[i] {
+			return nil, nil, nil, fmt.Errorf("invalid PROXY v2 signature")
+		}
+	}
+	verCmd := head[12]
+	famProto := head[13]
+	length := binary.BigEndian.Uint16(head[14:16])
+
+	if (verCmd >> 4) != 2 {
+		return nil, nil, nil, fmt.Errorf("not PROXY v2 (version=%d)", verCmd>>4)
+	}
+	if length > proxyV2MaxBodyLen {
+		return nil, nil, nil, fmt.Errorf("PROXY v2 body too large: %d", length)
+	}
+
+	body := make([]byte, length)
+	if length > 0 {
+		if _, err = io.ReadFull(r, body); err != nil {
+			return nil, nil, nil, fmt.Errorf("read PROXY v2 body: %w", err)
+		}
+	}
+	raw = append(head, body...)
+
+	cmd := verCmd & 0x0F
+	if cmd == 0 { // LOCAL：无地址信息
+		return raw, nil, nil, nil
+	}
+	if cmd != 1 {
+		return raw, nil, nil, fmt.Errorf("unsupported PROXY v2 command: %d", cmd)
+	}
+
+	family := famProto >> 4
+	proto := famProto & 0x0F
+	if proto != 1 {
+		return raw, nil, nil, fmt.Errorf("unsupported PROXY v2 transport: %d", proto)
+	}
+	switch family {
+	case 1: // IPv4
+		if len(body) < 12 {
+			return raw, nil, nil, fmt.Errorf("PROXY v2 IPv4 body too short")
+		}
+		src = &net.TCPAddr{IP: net.IP(body[0:4]), Port: int(binary.BigEndian.Uint16(body[8:10]))}
+		dst = &net.TCPAddr{IP: net.IP(body[4:8]), Port: int(binary.BigEndian.Uint16(body[10:12]))}
+	case 2: // IPv6
+		if len(body) < 36 {
+			return raw, nil, nil, fmt.Errorf("PROXY v2 IPv6 body too short")
+		}
+		src = &net.TCPAddr{IP: net.IP(body[0:16]), Port: int(binary.BigEndian.Uint16(body[32:34]))}
+		dst = &net.TCPAddr{IP: net.IP(body[16:32]), Port: int(binary.BigEndian.Uint16(body[34:36]))}
+	default:
+		return raw, nil, nil, fmt.Errorf("unsupported PROXY v2 family: %d", family)
+	}
+	return raw, src, dst, nil
+}
+
 // handleTCPConnectViaTunnel 处理 TCP CONNECT 命令并通过隧道转发
-func handleTCPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunnelStream net.Conn, transparent bool, targetHost string, targetPort int) error {
+func handleTCPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunnelStream net.Conn, transparent bool, targetHost string, targetPort int, proxyHeader []byte) error {
 	// 发送代理请求给远端: "tcp://target_host:target_port\n"
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
@@ -529,6 +654,13 @@ func handleTCPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunne
 		return fmt.Errorf("tunnel TCP connect failed: %s", responseLine)
 	}
 
+	// pp=v2：在客户端真实数据之前，向 stream 注入 PROXY v2 头部，由对端透传到目标业务
+	if len(proxyHeader) > 0 {
+		if _, err := tunnelStream.Write(proxyHeader); err != nil {
+			return fmt.Errorf("write PROXY v2 header to tunnel: %w", err)
+		}
+	}
+
 	// 成功响应SOCKS5客户端
 	// 这里我们没有远端绑定的实际地址和端口，所以使用 0.0.0.0:0 或者客户端连接的源IP/端口
 	// 根据SOCKS5协议，BND.ADDR和BND.PORT应该是服务器用于连接目标的地址/端口
@@ -544,7 +676,7 @@ func handleTCPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunne
 	return nil
 }
 
-func handleHTTPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int) error {
+func handleHTTPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunnelStream net.Conn, targetHost string, targetPort int, proxyHeader []byte) error {
 	// 发送代理请求给远端: "tcp://target_host:target_port\n"
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	requestLine := fmt.Sprintf("%s%s\n", TUNNEL_REQ_TCP, targetAddr)
@@ -572,6 +704,14 @@ func handleHTTPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunn
 		return fmt.Errorf("tunnel handshake failed: %s", responseLine)
 	}
 
+	// pp=v2：注入 PROXY v2 头给对端透传
+	if len(proxyHeader) > 0 {
+		if _, err := tunnelStream.Write(proxyHeader); err != nil {
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			return fmt.Errorf("write PROXY v2 header to tunnel: %w", err)
+		}
+	}
+
 	// 4. 告诉 HTTP 客户端连接已建立 (关键步骤)
 	// 浏览器收到这个 200 后，就会开始发送 TLS 握手包或原始 TCP 数据
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
@@ -584,7 +724,7 @@ func handleHTTPConnectViaTunnel(config *Socks5uConfig, clientConn net.Conn, tunn
 	return nil
 }
 
-func handleHTTPRequestViaTunnel(config *Socks5uConfig, clientConn net.Conn, req *http.Request, tunnelConn net.Conn, targetHost string, targetPort int) error {
+func handleHTTPRequestViaTunnel(config *Socks5uConfig, clientConn net.Conn, req *http.Request, tunnelConn net.Conn, targetHost string, targetPort int, proxyHeader []byte) error {
 
 	bufTunnelStream := netx.NewBufferedConn(tunnelConn)
 
@@ -613,6 +753,14 @@ func handleHTTPRequestViaTunnel(config *Socks5uConfig, clientConn net.Conn, req 
 		config.Logger.Printf("%s->%s failed: %s", clientConn.RemoteAddr().String(), targetAddr, responseLine)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return fmt.Errorf("tunnel handshake failed: %s", responseLine)
+	}
+
+	// pp=v2：在 HTTP 请求字节之前注入 PROXY v2 头给对端透传
+	if len(proxyHeader) > 0 {
+		if _, err := bufTunnelStream.Write(proxyHeader); err != nil {
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			return fmt.Errorf("write PROXY v2 header to tunnel: %w", err)
+		}
 	}
 
 	req.Close = true
@@ -1048,7 +1196,7 @@ func handleTCPListen(config *Socks5uConfig, clientConn net.Conn, targetHost stri
 	return nil
 }
 
-func ServeProxyOnTunnel(config *Socks5uConfig, conn net.Conn, keyingMaterial [32]byte, stream net.Conn, cmd, targetHost string, targetPort int) {
+func ServeProxyOnTunnel(config *Socks5uConfig, conn net.Conn, keyingMaterial [32]byte, stream net.Conn, cmd, targetHost string, targetPort int, proxyHeader []byte) {
 	/*
 		conn 是本地应用接入的客户端连接
 		stream 是通过mux申请下来的一个channel
@@ -1145,11 +1293,11 @@ func ServeProxyOnTunnel(config *Socks5uConfig, conn net.Conn, keyingMaterial [32
 	switch cmd {
 	case "CONNECT", "T-CONNECT":
 		transparent := cmd == "T-CONNECT"
-		err = handleTCPConnectViaTunnel(config, conn, stream, transparent, targetHost, targetPort)
+		err = handleTCPConnectViaTunnel(config, conn, stream, transparent, targetHost, targetPort, proxyHeader)
 	case "HTTP-CONNECT":
-		err = handleHTTPConnectViaTunnel(config, conn, stream, targetHost, targetPort)
+		err = handleHTTPConnectViaTunnel(config, conn, stream, targetHost, targetPort, proxyHeader)
 	case "HTTP-REQ":
-		err = handleHTTPRequestViaTunnel(config, conn, httpreq, stream, targetHost, targetPort)
+		err = handleHTTPRequestViaTunnel(config, conn, httpreq, stream, targetHost, targetPort, proxyHeader)
 	case "UDP":
 		err = handleUDPAssociateViaTunnel(config, conn, keyingMaterial, stream, targetHost, targetPort)
 	default:
@@ -1187,7 +1335,6 @@ func handleSocks5ClientOnStream(config *Socks5uConfig, tunnelStream net.Conn) {
 		handleRemoteUDPAssociate(config, tunnelStream)
 	} else {
 		config.Logger.Printf("Unknown request type from mux stream: %s", requestLine)
-		// 向流写入错误响应
 		_, writeErr := tunnelStream.Write([]byte("ERROR: Unknown request type\n"))
 		if writeErr != nil {
 			config.Logger.Printf("Failed to write error response: %v", writeErr)
@@ -1236,6 +1383,28 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 		config.Logger.Printf("Failed to write OK response to mux stream: %v", err)
 		return
 	}
+
+	// 若握手期已确认对端会发 PROXY v2，则在数据 copy 之前先消费这个头部、
+	// 解析出 src/dst 用于日志，并把原始字节原样写入 targetConn 让目标业务感知。
+	if config.ExpectProxyHeader {
+		tunnelStream.SetReadDeadline(time.Now().Add(25 * time.Second))
+		raw, src, dst, perr := ReadProxyV2Header(tunnelStream)
+		tunnelStream.SetReadDeadline(time.Time{})
+		if perr != nil {
+			config.Logger.Printf("PROXY v2 header read failed for %s: %v", targetAddr, perr)
+			return
+		}
+		if src != nil && dst != nil {
+			config.Logger.Printf("TCP-Connect (pp v2): %s -> %s (origDst=%s)", src.String(), targetAddr, dst.String())
+		} else {
+			config.Logger.Printf("TCP-Connect (pp v2 LOCAL): %s", targetAddr)
+		}
+		if _, werr := targetConn.Write(raw); werr != nil {
+			config.Logger.Printf("write PROXY v2 header to target %s failed: %v", targetAddr, werr)
+			return
+		}
+	}
+
 	// 双向数据转发：隧道流 <-> 目标连接
 	bidirectionalCopy(targetConn, tunnelStream)
 	config.Logger.Printf("TCP relay for %s ended.", targetAddr)

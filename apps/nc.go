@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.1"
+	VERSION = "v2.5.2"
 )
 
 type AppNetcatConfig struct {
@@ -98,6 +98,7 @@ type AppNetcatConfig struct {
 	shadowStream      bool
 	enableCRLF        bool
 	listenMode        bool
+	proxyProtocolEnabled bool
 	udpProtocol       bool
 	useUNIXdomain     bool
 	kcpEnabled        bool
@@ -197,6 +198,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.shadowStream, "ss", false, "TLS-free, lightweight, low-signature encrypted transport in P2P mode")
 	fs.BoolVar(&config.enableCRLF, "C", false, "enable CRLF")
 	fs.BoolVar(&config.listenMode, "l", false, "listen mode")
+	fs.BoolVar(&config.proxyProtocolEnabled, "pp", false, "accept and strip PROXY protocol v1/v2 header on each accepted connection (strict). c.RemoteAddr()/LocalAddr() and ACL will see the real client address.")
 	fs.BoolVar(&config.udpProtocol, "u", false, "use UDP protocol")
 	fs.BoolVar(&config.useUNIXdomain, "U", false, "Specifies to use UNIX-domain sockets.")
 	fs.BoolVar(&config.kcpEnabled, "kcp", false, "use UDP+KCP protocol, -u can be omitted")
@@ -1139,6 +1141,15 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			return 1
 		}
 		defer listener.Close()
+	}
+
+	if ncconfig.proxyProtocolEnabled {
+		if listener.Addr().Network() == "unix" {
+			ncconfig.Logger.Printf("Warning: -pp is ignored on unix-domain sockets\n")
+		} else {
+			listener = NewPPListener(listener)
+			ncconfig.Logger.Printf("PROXY protocol v1/v2 acceptance enabled (strict)\n")
+		}
 	}
 
 	ncconfig.Logger.Printf("Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())

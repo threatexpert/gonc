@@ -281,6 +281,7 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | **`tproxy`** | `tproxy=1` | 启用透明代理支持 (Linux TProxy)。 |
 | **`allow`** | `allow=domain` | 使透明代理允许代理访问域名。 |
 | **`outbound_bind`** | `outbound_bind=10.0.0.5` | **指定出口 IP**。当对端机器有多个 IP 时，强制代理流量从指定网卡发出。 |
+| **`pp`** | `pp=v2` | **PROXY protocol v2 透传**。挂在监听侧。本端为每个接入客户端在隧道里附带一个 PROXY v2 头（HAProxy 标准），由对端 gonc **原样写到目标连接**，目标业务（nginx/HAProxy/自研服务）即可拿到真实客户端 IP。对端 gonc 同时会读出头部用于审计日志。需要两端都为支持该参数的版本——否则握手期立即报错。目标业务侧必须配合启用 PROXY listener（如 nginx `listen ... proxy_protocol;`）。 |
 
 #### **(2) 转发协议 (`f://`)**
 
@@ -300,6 +301,7 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | --- | --- | --- |
 | **`outbound_bind`** | `outbound_bind=10.0.0.5` | 指定连接目标地址时使用的源 IP。 |
 | **`proto`** | `proto=udp` 或 `proto=all` | 不指定proto参数时默认仅开启TCP端口，proto=udp表示仅UDP转发。 |
+| **`pp`** | `pp=v2` | **PROXY protocol v2 透传**（仅 TCP）。让目标业务通过标准 PROXY 协议拿到真实客户端 IP。详见 `x://` 中同名参数说明。 |
 
 
 #### **(3) TLS 加密扩展 (`+tls`)**
@@ -361,6 +363,22 @@ gonc -p2p mysecret123 -link "x://0.0.0.0:1080?tproxy=1;none?outbound_bind=192.16
 ```bash
 gonc -p2p mysecret123 -link "none;f://0.0.0.0:8080?to=192.168.0.1:80"
 ```
+
+=== "反向代理 + 让目标业务看到真实客户端 IP（PROXY v2）"
+在上面反向代理基础上加 `pp=v2`，公司侧接入的客户端真实 `IP:Port` 会通过 HAProxy PROXY 协议 v2 头部由隧道透传到家里目标业务，家里 nginx/业务服务可拿到真实 IP；家里 gonc 日志同步打印源信息便于审计。
+```bash
+gonc -p2p mysecret123 -link "none;f://0.0.0.0:8080?to=192.168.0.1:80&pp=v2"
+```
+**目标业务侧必须启用 PROXY listener**，例如 nginx：
+```nginx
+server {
+    listen 80 proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+    # 之后 $remote_addr 即真实客户端 IP
+}
+```
+需要两端 gonc 都为支持该参数的版本，否则握手期会立即报错。
 
 === "TLS 安全监听"
 本地监听加密的 SOCKS5 端口（需要客户端用 TLS 连入）。

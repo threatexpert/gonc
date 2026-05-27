@@ -43,6 +43,7 @@ gonc -l [端口]
 | **`-local`** | **绑定本地地址** | 格式为 `ip:port`。如果只指定端口 (如 `-l 8080`)，默认绑定 `0.0.0.0`。使用 `-local 127.0.0.1:8080` 可限制只允许本机访问。 |
 | **`-k`, `-keep-open`** | **保持监听** | 传统netcat客户端断开后服务端会退出。开启此选项后，服务端会保持运行，等待下一个客户端连接（类似守护进程）。 |
 | **`-U`** | **Unix Domain Socket** | 监听或连接 Unix Socket 文件而非 TCP/UDP 端口。 |
+| **`-pp`** | **PROXY 协议接收** | 严格模式：每个入连接前必须有 HAProxy PROXY protocol v1 或 v2 头部（自动识别）。gonc 读取并剥离头部，把真实客户端地址透传到 `c.RemoteAddr()` / `c.LocalAddr()`，下游所有逻辑（ACL、`-e :mux ...`、`:httpserver`、shell 等）都自动感知到真实源 IP。需要上游（nginx `proxy_protocol on;` / HAProxy `send-proxy-v2` / AWS NLB / 另一台开了 `pp=v2` 的 gonc）配合。10 秒内未发头或头部非法的连接会被关掉。 |
 
 **示例：**
 === "一次性监听"
@@ -61,6 +62,32 @@ gonc -k -l 8080
 ```bash
 gonc -l -local 192.168.1.5:8080
 ```
+
+=== "接收 PROXY 协议头"
+当 gonc 位于 HAProxy / nginx / AWS NLB 等四层负载之后，开启 `-pp` 让 gonc 解析 PROXY v1/v2 头，下游业务即可看到真实客户端 IP。
+```bash
+# 1) gonc 作为 :httpserver 的 TCP 入口
+gonc -pp -l 9090 -e ":mux httpserver /var/share"
+```
+
+上游 nginx 配套示例：
+```nginx
+stream {
+    upstream gonc { server 127.0.0.1:9090; }
+    server {
+        listen 80;
+        proxy_pass gonc;
+        proxy_protocol on;          # 向 gonc 发 PROXY 头
+    }
+}
+```
+或 HAProxy：
+```
+backend b1
+    server gonc 127.0.0.1:9090 send-proxy-v2
+```
+
+`-pp` 也能跟 link 的 `pp=v2` 串成完整链路：外网入口 gonc(`pp=v2`) → 隧道 → 出口 gonc dial 到本地 gonc(`-pp -l ... -e ":mux httpserver"`)，目标业务全程看到真实客户端 IP。
 
 ---
 
