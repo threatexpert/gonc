@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.2"
+	VERSION = "v2.5.3"
 )
 
 type AppNetcatConfig struct {
@@ -75,82 +75,82 @@ type AppNetcatConfig struct {
 	accessControl *acl.ACL
 	term_oldstat  *term.State
 
-	proxyProt         string
-	proxyAddr         string
-	proxyAddr2        string
-	auth              string
-	sendfile          string
-	sendsize          int64
-	writefile         string
-	tlsEnabled        bool
-	tlsServerMode     bool
-	tls10_forced      bool
-	tls11_forced      bool
-	tls12_forced      bool
-	tls13_forced      bool
-	tlsECCertEnabled  bool
-	tlsRSACertEnabled bool
-	tlsSNI            string
-	sslCertFile       string
-	sslKeyFile        string
-	presharedKey      string
-	autoPSK           bool
-	shadowStream      bool
-	enableCRLF        bool
-	listenMode        bool
+	proxyProt            string
+	proxyAddr            string
+	proxyAddr2           string
+	auth                 string
+	sendfile             string
+	sendsize             int64
+	writefile            string
+	tlsEnabled           bool
+	tlsServerMode        bool
+	tls10_forced         bool
+	tls11_forced         bool
+	tls12_forced         bool
+	tls13_forced         bool
+	tlsECCertEnabled     bool
+	tlsRSACertEnabled    bool
+	tlsSNI               string
+	sslCertFile          string
+	sslKeyFile           string
+	presharedKey         string
+	autoPSK              bool
+	shadowStream         bool
+	enableCRLF           bool
+	listenMode           bool
 	proxyProtocolEnabled bool
-	udpProtocol       bool
-	useUNIXdomain     bool
-	kcpEnabled        bool
-	kcpSEnabled       bool
-	localbind         string
-	localbindIP       string
-	remoteAddr        string
-	progressEnabled   bool
-	runCmd            string
-	remoteCall        string
-	keepOpen          bool
-	enablePty         bool
-	useSTUN           bool
-	stunSrv           string
-	mqttServers       string
-	autoP2P           string
-	useMutilPath      bool
-	useMQTTWait       bool
-	useMQTTHello      bool
-	useLAN            bool
-	MQTTHelloPayload  easyp2p.HelloPayload
-	useIPv4           bool
-	useIPv6           bool
-	useDNS            string
-	runAppFileServ    string
-	runAppFileGet     string
-	downloadSubPath   string
-	appMuxListenMode  bool
-	appMuxListenOn    string
-	appMuxSocksMode   bool
-	appMuxLinkAgent   bool
-	runAppLink        string
-	fileACL           string
-	plainTransport    bool
-	framedStdio       bool
-	framedTCP         bool
-	p2pReportURL      string
-	featureModulesRun []string
-	Args              []string
-	natchecker        bool
-	httpdownload      bool
-	portRotate        bool
-	kcpBridgeMode     bool
-	verbose           bool
-	verboseWithTime   bool
-	muxEnabled        bool
-	muxLocalPort      string
-	muxLocalListener  net.Listener
-	dialreadTimeout   int
-	scanOnly          bool
-	daemon            bool
-	outputLogFile     string
+	udpProtocol          bool
+	useUNIXdomain        bool
+	kcpEnabled           bool
+	kcpSEnabled          bool
+	localbind            string
+	localbindIP          string
+	remoteAddr           string
+	progressEnabled      bool
+	runCmd               string
+	remoteCall           string
+	keepOpen             bool
+	enablePty            bool
+	useSTUN              bool
+	stunSrv              string
+	mqttServers          string
+	autoP2P              string
+	useMutilPath         bool
+	useMQTTWait          bool
+	useMQTTHello         bool
+	useLAN               bool
+	MQTTHelloPayload     easyp2p.HelloPayload
+	useIPv4              bool
+	useIPv6              bool
+	useDNS               string
+	runAppFileServ       string
+	runAppFileGet        string
+	downloadSubPath      string
+	appMuxListenMode     bool
+	appMuxListenOn       string
+	appMuxSocksMode      bool
+	appMuxLinkAgent      bool
+	runAppLink           string
+	fileACL              string
+	plainTransport       bool
+	framedStdio          bool
+	framedTCP            bool
+	p2pReportURL         string
+	featureModulesRun    []string
+	Args                 []string
+	natchecker           bool
+	httpdownload         bool
+	portRotate           bool
+	kcpBridgeMode        bool
+	verbose              bool
+	verboseWithTime      bool
+	muxEnabled           bool
+	muxLocalPort         string
+	muxLocalListener     net.Listener
+	dialreadTimeout      int
+	scanOnly             bool
+	daemon               bool
+	outputLogFile        string
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig

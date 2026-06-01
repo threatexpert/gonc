@@ -300,7 +300,8 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 		index int
 	}
 
-	var clients []mqtt.Client
+	var clients []mqtt.Client    // 成功连接、可用于发布/订阅的 client
+	var allClients []mqtt.Client // 所有创建过的 client（含未连上的），用于兜底清理，防止泄漏
 	var clientsMu sync.Mutex
 	recvRemoteData := make(chan recvPayload, 1)
 	errChan := make(chan error, 1)
@@ -311,8 +312,10 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 	backgroundCleanup := false
 
 	cleanupClients := func() {
+		// 清理所有创建过的 client（不只是连上的），确保未连上的 client 及其
+		// 内部重连 goroutine 一并被 Disconnect 关闭，避免 SYN_SENT 堆积/泄漏。
 		clientsMu.Lock()
-		for _, c := range clients {
+		for _, c := range allClients {
 			c.Disconnect(250)
 		}
 		clientsMu.Unlock()
@@ -440,6 +443,12 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 			}
 
 			client := mqtt.NewClient(opts)
+
+			// 先登记到兜底清理列表，确保无论连接成功与否都会被 Disconnect，
+			// 不会有泄漏的 client / 重连 goroutine 残留。
+			clientsMu.Lock()
+			allClients = append(allClients, client)
+			clientsMu.Unlock()
 
 			// ---- 首次 Connect ----
 			if token := client.Connect(); token.Wait() && token.Error() != nil {
