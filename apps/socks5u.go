@@ -75,6 +75,7 @@ type Socks5uConfig struct {
 	ServerIP   string
 	Localbind  []string
 	AccessCtrl *acl.ACL
+	Outbound   Dialer
 	// ExpectProxyHeader：若为 true，从 mux stream 收到 OK 之后会先读取一个完整的
 	// PROXY v2 头部（用于解析源/目的地址记日志），并原样转发到 targetConn。
 	ExpectProxyHeader bool
@@ -1052,6 +1053,23 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 
 func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+	if config.Outbound != nil {
+		config.Logger.Printf(
+			"TCP: %s->%s connecting via upstream proxy...",
+			clientConn.RemoteAddr(),
+			targetAddr,
+		)
+		targetConn, err := config.Outbound.DialTimeout("tcp", targetAddr, 25*time.Second)
+		if err != nil {
+			sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
+			return fmt.Errorf("upstream TCP connect failed: %w", err)
+		}
+		defer targetConn.Close()
+		sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
+		bidirectionalCopy(clientConn, targetConn)
+		return nil
+	}
+
 	dialer := &net.Dialer{}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
@@ -2354,8 +2372,8 @@ func (pc *Socks5UDPPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err erro
 	buf := pc.writeBuf
 	buf[0] = SOCKS5_UDP_RSV >> 8
 	buf[1] = SOCKS5_UDP_RSV & 0xFF // RSV
-	buf[2] = 0x00                   // FRAG
-	buf[3] = atyp                   // ATYP
+	buf[2] = 0x00                  // FRAG
+	buf[3] = atyp                  // ATYP
 	off := 4
 	off += copy(buf[off:], addrBytes)
 	buf[off] = byte(port >> 8)

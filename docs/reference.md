@@ -63,7 +63,7 @@
 | :--- | :--- | :--- |
 | `-e :sh` | `shell` | **远程 Shell**。将连接的 stdin/stdout 重定向到系统的 shell (cmd.exe 或 /bin/sh)。 |
 | `-e :nc` | `netcat` | **标准 Netcat**。仅进行标准输入输出的转发。 |
-| `-e :s5s` | `SOCKS5` | **SOCKS5 代理服务器**。将 `gonc` 变为一个标准的 SOCKS5 代理，支持 UDP Associate。 |
+| `-e :s5s` | `SOCKS5` | **SOCKS5 代理服务器**。将 `gonc` 变为一个标准的 SOCKS5 代理，支持 UDP Associate；子参数 `:s5s -x <proxy-chain>` 可将 TCP CONNECT 转发到上游代理链。 |
 | `-e :httpserver` | `http` | **HTTP 文件服务器**。快速共享当前目录下的文件。 |
 | `-e :mux` | `mux` | **多路复用代理**。配合客户端的 `-link` 参数使用，实现单端口承载多服务。 |
 
@@ -71,3 +71,6 @@
 ```bash
 # 启动一个带用户认证的 SOCKS5 代理
 gonc -l 1080 -auth "user:pass" -e ":s5s"
+
+# 启动一个通过上游代理链出站的 TCP CONNECT 代理入口
+gonc -k -l 1080 -e ":s5s -x 'socks5s://1.2.3.4:3080?psk=key1,socks5s://2.3.4.5:3080?psk=key2'"

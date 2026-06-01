@@ -184,6 +184,7 @@ type ProxyClientConfig struct {
 	ServerPort       string
 	PresharedKey     string // -psk <psk-string>
 	KcpWithUDP       bool
+	LocalAddr        net.Addr
 	UpstreamDialer   Dialer // 上游拨号器，用于链式代理。nil则使用net.DialTimeout直连
 }
 
@@ -193,7 +194,11 @@ func (c *ProxyClientConfig) dialToServer(timeout time.Duration) (net.Conn, error
 	if c.UpstreamDialer != nil {
 		return c.UpstreamDialer.DialTimeout(c.Network, serverAddress, timeout)
 	}
-	return net.DialTimeout(c.Network, serverAddress, timeout)
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		LocalAddr: c.LocalAddr,
+	}
+	return dialer.Dial(c.Network, serverAddress)
 }
 
 func BuildNTConfigFromPCConfig(config *ProxyClientConfig) *secure.NegotiationConfig {
@@ -502,6 +507,10 @@ func IsProxyURLFormat(s string) bool {
 // ParseProxyChainURL 解析逗号分隔的代理链 URL，返回链式 ProxyClient
 // 例如: "socks5://user:pass@1.1.1.1:1080,https://2.2.2.2:8080"
 func ParseProxyChainURL(logWriter io.Writer, chain string) (*ProxyClient, error) {
+	return ParseProxyChainURLWithLocalAddr(logWriter, chain, nil)
+}
+
+func ParseProxyChainURLWithLocalAddr(logWriter io.Writer, chain string, firstHopLocalAddr net.Addr) (*ProxyClient, error) {
 	parts := splitProxyChain(chain)
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("empty proxy chain")
@@ -513,6 +522,9 @@ func ParseProxyChainURL(logWriter io.Writer, chain string) (*ProxyClient, error)
 		config, err := ParseProxyURL(logWriter, part)
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy URL %q: %w", part, err)
+		}
+		if len(configs) == 0 {
+			config.LocalAddr = firstHopLocalAddr
 		}
 		configs = append(configs, config)
 	}

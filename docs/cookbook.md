@@ -140,6 +140,15 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
 ```
 
+如果希望这个 `:s5s` 本身不直接访问目标，而是把 TCP CONNECT 请求继续交给上游代理链，可以使用 `:s5s -x`：
+
+```bash
+# 本地监听 1080，客户端发来的 SOCKS5 CONNECT / HTTP CONNECT 通过上游代理链出站
+gonc -e ":s5s -http -x 'socks5s://1.2.3.4:3080?psk=key1,socks5s://2.3.4.5:3080?psk=key2'" -k -l 1080
+```
+
+`-x` 模式下，目标域名由上游代理解析，本机不做目标出站 ACL 检查；`:s5s -local` 只用于选择连接第一跳上游代理时的本地源 IP。SOCKS5 UDP ASSOCIATE、SOCKS5 BIND 和普通 HTTP 请求不会走该链路。
+
 如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发。
 <div class="interactive-box">
   <label>🛠️设置示例server-ip:</label>

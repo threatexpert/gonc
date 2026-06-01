@@ -21,17 +21,19 @@ import (
 // VERSION 1.1.0 (Refactored)
 
 type AppS5SConfig struct {
-	Logger        *log.Logger
-	Username      string
-	Password      string
-	EnableConnect bool
-	EnableUDP     bool
-	EnableBind    bool
-	Localbind     []string
-	ServerIP      string
-	AccessCtrl    *acl.ACL
-	EnableSocks5  bool
-	EnableHTTP    bool
+	Logger         *log.Logger
+	Username       string
+	Password       string
+	EnableConnect  bool
+	EnableUDP      bool
+	EnableBind     bool
+	Localbind      []string
+	ServerIP       string
+	AccessCtrl     *acl.ACL
+	EnableSocks5   bool
+	EnableHTTP     bool
+	UpstreamProxy  string
+	UpstreamClient *ProxyClient
 }
 
 // AppS5SConfigByArgs 解析给定的 []string 参数，生成 AppS5SConfig
@@ -47,6 +49,7 @@ func AppS5SConfigByArgs(logWriter io.Writer, args []string) (*AppS5SConfig, erro
 	var authString string // 用于接收 -auth 的值
 	var localBind string
 	fs.StringVar(&authString, "auth", "", "Username and password for SOCKS5 authentication (format: user:pass)")
+	fs.StringVar(&config.UpstreamProxy, "x", "", "Upstream proxy chain for TCP CONNECT only (URL format, comma-separated)")
 	fs.BoolVar(&config.EnableConnect, "c", true, "Allow SOCKS5 CONNECT command")
 	fs.BoolVar(&config.EnableBind, "b", false, "Allow SOCKS5 BIND command")
 	fs.BoolVar(&config.EnableUDP, "u", false, "Allow SOCKS5 UDP ASSOCIATE command")
@@ -82,6 +85,17 @@ func AppS5SConfigByArgs(logWriter io.Writer, args []string) (*AppS5SConfig, erro
 		}
 	}
 
+	if config.UpstreamProxy != "" {
+		localAddr, err := resolveS5SFirstHopLocalAddr(config.Localbind)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -local for -x first hop: %w", err)
+		}
+		config.UpstreamClient, err = ParseProxyChainURLWithLocalAddr(logWriter, config.UpstreamProxy, localAddr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid upstream proxy chain: %w", err)
+		}
+	}
+
 	// 如果 -auth 标志被提供
 	if authString != "" {
 		authParts := strings.SplitN(authString, ":", 2)
@@ -96,6 +110,17 @@ func AppS5SConfigByArgs(logWriter io.Writer, args []string) (*AppS5SConfig, erro
 }
 
 // App_s5s_usage_flagSet 接受一个 *flag.FlagSet 参数，用于打印其默认用法信息
+func resolveS5SFirstHopLocalAddr(localbind []string) (net.Addr, error) {
+	for _, ip := range localbind {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		return net.ResolveTCPAddr("tcp", net.JoinHostPort(ip, "0"))
+	}
+	return nil, nil
+}
+
 func App_s5s_usage_flagSet(fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), ":s5s Usage: [options]")
 	fmt.Fprintln(fs.Output(), "\nOptions:")

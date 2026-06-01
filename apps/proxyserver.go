@@ -27,6 +27,7 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 		ServerIP:   config.ServerIP,
 		Localbind:  config.Localbind,
 		AccessCtrl: config.AccessCtrl,
+		Outbound:   config.UpstreamClient,
 	}
 	s5auth := &Socks5AuthConfig{
 		AuthenticateUser: nil,
@@ -56,6 +57,12 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 	reqTarget := net.JoinHostPort(req.Host, strconv.Itoa(req.Port))
 
 	conn.SetReadDeadline(time.Time{})
+
+	if config.UpstreamClient != nil && req.Command != "CONNECT" {
+		config.Logger.Printf("SOCKS5 %s rejected for %s->%s: -x upstream mode supports CONNECT only", req.Command, conn.RemoteAddr(), reqTarget)
+		sendSocks5Response(conn, REP_COMMAND_NOT_SUPPORTED, "0.0.0.0", 0)
+		return
+	}
 
 	if req.Command == "CONNECT" && config.EnableConnect {
 		err = handleDirectTCPConnect(&s5config, conn, req.Host, req.Port)
@@ -97,6 +104,12 @@ func handleHTTPProxy(conn *netx.BufferedConn, config *AppS5SConfig) {
 	}
 
 	// 普通 HTTP
+	if config.UpstreamClient != nil {
+		config.Logger.Printf("HTTP %s rejected for %s->%s: -x upstream mode supports CONNECT only", req.Method, conn.RemoteAddr(), req.Host)
+		_, _ = conn.Write([]byte("HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n"))
+		return
+	}
+
 	err = handleHTTPForwardSimple(conn, req, config)
 	if err != nil {
 		config.Logger.Printf("HTTP CONNECT failed for %s->%s: %v", conn.RemoteAddr(), req.Host, err)
@@ -272,6 +285,18 @@ func delHopHeaders(header http.Header) {
 func handleHTTPConnect(clientConn net.Conn, req *http.Request, config *AppS5SConfig) error {
 	config.Logger.Printf("HTTP-CONNECT: %s->%s connecting...", clientConn.RemoteAddr().String(), req.Host)
 	defer config.Logger.Printf("HTTP: %s client disconnected.", clientConn.RemoteAddr().String())
+
+	if config.UpstreamClient != nil {
+		targetConn, err := config.UpstreamClient.DialTimeout("tcp", req.Host, 25*time.Second)
+		if err != nil {
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			return fmt.Errorf("upstream HTTP CONNECT failed: %w", err)
+		}
+		defer targetConn.Close()
+		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		bidirectionalCopy(clientConn, targetConn)
+		return nil
+	}
 
 	dialer := &net.Dialer{}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)

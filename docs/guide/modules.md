@@ -69,6 +69,12 @@
 
 * `-http`: 开启兼容HTTP代理协议，这样同时能支持HTTP代理的客户端了。
 
+* `-x <proxy-chain>`: 为 `:s5s` 的出站 TCP CONNECT 请求指定上游代理链。格式与全局 `-x` 的 URL 形式一致，例如 `socks5://host:port`、`socks5s://host:port?psk=key`、`https://host:port`，多个代理用逗号连接。
+
+  启用后，SOCKS5 CONNECT 和 HTTP CONNECT 的目标地址会原样交给上游代理，由上游代理服务器解析 DNS；本机不会对目标地址做出站 ACL 检查。`-local` 此时只用于绑定连接第一跳上游代理时使用的本地源 IP。
+
+  注意：`:s5s -x` 只支持 TCP CONNECT。SOCKS5 UDP ASSOCIATE、SOCKS5 BIND，以及普通 HTTP 请求（GET/POST 等非 CONNECT）会被明确拒绝。
+
 * `-local`: 限定使用的出站源 IP，如果服务器有多个 IP，可指定多个，用 **逗号分隔**。  
   **支持顺序优先**，即列表靠前的 IP 优先尝试路由连通性。 例如：
 
@@ -89,6 +95,11 @@
 ```bash
 # 启动一个监听在 1080 的 SOCKS5 代理服务器，带认证
 gonc -k -e ":s5s -auth user:simplekey123" -l 1080 
+```
+
+```bash
+# 启动本地代理入口，所有 TCP CONNECT 通过上游加密 SOCKS5 代理链转发
+gonc -k -e ":s5s -x 'socks5s://1.2.3.4:3080?psk=key1,socks5s://2.3.4.5:3080?psk=key2'" -l 1080
 ```
 
 **高级组合 (Socks5 over TLS)**：
