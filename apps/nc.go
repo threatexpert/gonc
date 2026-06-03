@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.3"
+	VERSION = "v2.5.4"
 )
 
 type AppNetcatConfig struct {
@@ -325,15 +325,15 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	// 1. 初始化基本设置
 	firstInit(config)
 
-	// 2. 配置内置应用程序模式（例如http服务器，socks5）
-	configureAppMode(config)
-
-	// 3. 配置安全功能，如PSK和ACL
+	// 2. 配置安全功能，如PSK和ACL
 	err = configureSecurity(config)
 	if err != nil {
 		fmt.Fprintf(logWriter, "Security configuration failed: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 3. 配置内置应用程序模式（例如http服务器，socks5）
+	configureAppMode(config)
 
 	if fs.NFlag() == 0 && fs.NArg() == 0 {
 		usage_less(logWriter, argv0)
@@ -1982,6 +1982,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		ncconfig.app_s5s_Config, err = AppS5SConfigByArgs(ncconfig.LogWriter, args[1:])
 		if err == nil {
 			ncconfig.app_s5s_Config.AccessCtrl = ncconfig.accessControl
+			if ncconfig.app_s5s_Config.UpstreamClient != nil && ncconfig.accessControl != nil {
+				ncconfig.Logger.Printf(":s5s -x enabled: outbound ACL for target addresses is ignored; inbound ACL still applies.\n")
+			}
 		}
 	case ":s5c":
 		ncconfig.app_s5c_Config, err = AppS5CConfigByArgs(ncconfig.LogWriter, args[1:])

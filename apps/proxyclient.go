@@ -156,6 +156,9 @@ func (c *DirectDialer) Listen(network, address string) (net.Listener, error) {
 
 // Dial 实现 ProxyClient 的拨号逻辑，委托给内部的 dialer
 func (c *ProxyClient) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	if c == nil {
+		return nil, fmt.Errorf("proxy client not initialized")
+	}
 	if c.Dialer == nil {
 		return nil, fmt.Errorf("proxy client not initialized, call NewProxyClient first")
 	}
@@ -163,6 +166,9 @@ func (c *ProxyClient) DialTimeout(network, address string, timeout time.Duration
 }
 
 func (c *ProxyClient) Listen(network, address string) (net.Listener, error) {
+	if c == nil {
+		return nil, fmt.Errorf("proxy client not initialized")
+	}
 	if c.Dialer == nil {
 		return nil, fmt.Errorf("proxy client not initialized")
 	}
@@ -170,6 +176,9 @@ func (c *ProxyClient) Listen(network, address string) (net.Listener, error) {
 }
 
 func (c *ProxyClient) SupportBIND() bool {
+	if c == nil {
+		return false
+	}
 	// 目前仅 SOCKS5 支持 BIND
 	return c.ProxyProt == "socks5"
 }

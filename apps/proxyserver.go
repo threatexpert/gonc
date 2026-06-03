@@ -27,7 +27,9 @@ func handleSocks5Proxy(conn net.Conn, keyingMaterial [32]byte, config *AppS5SCon
 		ServerIP:   config.ServerIP,
 		Localbind:  config.Localbind,
 		AccessCtrl: config.AccessCtrl,
-		Outbound:   config.UpstreamClient,
+	}
+	if config.UpstreamClient != nil {
+		s5config.Outbound = config.UpstreamClient
 	}
 	s5auth := &Socks5AuthConfig{
 		AuthenticateUser: nil,
