@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.4"
+	VERSION = "v2.5.5"
 )
 
 type AppNetcatConfig struct {
@@ -2466,6 +2466,20 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 	abort := make(chan struct{})
+	connWriter := io.Writer(nconn)
+	outputWriter := io.Writer(output)
+	resizeStop := make(chan struct{})
+	var resizeStopOnce sync.Once
+	var resizeStartOnce sync.Once
+	if ncconfig.enablePty {
+		lockedConnWriter := &lockedWriter{w: nconn}
+		connWriter = lockedConnWriter
+		outputWriter = newPtyshCapsOutputWriter(output, func(sid []byte) {
+			resizeStartOnce.Do(func() {
+				go startPtyshResizeSender(resizeStop, lockedConnWriter, sid, ncconfig.Logger)
+			})
+		})
+	}
 	inExited := make(chan struct{})  //
 	outExited := make(chan struct{}) //
 	wg.Add(2)
@@ -2483,15 +2497,16 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
-				copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, 0, 0)
+				copyWithProgress(ncconfig, connWriter, input, blocksize, !nconn.IsUDP, stats_out, 0, 0)
 			} else {
 				copyCharDeviceWithProgress(ncconfig, nconn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes, 0)
+			copyWithProgress(ncconfig, connWriter, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes, 0)
 		}
 
 		time.Sleep(1 * time.Second)
+		resizeStopOnce.Do(func() { close(resizeStop) })
 		nconn.CloseWrite()
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-write routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
@@ -2500,7 +2515,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(ncconfig, output, nconn, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
+		copyWithProgress(ncconfig, outputWriter, nconn, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
 		time.Sleep(1 * time.Second)
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-read routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
@@ -2534,6 +2549,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	}
 
 	//ncconfig.Logger.Printf("PID:%d (%s) closing nconn...\n", os.Getpid(), nconn.RemoteAddr().String())
+	resizeStopOnce.Do(func() { close(resizeStop) })
 	nconn.Close()
 	if ncconfig.term_oldstat != nil {
 		term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)

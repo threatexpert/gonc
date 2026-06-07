@@ -78,6 +78,11 @@ type PtyProcess interface {
 }
 
 // StdProcess 包装标准库的 *exec.Cmd，用于 Linux 或普通 Pipe 模式
+type ResizablePty interface {
+	io.ReadWriteCloser
+	Resize(cols, rows int) error
+}
+
 type StdProcess struct {
 	*exec.Cmd
 }

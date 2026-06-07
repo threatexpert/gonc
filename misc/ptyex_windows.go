@@ -4,7 +4,6 @@
 package misc
 
 import (
-	"io"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -31,7 +30,7 @@ func (w *WinPtyProcess) GetProcess() *os.Process {
 	return w.cmd.Process
 }
 
-func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, error) {
+func PtyStart(name string, args ...string) (PtyProcess, ResizablePty, error) {
 
 	pt, err := pty.New()
 	if err != nil {

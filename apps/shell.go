@@ -97,6 +97,8 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	var proc misc.PtyProcess
 	var input io.ReadCloser
 	var output io.WriteCloser
+	var ptyIO misc.ResizablePty
+	var ptyshSID []byte
 
 	if config.EnablePty {
 		cmd, ptmx, err := misc.PtyStart(config.Args[0], config.Args[1:]...)
@@ -105,8 +107,17 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 			return
 		}
 		proc = cmd
+		ptyIO = ptmx
 		input = ptmx
 		output = ptmx
+		sid, sidHex, err := newPtyshSID()
+		if err == nil {
+			if caps, err := encodePtyshCaps(sidHex); err == nil {
+				if _, err := conn.Write(caps); err == nil {
+					ptyshSID = sid
+				}
+			}
+		}
 	} else {
 		cmd := exec.Command(config.Args[0], config.Args[1:]...)
 		// 创建管道
@@ -151,7 +162,17 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	go func() {
 		defer wg.Done()
 		defer func() { done <- struct{}{} }()
-		io.Copy(output, conn)
+		var shellInput io.Reader = conn
+		if len(ptyshSID) == ptyshSIDSize && ptyIO != nil {
+			shellInput = newPtyshResizeInputReader(conn, ptyshSID, func(rows, cols int) {
+				if err := ptyIO.Resize(cols, rows); err != nil {
+					config.Logger.Printf("pty resize error: %v\n", err)
+				} else {
+					//config.Logger.Printf("pty resize successful: %dx%d\n", cols, rows)
+				}
+			})
+		}
+		io.Copy(output, shellInput)
 	}()
 	go func() {
 		defer wg.Done()

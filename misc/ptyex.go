@@ -6,7 +6,6 @@ package misc
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"syscall"
@@ -14,7 +13,15 @@ import (
 	"github.com/creack/pty"
 )
 
-func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, error) {
+type unixResizablePty struct {
+	*os.File
+}
+
+func (p *unixResizablePty) Resize(cols, rows int) error {
+	return pty.Setsize(p.File, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+}
+
+func PtyStart(name string, args ...string) (PtyProcess, ResizablePty, error) {
 	c := exec.Command(name, args...)
 
 	if c.SysProcAttr == nil {
@@ -29,9 +36,9 @@ func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, erro
 	}
 
 	var err2 error
-	pty, tty, err := pty.Open()
+	ptmx, tty, err := pty.Open()
 	if err != nil {
-		pty, tty, err2 = fallbackPtyOpen()
+		ptmx, tty, err2 = fallbackPtyOpen()
 		if err2 != nil {
 			return nil, nil, err
 		}
@@ -50,11 +57,11 @@ func PtyStart(name string, args ...string) (PtyProcess, io.ReadWriteCloser, erro
 	}
 
 	if err = c.Start(); err != nil {
-		_ = pty.Close() // Best effort.
+		_ = ptmx.Close() // Best effort.
 		return nil, nil, err
 	}
 
-	return &StdProcess{Cmd: c}, pty, nil
+	return &StdProcess{Cmd: c}, &unixResizablePty{File: ptmx}, nil
 }
 
 // fallbackPtyOpen tries to find an available legacy /dev/ptyXY pseudoterminal
