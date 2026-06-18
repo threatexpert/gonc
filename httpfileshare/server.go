@@ -687,7 +687,43 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request, file
 	if !s.config.WebMode {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, stat.Name()))
 	}
-	http.ServeContent(w, r, stat.Name(), stat.ModTime(), file.(io.ReadSeeker))
+	if content, ok := file.(io.ReadSeeker); ok && canServeContent(content) {
+		http.ServeContent(w, r, stat.Name(), stat.ModTime(), content)
+		return
+	}
+	s.serveStreamingContent(w, r, file, stat)
+}
+
+func canServeContent(content io.ReadSeeker) bool {
+	if _, err := content.Seek(0, io.SeekEnd); err != nil {
+		return false
+	}
+	if _, err := content.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	return true
+}
+
+func (s *Server) serveStreamingContent(w http.ResponseWriter, r *http.Request, file fs.File, stat fs.FileInfo) {
+	w.Header().Set("Accept-Ranges", "none")
+	if stat.Size() >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+	}
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+
+	if r.Header.Get("Range") != "" {
+		s.logger.Printf("Ignoring Range request for non-seekable file '%s' from %s", r.URL.Path, r.RemoteAddr)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := io.Copy(w, file); err != nil {
+		s.logger.Printf("Error streaming non-seekable file '%s' to %s: %v", r.URL.Path, r.RemoteAddr, err)
+	}
 }
 
 // formatBytes formats bytes into human-readable string.
