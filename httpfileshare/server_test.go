@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -123,5 +124,107 @@ func TestHandleFileDownloadBrokenReadSeekerFallsBackToStreaming(t *testing.T) {
 	}
 	if got := rr.Body.String(); got != string(body) {
 		t.Fatalf("body = %q, want %q", got, string(body))
+	}
+}
+
+type testFileSource struct {
+	files map[string]string
+}
+
+func (s *testFileSource) Description() string { return "test file source" }
+
+func (s *testFileSource) Stat(name string) (fs.FileInfo, error) {
+	name = path.Clean(name)
+	if name == "/" {
+		return sourceDirInfo{name: "/", modTime: time.Unix(1700000000, 0)}, nil
+	}
+	body, ok := s.files[name]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	return testFileInfo{name: path.Base(name), size: int64(len(body))}, nil
+}
+
+func (s *testFileSource) Open(name string) (fs.File, error) {
+	name = path.Clean(name)
+	body, ok := s.files[name]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	return &testSeekableFile{Reader: strings.NewReader(body), info: testFileInfo{name: path.Base(name), size: int64(len(body))}}, nil
+}
+
+func (s *testFileSource) ReadDir(name string) ([]fs.FileInfo, error) {
+	name = path.Clean(name)
+	if name != "/" {
+		return nil, fs.ErrNotExist
+	}
+	var entries []fs.FileInfo
+	for filePath, body := range s.files {
+		entries = append(entries, testFileInfo{name: strings.TrimPrefix(filePath, "/"), size: int64(len(body))})
+	}
+	return entries, nil
+}
+
+func (s *testFileSource) Walk(name string, fn func(sourcePath string, info fs.FileInfo, err error) error) error {
+	name = path.Clean(name)
+	if name == "/" {
+		if err := fn("/", sourceDirInfo{name: "/", modTime: time.Unix(1700000000, 0)}, nil); err != nil {
+			return err
+		}
+		for filePath, body := range s.files {
+			if err := fn(filePath, testFileInfo{name: path.Base(filePath), size: int64(len(body))}, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	info, err := s.Stat(name)
+	if err != nil {
+		return err
+	}
+	return fn(name, info, nil)
+}
+
+func TestServerUsesConfiguredFileSource(t *testing.T) {
+	source := &testFileSource{files: map[string]string{"/hello.txt": "hello from source"}}
+	server, err := NewServer(ServerConfig{FileSource: source, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/hello.txt", nil)
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := rr.Body.String(); got != "hello from source" {
+		t.Fatalf("body = %q, want %q", got, "hello from source")
+	}
+}
+
+func TestConfiguredFileSourceRecursiveList(t *testing.T) {
+	source := &testFileSource{files: map[string]string{"/hello.txt": "hello"}}
+	server, err := NewServer(ServerConfig{FileSource: source, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := rr.Body.String(); !strings.Contains(got, `"path":"/hello.txt"`) {
+		t.Fatalf("recursive list = %q, want /hello.txt entry", got)
 	}
 }
