@@ -48,7 +48,8 @@ type AppMuxConfig struct {
 	LinkLocalConf    string   // for mux link L config
 	LinkRemoteConf   string   // for mux link R config
 	HttpServerVDirs  []string // for httpserver
-	HttpClientDir    string   // for httpclient
+	HttpFileSource   httpfileshare.FileSource
+	HttpClientDir    string // for httpclient
 	DownloadPath     string
 	AccessCtrl       *acl.ACL
 	KeepAliveTimeout int
@@ -1174,6 +1175,7 @@ func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 
 	srvcfg := httpfileshare.ServerConfig{
 		RootPaths:    cfg.HttpServerVDirs,
+		FileSource:   cfg.HttpFileSource,
 		LoggerOutput: cfg.Logger.Writer(),
 		EnableZstd:   enableZstd,
 		Listener:     ln,

@@ -45,32 +45,28 @@ func (s *Session) Stop() {
 	}
 }
 
-// StartShare starts the sender side using path-based sharing.
-//
-// paths is a newline-separated list of filesystem paths. Android should pass
-// app-cache paths for the first integration, then this can evolve to stream
-// ContentResolver inputs directly.
-func StartShare(paths string, password string, useUDP bool, cb Callback) (*Session, error) {
-	items := splitLines(paths)
+// StartP2PShareSource starts the P2P sender side using an Android-provided FileSource.
+// File contents are streamed from Android on demand; they are not copied into a
+// temporary cache before sharing.
+func StartP2PShareSource(source AndroidFileSource, password string, useUDP bool, cb Callback) (*Session, error) {
+	if source == nil {
+		return nil, errors.New("file source is required")
+	}
 	if strings.TrimSpace(password) == "" {
 		return nil, errors.New("password is required")
-	}
-	if len(items) == 0 {
-		return nil, errors.New("at least one path is required")
 	}
 	args := []string{"-p2p", password}
 	if useUDP {
 		args = append(args, "-u")
 	}
-	args = append(args, "-httpserver")
-	args = append(args, items...)
-	return start(args, cb, "send"), nil
+	args = append(args, "-httpserver", ".")
+	return startP2PWithFileSource(args, cb, "send", source), nil
 }
 
-// StartReceive starts the receiver side and exposes the peer's HTTP share on a
+// StartP2PReceive starts the P2P receiver side and exposes the peer's HTTP share on a
 // local endpoint. The Android layer can later download through that endpoint or
 // call a dedicated download API.
-func StartReceive(password string, useUDP bool, cb Callback) (*Session, error) {
+func StartP2PReceive(password string, useUDP bool, cb Callback) (*Session, error) {
 	if strings.TrimSpace(password) == "" {
 		return nil, errors.New("password is required")
 	}
@@ -83,6 +79,10 @@ func StartReceive(password string, useUDP bool, cb Callback) (*Session, error) {
 }
 
 func start(args []string, cb Callback, mode string) *Session {
+	return startP2PWithFileSource(args, cb, mode, nil)
+}
+
+func startP2PWithFileSource(args []string, cb Callback, mode string, source AndroidFileSource) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &Session{
 		cancel: cancel,
@@ -99,7 +99,12 @@ func start(args []string, cb Callback, mode string) *Session {
 		if reportServer != nil {
 			defer reportServer.Close()
 		}
-		exitCode := apps.RunNetcat(ctx, nil, writer, args)
+		exitCode := 0
+		if source != nil {
+			exitCode = apps.RunNetcatP2PWithHTTPFileSource(ctx, nil, writer, args, newMobileFileSource(source))
+		} else {
+			exitCode = apps.RunNetcat(ctx, nil, writer, args)
+		}
 		if cb != nil {
 			cb.Stopped(exitCode)
 		}
@@ -155,18 +160,6 @@ func startP2PReportServer(ctx context.Context, cb Callback, mode string) (*http.
 		_ = server.Serve(ln)
 	}()
 	return server, "http://" + ln.Addr().String() + "/p2p-report"
-}
-
-func splitLines(value string) []string {
-	lines := strings.Split(value, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
 }
 
 type callbackWriter struct {

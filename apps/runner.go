@@ -7,12 +7,22 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/threatexpert/gonc/v2/httpfileshare"
 )
 
 // RunNetcat runs the gonc engine from library callers without going through
 // main() or os.Args. It is intentionally thin so mobile integrations can first
 // reuse the battle-tested CLI path, then replace internals module by module.
 func RunNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args []string) int {
+	return runNetcat(ctx, console, logWriter, args, nil)
+}
+
+func RunNetcatP2PWithHTTPFileSource(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, source httpfileshare.FileSource) int {
+	return runNetcat(ctx, console, logWriter, args, source)
+}
+
+func runNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, source httpfileshare.FileSource) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -32,6 +42,13 @@ func RunNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args 
 	}
 	config.ctx = ctx
 	config.ConsoleMode = false
+	if source != nil {
+		if config.app_mux_Config == nil || config.app_mux_Config.AppMode != "httpserver" {
+			fmt.Fprintln(logWriter, "Error preparing P2P HTTP file source: P2P httpserver mode is required")
+			return 1
+		}
+		config.app_mux_Config.HttpFileSource = source
+	}
 
 	return App_Netcat_main_withconfig(console, config)
 }
