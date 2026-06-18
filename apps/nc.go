@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.5"
+	VERSION = "v2.5.6"
 )
 
 type AppNetcatConfig struct {
@@ -941,11 +941,27 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 	if ncconfig.keepOpen {
 		for {
+			select {
+			case <-ncconfig.ctx.Done():
+				ncconfig.Logger.Printf("P2P stopped\n")
+				return 0
+			default:
+			}
+
 			nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
 			if err != nil {
+				if ncconfig.ctx.Err() != nil {
+					ncconfig.Logger.Printf("P2P stopped\n")
+					return 0
+				}
 				ncconfig.Logger.Printf("P2P failed: %v\n", err)
 				ncconfig.Logger.Printf("Will retry in 10 seconds...\n")
-				time.Sleep(10 * time.Second)
+				select {
+				case <-ncconfig.ctx.Done():
+					ncconfig.Logger.Printf("P2P stopped\n")
+					return 0
+				case <-time.After(10 * time.Second):
+				}
 				continue
 			}
 
@@ -960,7 +976,12 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 				handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
 				ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
 			}
-			time.Sleep(2 * time.Second)
+			select {
+			case <-ncconfig.ctx.Done():
+				ncconfig.Logger.Printf("P2P stopped\n")
+				return 0
+			case <-time.After(2 * time.Second):
+			}
 		}
 	} else {
 		nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
@@ -2039,6 +2060,13 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 	var totalWritten int64
 
 	for {
+		if ncconfig.ctx != nil {
+			select {
+			case <-ncconfig.ctx.Done():
+				return ncconfig.ctx.Err()
+			default:
+			}
+		}
 		rtimeout := false
 		if readIdleTimeout > 0 {
 			type readDeadliner interface {
@@ -2209,6 +2237,19 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	atomic.AddInt32(&ncconfig.goroutineConnectionCounter, 1)
 
 	defer nconn.Close()
+	if ncconfig.ctx != nil {
+		if done := ncconfig.ctx.Done(); done != nil {
+			watchStop := make(chan struct{})
+			defer close(watchStop)
+			go func() {
+				select {
+				case <-done:
+					_ = nconn.Close()
+				case <-watchStop:
+				}
+			}()
+		}
+	}
 
 	localAddrStr := nconn.LocalAddr().String()
 	remoteAddrStr := nconn.RemoteAddr().String()
