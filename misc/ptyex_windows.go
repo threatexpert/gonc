@@ -47,17 +47,22 @@ func PtyStart(name string, args ...string) (PtyProcess, ResizablePty, error) {
 }
 
 func EnableVirtualTerminal() {
-	stdout := windows.Handle(os.Stdout.Fd())
+	enableVirtualTerminalFor(os.Stdout)
+	enableVirtualTerminalFor(os.Stderr)
+}
+
+func enableVirtualTerminalFor(file *os.File) {
+	console := windows.Handle(file.Fd())
 
 	// Variable to store the original console mode
 	var originalMode uint32
 
 	// Get the current console mode
-	if err := windows.GetConsoleMode(stdout, &originalMode); err == nil {
+	if err := windows.GetConsoleMode(console, &originalMode); err == nil {
 		if originalMode&windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
 			return
 		}
 		// Set the new mode with ENABLE_VIRTUAL_TERMINAL_PROCESSING added
-		windows.SetConsoleMode(stdout, originalMode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+		windows.SetConsoleMode(console, originalMode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
 	}
 }

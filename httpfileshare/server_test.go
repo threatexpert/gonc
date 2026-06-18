@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -226,5 +228,75 @@ func TestConfiguredFileSourceRecursiveList(t *testing.T) {
 	}
 	if got := rr.Body.String(); !strings.Contains(got, `"path":"/hello.txt"`) {
 		t.Fatalf("recursive list = %q, want /hello.txt entry", got)
+	}
+}
+
+func TestSingleFileRootServesVirtualDirectory(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "hello.txt")
+	if err := os.WriteFile(filePath, []byte("hello from disk"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	server, err := NewServer(ServerConfig{RootPaths: []string{filePath}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	rootReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootRR := httptest.NewRecorder()
+	server.serveFilesFromSource(rootRR, rootReq)
+	rootResp := rootRR.Result()
+	defer rootResp.Body.Close()
+	if rootResp.StatusCode != http.StatusOK {
+		t.Fatalf("root status = %d, want %d", rootResp.StatusCode, http.StatusOK)
+	}
+	rootBody := rootRR.Body.String()
+	if strings.Contains(rootBody, "hello from disk") {
+		t.Fatalf("root response downloaded file body, want directory listing")
+	}
+	if !strings.Contains(rootBody, "hello.txt") {
+		t.Fatalf("root response = %q, want directory listing with hello.txt", rootBody)
+	}
+
+	fileReq := httptest.NewRequest(http.MethodGet, "/hello.txt", nil)
+	fileRR := httptest.NewRecorder()
+	server.serveFilesFromSource(fileRR, fileReq)
+	fileResp := fileRR.Result()
+	defer fileResp.Body.Close()
+	if fileResp.StatusCode != http.StatusOK {
+		t.Fatalf("file status = %d, want %d", fileResp.StatusCode, http.StatusOK)
+	}
+	if got := fileRR.Body.String(); got != "hello from disk" {
+		t.Fatalf("file body = %q, want %q", got, "hello from disk")
+	}
+}
+
+func TestSingleFileRootRecursiveListUsesFileNamePath(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "hello.txt")
+	if err := os.WriteFile(filePath, []byte("hello from disk"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	server, err := NewServer(ServerConfig{RootPaths: []string{filePath}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, `"path":"/","`) && strings.Count(body, `"path":"/"`) > 1 {
+		t.Fatalf("recursive list = %q, root path repeated unexpectedly", body)
+	}
+	if !strings.Contains(body, `"path":"/hello.txt"`) {
+		t.Fatalf("recursive list = %q, want /hello.txt entry", body)
 	}
 }

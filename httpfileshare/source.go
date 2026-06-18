@@ -31,8 +31,10 @@ type FileSource interface {
 // OSFileSource adapts local filesystem paths to FileSource. It preserves the
 // server's existing single-root and multi-root virtual mount behavior.
 type OSFileSource struct {
-	mounts     []virtualMount
-	singleRoot string
+	mounts           []virtualMount
+	singleRoot       string
+	singleRootIsFile bool
+	singleRootAlias  string
 }
 
 // NewOSFileSource creates a FileSource backed by one or more local filesystem
@@ -58,6 +60,10 @@ func NewOSFileSource(rootPaths []string) (*OSFileSource, error) {
 	src := &OSFileSource{}
 	if len(absPaths) == 1 {
 		src.singleRoot = absPaths[0]
+		if stat, err := os.Stat(absPaths[0]); err == nil && !stat.IsDir() {
+			src.singleRootIsFile = true
+			src.singleRootAlias = filepath.Base(absPaths[0])
+		}
 		return src, nil
 	}
 
@@ -102,6 +108,9 @@ func (s *OSFileSource) Stat(name string) (fs.FileInfo, error) {
 		return nil, err
 	}
 	if isVirtualRoot {
+		if s.singleRootIsFile {
+			return sourceDirInfo{name: "/", modTime: singleRootModTime(s.singleRoot)}, nil
+		}
 		return sourceDirInfo{name: "/", modTime: latestMountModTime(s.mounts)}, nil
 	}
 	return os.Stat(fullPath)
@@ -124,6 +133,13 @@ func (s *OSFileSource) ReadDir(name string) ([]fs.FileInfo, error) {
 		return nil, err
 	}
 	if isVirtualRoot {
+		if s.singleRootIsFile {
+			stat, err := os.Stat(s.singleRoot)
+			if err != nil {
+				return nil, err
+			}
+			return []fs.FileInfo{virtualFileInfo{FileInfo: stat, name: s.singleRootAlias}}, nil
+		}
 		var entries []fs.FileInfo
 		for _, m := range s.mounts {
 			stat, err := os.Stat(m.RealPath)
@@ -160,6 +176,9 @@ func (s *OSFileSource) Walk(name string, fn func(sourcePath string, info fs.File
 	}
 
 	if s.singleRoot != "" {
+		if s.singleRootIsFile {
+			return s.walkSingleFileRoot(requestedPath, fn)
+		}
 		fullPath, _, err := s.resolvePath(requestedPath)
 		if err != nil {
 			return err
@@ -210,6 +229,24 @@ func (s *OSFileSource) walkDiskRoot(rootDiskPath string, virtualPrefix string, f
 	})
 }
 
+func (s *OSFileSource) walkSingleFileRoot(requestedPath string, fn func(sourcePath string, info fs.FileInfo, err error) error) error {
+	stat, err := os.Stat(s.singleRoot)
+	if err != nil {
+		return err
+	}
+	filePath := "/" + s.singleRootAlias
+	if requestedPath == "/" {
+		if err := fn("/", sourceDirInfo{name: "/", modTime: stat.ModTime()}, nil); err != nil {
+			return err
+		}
+		return fn(filePath, virtualFileInfo{FileInfo: stat, name: s.singleRootAlias}, nil)
+	}
+	if requestedPath == filePath {
+		return fn(filePath, virtualFileInfo{FileInfo: stat, name: s.singleRootAlias}, nil)
+	}
+	return os.ErrNotExist
+}
+
 func (s *OSFileSource) resolvePath(name string) (fullPath string, isVirtualRoot bool, err error) {
 	name, err = cleanSourcePath(name)
 	if err != nil {
@@ -217,6 +254,15 @@ func (s *OSFileSource) resolvePath(name string) (fullPath string, isVirtualRoot 
 	}
 
 	if s.singleRoot != "" {
+		if s.singleRootIsFile {
+			if name == "/" {
+				return "", true, nil
+			}
+			if strings.TrimPrefix(name, "/") == s.singleRootAlias {
+				return s.singleRoot, false, nil
+			}
+			return "", false, os.ErrNotExist
+		}
 		return filepath.Join(s.singleRoot, sourceLocalRel(name)), false, nil
 	}
 
@@ -274,6 +320,14 @@ func latestMountModTime(mounts []virtualMount) time.Time {
 		}
 	}
 	return latest
+}
+
+func singleRootModTime(root string) time.Time {
+	stat, err := os.Stat(root)
+	if err != nil {
+		return time.Time{}
+	}
+	return stat.ModTime()
 }
 
 type sourceDirInfo struct {

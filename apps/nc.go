@@ -437,6 +437,7 @@ func reorderNetcatArgs(args []string) []string {
 }
 
 func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
+	misc.EnableVirtualTerminal()
 	config, err := AppNetcatConfigByArgs(os.Stderr, "gonc", args)
 	if err != nil {
 		if err == flag.ErrHelp {
@@ -446,7 +447,6 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 		return 1
 	}
 	config.ConsoleMode = true
-	misc.EnableVirtualTerminal()
 	ensureSignalHandler()
 
 	return App_Netcat_main_withconfig(console, config)
@@ -758,14 +758,11 @@ func printPassphraseQRCode(w io.Writer, title, passphrase string) {
 		fmt.Fprintln(w, title)
 	}
 	qrterminal.GenerateWithConfig(passphrase, qrterminal.Config{
-		Level:          qrterminal.L,
-		Writer:         w,
-		HalfBlocks:     true,
-		BlackChar:      qrterminal.BLACK_BLACK,
-		WhiteBlackChar: qrterminal.WHITE_BLACK,
-		WhiteChar:      qrterminal.WHITE_WHITE,
-		BlackWhiteChar: qrterminal.BLACK_WHITE,
-		QuietZone:      2,
+		Level:     qrterminal.L,
+		Writer:    w,
+		BlackChar: qrterminal.BLACK,
+		WhiteChar: qrterminal.WHITE,
+		QuietZone: 2,
 	})
 	fmt.Fprintf(w, "Passphrase: %s\n\n", passphrase)
 }
