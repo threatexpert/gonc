@@ -7,6 +7,7 @@ require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/hashicorp/yamux v0.1.2
 	github.com/klauspost/compress v1.18.2
+	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/pion/dtls/v3 v3.0.9
 	github.com/pion/stun/v3 v3.0.2
 	github.com/pkg/errors v0.9.1
@@ -32,6 +33,7 @@ require (
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.46.0 // indirect
+	rsc.io/qr v0.2.0 // indirect
 )
 
 tool golang.org/x/mobile/cmd/gobind

@@ -24,6 +24,7 @@ import (
 
 	//_ "net/http/pprof"
 
+	"github.com/mdp/qrterminal/v3"
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/easyp2p"
 	"github.com/threatexpert/gonc/v2/httpfileshare"
@@ -94,6 +95,7 @@ type AppNetcatConfig struct {
 	sslCertFile          string
 	sslKeyFile           string
 	presharedKey         string
+	showQRCode           bool
 	autoPSK              bool
 	shadowStream         bool
 	enableCRLF           bool
@@ -194,6 +196,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.sslCertFile, "ssl-cert", "", "Specify SSL certificate file (PEM) for listening")
 	fs.StringVar(&config.sslKeyFile, "ssl-key", "", "Specify SSL private key (PEM) for listening")
 	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM) and for TCP/KCP encryption; when using -p2p, the P2P session key overrides this value.")
+	fs.BoolVar(&config.showQRCode, "qr", false, "print a terminal QR code for -p2p passphrase or generated -psk .")
 	fs.BoolVar(&config.autoPSK, "auto-psk", false, "Use MQTT/ECDHE to automatically derive shared encryption key")
 	fs.BoolVar(&config.shadowStream, "ss", false, "TLS-free, lightweight, low-signature encrypted transport in P2P mode")
 	fs.BoolVar(&config.enableCRLF, "C", false, "enable CRLF")
@@ -746,12 +749,36 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 	}
 }
 
+func printPassphraseQRCode(w io.Writer, title, passphrase string) {
+	if strings.TrimSpace(passphrase) == "" {
+		return
+	}
+	fmt.Fprintln(w)
+	if title != "" {
+		fmt.Fprintln(w, title)
+	}
+	qrterminal.GenerateWithConfig(passphrase, qrterminal.Config{
+		Level:          qrterminal.L,
+		Writer:         w,
+		HalfBlocks:     true,
+		BlackChar:      qrterminal.BLACK_BLACK,
+		WhiteBlackChar: qrterminal.WHITE_BLACK,
+		WhiteChar:      qrterminal.WHITE_WHITE,
+		BlackWhiteChar: qrterminal.BLACK_WHITE,
+		QuietZone:      2,
+	})
+	fmt.Fprintf(w, "Passphrase: %s\n\n", passphrase)
+}
+
 func configureSecurity(ncconfig *AppNetcatConfig) error {
 	var err error
 	if ncconfig.presharedKey == "." {
 		ncconfig.presharedKey, err = secure.GenerateSecureRandomString(22)
 		if err != nil {
 			panic(err)
+		}
+		if ncconfig.showQRCode {
+			printPassphraseQRCode(os.Stderr, "Generated passphrase QR:", ncconfig.presharedKey)
 		}
 		fmt.Fprintf(os.Stdout, "%s\n", ncconfig.presharedKey)
 		os.Exit(0)
@@ -862,6 +889,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				ncconfig.Logger.Printf("Keep this key secret! It is used to establish the secure P2P tunnel: %s\n", P2PSessionKey)
 			} else if secure.IsWeakPassword(P2PSessionKey) {
 				return network, "", "", "", fmt.Errorf("weak password detected")
+			}
+			if ncconfig.showQRCode {
+				printPassphraseQRCode(ncconfig.LogWriter, "P2P passphrase QR:", P2PSessionKey)
 			}
 			if !ncconfig.plainTransport {
 				//没-plain的情况，P2P默认启用kcp tls
