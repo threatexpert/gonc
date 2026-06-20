@@ -524,6 +524,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	var localFileExists bool
 	var localFileSize int64
 	fileMode := os.O_CREATE | os.O_WRONLY
+	resumeRequested := false
 
 	if stat, err := os.Stat(localFilePath); err == nil {
 		localFileExists = true
@@ -563,7 +564,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
 			c.logVerbose("Resuming download for %s. Local size: %d, Server size: %d", localFilePath, localFileSize, fileInfo.Size)
 			fileMode |= os.O_APPEND
-			c.progressTracker.AddBytesDownloaded(localFileSize)
+			resumeRequested = true
 		} else if c.config.Resume && localFileExists && localFileSize >= fileInfo.Size {
 			c.logVerbose("File %s already appears complete (local size %d >= server size %d). Skipping download.", localFilePath, localFileSize, fileInfo.Size)
 			c.progressTracker.AddBytesDownloaded(localFileSize)
@@ -574,6 +575,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 			return nil
 		} else if localFileExists && c.config.Overwrite {
 			c.logInfo("Overwriting existing file: %s", localFilePath)
+			fileMode |= os.O_TRUNC
 		} else if c.config.DryRun {
 			c.logInfo("Dry run: Would download %s to %s", downloadURL, localFilePath)
 			return nil
@@ -586,7 +588,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		return fmt.Errorf("error creating download request for %s: %w", downloadURL, err)
 	}
 
-	if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
+	if resumeRequested {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", localFileSize))
 		c.logVerbose("Requesting bytes %d- for %s", localFileSize, downloadURL)
 	}
@@ -606,15 +608,17 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 
 	responseBytesOffset := int64(0)
 	if resp.StatusCode == http.StatusPartialContent {
-		if !c.config.Resume || !localFileExists || localFileSize >= fileInfo.Size {
+		if !resumeRequested {
 			c.logInfo("Warning: Received 206 Partial Content for %s but not in resume mode or file already complete. Proceeding as full download.", downloadURL)
+		} else {
+			c.progressTracker.AddBytesDownloaded(localFileSize)
 		}
 		responseBytesOffset = localFileSize
 	} else if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned unexpected status %s for %s", resp.Status, downloadURL)
-	} else if resp.StatusCode == http.StatusOK && c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
+	} else if resp.StatusCode == http.StatusOK && resumeRequested {
 		c.logInfo("Server does not support Range requests for %s (received 200 OK instead of 206). Restarting download.", downloadURL)
-		fileMode = os.O_CREATE | os.O_WRONLY
+		fileMode = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	}
 
 	if err := os.MkdirAll(filepath.Dir(localFilePath), 0755); err != nil {
@@ -627,7 +631,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	}
 	defer outFile.Close()
 
-	if resp.StatusCode == http.StatusPartialContent && c.config.Resume && localFileExists {
+	if resp.StatusCode == http.StatusPartialContent && resumeRequested {
 		if _, err := outFile.Seek(localFileSize, io.SeekStart); err != nil {
 			return fmt.Errorf("error seeking to end of file %s for resume: %w", localFilePath, err)
 		}
