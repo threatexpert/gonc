@@ -78,17 +78,17 @@ func StartP2PReceive(password string, useUDP bool, cb Callback) (*Session, error
 	return start(args, cb, "receive"), nil
 }
 
-func start(args []string, cb Callback, mode string) *Session {
-	return startP2PWithFileSource(args, cb, mode, nil)
+func start(args []string, cb Callback, side string) *Session {
+	return startP2PWithFileSource(args, cb, side, nil)
 }
 
-func startP2PWithFileSource(args []string, cb Callback, mode string, source AndroidFileSource) *Session {
+func startP2PWithFileSource(args []string, cb Callback, side string, source AndroidFileSource) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &Session{
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
-	reportServer, reportURL := startP2PReportServer(ctx, cb, mode)
+	reportServer, reportURL := startP2PReportServer(ctx, cb, side)
 	if reportURL != "" {
 		args = append([]string{}, args...)
 		args = append(args, "-p2p-report-url", reportURL)
@@ -117,12 +117,13 @@ type p2pStatusReport struct {
 	Status    string `json:"status"`
 	Network   string `json:"network"`
 	Mode      string `json:"mode"`
+	Side      string `json:"side"`
 	Peer      string `json:"peer"`
 	Timestamp int64  `json:"timestamp"`
 	PID       int    `json:"pid"`
 }
 
-func startP2PReportServer(ctx context.Context, cb Callback, mode string) (*http.Server, string) {
+func startP2PReportServer(ctx context.Context, cb Callback, side string) (*http.Server, string) {
 	if cb == nil {
 		return nil, ""
 	}
@@ -145,8 +146,8 @@ func startP2PReportServer(ctx context.Context, cb Callback, mode string) (*http.
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if report.Mode == "" {
-			report.Mode = mode
+		if report.Side == "" {
+			report.Side = side
 		}
 		cb.P2PReport(report.Topic, report.Status, report.Network, report.Mode, report.Peer, report.Timestamp, report.PID)
 		w.WriteHeader(http.StatusNoContent)
