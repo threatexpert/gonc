@@ -2927,6 +2927,13 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 	}
 
+	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
+	statusMode := "P2P"
+	if connInfo.RelayMode {
+		statusMode = "Relay"
+	}
+	ReportP2PStatus(ncconfig, topicSalt, "negotiating", statusNetwork, statusMode, connInfo.PeerAddress)
+
 	rawconn := connInfo.Conns[0]
 	nconn, err := p2pSecureNegotiation(ncconfig, connInfo, cipherSuite, ncconfig.useLAN)
 	if err != nil {
@@ -2948,11 +2955,6 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 	} else {
 		ncconfig.Logger.Printf("Connected to: %s\n", rawconn.RemoteAddr().String())
-	}
-	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
-	statusMode := "P2P"
-	if connInfo.RelayMode {
-		statusMode = "Relay"
 	}
 	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
 	preOnClose := nconn.OnClose
@@ -3108,7 +3110,7 @@ func cleanupUnixSocket(path string) error {
 
 type P2PStatusReport struct {
 	Topic     string `json:"topic"`     // random string
-	Status    string `json:"status"`    // wait / connecting / connected / disconnected / error
+	Status    string `json:"status"`    // wait / connecting / negotiating / connected / disconnected / error
 	Network   string `json:"network"`   // tcp / udp
 	Mode      string `json:"mode"`      // p2p / relay
 	Peer      string `json:"peer"`      // IP:port
