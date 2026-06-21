@@ -19,6 +19,7 @@ type AndroidFileSource interface {
 	ReadDir(name string) string
 	Open(name string) int64
 	Read(handle int64, maxBytes int) []byte
+	Seek(handle int64, offset int64, whence int) int64
 	Close(handle int64)
 }
 
@@ -209,6 +210,17 @@ func (f *mobileFile) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	return copy(p, chunk), nil
+}
+
+func (f *mobileFile) Seek(offset int64, whence int) (int64, error) {
+	if f.closed {
+		return 0, fs.ErrClosed
+	}
+	position := f.source.Seek(f.handle, offset, whence)
+	if position < 0 {
+		return 0, fs.ErrInvalid
+	}
+	return position, nil
 }
 
 func (f *mobileFile) Close() error {
