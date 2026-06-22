@@ -182,10 +182,15 @@ func (w callbackWriter) Write(p []byte) (int, error) {
 }
 
 func findLocalHTTPEndpoint(message string) string {
-	start := strings.Index(message, "http://127.0.0.1:")
-	if start < 0 {
+	const openPrefix = "You can open "
+	const urlPrefix = "http://127.0.0.1:"
+	marker := openPrefix + urlPrefix
+
+	markerStart := strings.Index(message, marker)
+	if markerStart < 0 {
 		return ""
 	}
+	start := markerStart + len(openPrefix)
 	end := start
 	for end < len(message) {
 		c := message[end]
