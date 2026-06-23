@@ -71,10 +71,40 @@ func StartP2PLinkAgent(password string, useUDP bool, extraArgs string, cb Callba
 	return start(args, cb, "linkagent"), nil
 }
 
+// splitExtraArgs tokenizes a command-line string shell-style: whitespace
+// separates tokens, but single or double quotes group a run (including spaces)
+// into one argument, with the quote characters removed. Adjacent quoted and
+// unquoted runs join (a"b c"d -> "ab cd"). Backslash escaping is not supported;
+// use quotes for values that contain spaces, e.g. -x "aaa bbb ccc".
 func splitExtraArgs(extraArgs string) []string {
-	fields := strings.Fields(extraArgs)
-	if len(fields) == 0 {
-		return nil
+	var args []string
+	var current strings.Builder
+	inToken := false
+	var quote rune // 0 when not inside quotes, otherwise '\'' or '"'
+	for _, r := range extraArgs {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			inToken = true
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			if inToken {
+				args = append(args, current.String())
+				current.Reset()
+				inToken = false
+			}
+		default:
+			current.WriteRune(r)
+			inToken = true
+		}
 	}
-	return fields
+	if inToken {
+		args = append(args, current.String())
+	}
+	return args
 }
