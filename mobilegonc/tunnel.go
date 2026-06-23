@@ -41,7 +41,7 @@ func StartP2PTunnel(password string, useUDP bool, linkConfig string, extraArgs s
 // the passive VPN server side: it waits for one or more link clients to connect
 // over P2P and proxies their traffic out through this device. No local endpoint
 // is exposed, so it behaves like the file-share side and just runs until stopped.
-func StartP2PLinkAgent(password string, useUDP bool, cb Callback) (session *Session, err error) {
+func StartP2PLinkAgent(password string, useUDP bool, extraArgs string, cb Callback) (session *Session, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic starting linkagent: %v", r)
@@ -58,6 +58,9 @@ func StartP2PLinkAgent(password string, useUDP bool, cb Callback) (session *Sess
 		args = append(args, "-u")
 	}
 	args = append(args, "-linkagent")
+	if strings.TrimSpace(extraArgs) != "" {
+		args = append(args, splitExtraArgs(extraArgs)...)
+	}
 	if cb != nil {
 		udpArg := ""
 		if useUDP {
