@@ -18,6 +18,12 @@ README in [中文](./README_zh.md) 、 [English](./README.md)
 
 ---
 
+## Related Projects
+
+- [gonc-gui](https://github.com/threatexpert/gonc-gui) — a desktop (Windows) and Android app built on `gonc`: convenient cross-device, cross-network P2P direct connection and secure file transfer. Just share a passphrase (or scan a QR code); no command line required.
+
+---
+
 ## Usage Examples
 
 ### Basic Usage

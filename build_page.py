@@ -119,6 +119,10 @@ body {
             <p>🧩 <strong>灵活的服务配置</strong>：通过参数 <code>-e</code> 可灵活的设置为每个连接提供服务的应用程序，例如-e /bin/sh可提供远程cmdshell，还可以使用内置的虚拟命令便捷的使用socks5服务、http文件服务和流量转发功能。</p>
             </li>
             </ul>
+            <h3>相关项目</h3>
+            <ul>
+            <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> —— 基于 <code>gonc</code> 的桌面（Windows）和 Android 应用：提供便捷的跨设备、跨网络点对点直连与安全文件传输，只需分享口令（或扫码），无需命令行。</li>
+            </ul>
         </div>
 
         <!-- English -->
@@ -135,6 +139,10 @@ body {
             <li>
             <p>🧩 <strong>Flexible Service Configuration</strong>: With the -e parameter, you can flexibly set the application to serve each connection. For example, -e /bin/sh can provide a remote cmd shell. You can also use built-in virtual commands for convenient SOCKS5 service, HTTP file service, and traffic forwarding.</p>
             </li>
+            </ul>
+            <h3>Related Projects</h3>
+            <ul>
+            <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> — a desktop (Windows) and Android app built on <code>gonc</code>: convenient cross-device, cross-network P2P direct connection and secure file transfer, just share a passphrase (or scan a QR code), no command line required.</li>
             </ul>
         </div>
 
