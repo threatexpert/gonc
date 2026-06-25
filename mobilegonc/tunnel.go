@@ -41,7 +41,17 @@ func StartP2PTunnel(password string, useUDP bool, linkConfig string, extraArgs s
 // the passive VPN server side: it waits for one or more link clients to connect
 // over P2P and proxies their traffic out through this device. No local endpoint
 // is exposed, so it behaves like the file-share side and just runs until stopped.
-func StartP2PLinkAgent(password string, useUDP bool, extraArgs string, cb Callback) (session *Session, err error) {
+//
+// Instead of the -linkagent sugar flag (which fixes the run command to a bare
+// ":mux linkagent"), the expanded form is built explicitly so the :mux
+// sub-command can carry optional advanced options:
+//   - upstream: ":mux linkagent -x <upstream>" routes proxied traffic through an
+//     upstream proxy (a full URL, e.g. socks5://host:port or http://host:port).
+//   - dnsForward: ":mux linkagent -dns <server[:port]>" intercepts clients' UDP:53
+//     DNS and forwards it over TCP to this server (UDP->TCP DNS).
+//
+// -linkagent expands to: -k -W -P -e ":mux linkagent" (keep-open, mqtt-wait, progress).
+func StartP2PLinkAgent(password string, useUDP bool, upstream string, dnsForward string, extraArgs string, cb Callback) (session *Session, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic starting linkagent: %v", r)
@@ -57,7 +67,15 @@ func StartP2PLinkAgent(password string, useUDP bool, extraArgs string, cb Callba
 	if useUDP {
 		args = append(args, "-u")
 	}
-	args = append(args, "-linkagent")
+	args = append(args, "-k", "-W", "-P")
+	mux := ":mux linkagent"
+	if strings.TrimSpace(upstream) != "" {
+		mux += " -x " + strings.TrimSpace(upstream)
+	}
+	if strings.TrimSpace(dnsForward) != "" {
+		mux += " -dns " + strings.TrimSpace(dnsForward)
+	}
+	args = append(args, "-e", mux)
 	if strings.TrimSpace(extraArgs) != "" {
 		args = append(args, splitExtraArgs(extraArgs)...)
 	}
@@ -66,7 +84,7 @@ func StartP2PLinkAgent(password string, useUDP bool, extraArgs string, cb Callba
 		if useUDP {
 			udpArg = " -u"
 		}
-		cb.Event("info", fmt.Sprintf("Starting gonc linkagent with args: -p2p ***%s -linkagent", udpArg))
+		cb.Event("info", fmt.Sprintf("Starting gonc linkagent with args: -p2p ***%s -k -W -P -e \"%s\"", udpArg, mux))
 	}
 	return start(args, cb, "linkagent"), nil
 }

@@ -41,18 +41,20 @@ type PortOwner struct {
 }
 
 type AppMuxConfig struct {
-	Logger           *log.Logger
-	Engine           string
-	AppMode          string
-	Port             string   // listen port
-	LinkLocalConf    string   // for mux link L config
-	LinkRemoteConf   string   // for mux link R config
-	HttpServerVDirs  []string // for httpserver
-	HttpFileSource   httpfileshare.FileSource
-	HttpClientDir    string // for httpclient
-	DownloadPath     string
-	AccessCtrl       *acl.ACL
-	KeepAliveTimeout int
+	Logger                  *log.Logger
+	Engine                  string
+	AppMode                 string
+	Port                    string   // listen port
+	LinkLocalConf           string   // for mux link L config
+	LinkRemoteConf          string   // for mux link R config
+	HttpServerVDirs         []string // for httpserver
+	HttpFileSource          httpfileshare.FileSource
+	HttpClientDir           string // for httpclient
+	DownloadPath            string
+	AccessCtrl              *acl.ACL
+	KeepAliveTimeout        int
+	LinkAgentUpstreamConfig *ProxyClientConfig // for linkagent tunnel upstream
+	LinkAgentDNSForward     string             // for linkagent DNS UDP→TCP interception (host:port)
 }
 
 type MuxSessionConfig struct {
@@ -186,7 +188,7 @@ func bidirectionalCopy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 func App_mux_usage(logWriter io.Writer) {
 	fmt.Fprintln(logWriter, "Usage:")
 	fmt.Fprintln(logWriter, "   :mux socks5")
-	fmt.Fprintln(logWriter, "   :mux linkagent")
+	fmt.Fprintln(logWriter, "   :mux linkagent [-x <socks5-proxy>] [-dns <dns-server[:port]>]")
 	fmt.Fprintln(logWriter, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
 	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>... (serve multiple dirs with virtual paths)")
 	fmt.Fprintln(logWriter, "   :mux httpclient <saveDir> <remotePath>")
@@ -216,10 +218,40 @@ func AppMuxConfigByArgs(logWriter io.Writer, args []string) (*AppMuxConfig, erro
 		config.Port = args[1]
 
 	case "linkagent":
-		if len(args) != 1 {
-			return nil, fmt.Errorf("usage: :mux linkagent")
-		}
 		config.AppMode = "linkagent"
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "-x":
+				if i+1 >= len(args) {
+					return nil, fmt.Errorf("usage: :mux linkagent [-x <socks5-proxy>]")
+				}
+				xArg := args[i+1]
+				var upstreamCfg *ProxyClientConfig
+				var parseErr error
+				if IsProxyURLFormat(xArg) {
+					upstreamCfg, parseErr = ParseProxyURL(logWriter, xArg)
+				} else {
+					upstreamCfg, parseErr = ProxyClientConfigByCommandline(logWriter, "socks5", "", xArg)
+				}
+				if parseErr != nil {
+					return nil, fmt.Errorf("linkagent -x: %w", parseErr)
+				}
+				config.LinkAgentUpstreamConfig = upstreamCfg
+				i++
+			case "-dns":
+				if i+1 >= len(args) {
+					return nil, fmt.Errorf("usage: :mux linkagent [-dns <dns-server[:port]>]")
+				}
+				dnsAddr := args[i+1]
+				if !strings.Contains(dnsAddr, ":") {
+					dnsAddr = dnsAddr + ":53"
+				}
+				config.LinkAgentDNSForward = dnsAddr
+				i++
+			default:
+				return nil, fmt.Errorf("unknown argument for linkagent: %s", args[i])
+			}
+		}
 
 	case "link":
 		// mux link L,R or L;R
@@ -720,7 +752,7 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	expectPP := rParams.Get("pp") == "v2"
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive, expectPP)
+		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive, expectPP, nil)
 		close(sessionDone)
 	}()
 
@@ -815,7 +847,7 @@ func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done 
 	// 单向模式：drainOnly = true；legacy 流程不支持 pp=v2
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, "", true, false)
+		startRemoteStreamAcceptLoop(cfg, session, "", true, false, nil)
 		close(sessionDone)
 	}()
 
@@ -999,7 +1031,7 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 	expectPP := rParams.Get("peer_pp") == "v2"
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive, expectPP)
+		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive, expectPP, cfg.LinkAgentUpstreamConfig)
 		close(sessionDone)
 	}()
 
@@ -1061,12 +1093,14 @@ func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
 // expectProxyHeader：握手期协商出"对端是 listener 且开启了 pp=v2"则为 true，
 // 此时每条 stream 在 OK 之后会先收到一个完整的 PROXY v2 头部，本侧需消费并透传到 target。
-func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool, expectProxyHeader bool) error {
+func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool, expectProxyHeader bool, upstreamConfig *ProxyClientConfig) error {
 	listener := newMuxListener(session)
 	s5config := Socks5uConfig{
-		Logger:            cfg.Logger,
-		AccessCtrl:        cfg.AccessCtrl,
-		ExpectProxyHeader: expectProxyHeader,
+		Logger:               cfg.Logger,
+		AccessCtrl:           cfg.AccessCtrl,
+		ExpectProxyHeader:    expectProxyHeader,
+		TunnelUpstreamConfig: upstreamConfig,
+		DNSForwardAddr:       cfg.LinkAgentDNSForward,
 	}
 	if localbind != "" {
 		s5config.Localbind = strings.Split(localbind, ",")
@@ -1155,7 +1189,7 @@ func handleSocks5uMode(cfg *MuxSessionConfig) error {
 	}
 
 	cfg.Logger.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
-	err = startRemoteStreamAcceptLoop(cfg, session, "", false, false)
+	err = startRemoteStreamAcceptLoop(cfg, session, "", false, false, nil)
 	cfg.Logger.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
 	return err
 }
