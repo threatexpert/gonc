@@ -21,7 +21,7 @@ import (
 // primitive because gomobile bind does not support arbitrary Go types.
 type Callback interface {
 	Event(level string, message string)
-	P2PReport(topic string, status string, network string, mode string, peer string, timestamp int64, pid int)
+	P2PReport(topic string, side string, status string, network string, mode string, peer string, timestamp int64, pid int)
 	Ready(endpoint string)
 	Stopped(exitCode int)
 	Error(message string)
@@ -93,7 +93,7 @@ func startP2PWithFileSource(args []string, cb Callback, side string, source Andr
 		args = append([]string{}, args...)
 		args = append(args, "-p2p-report-url", reportURL)
 	}
-	writer := callbackWriter{cb: cb}
+	writer := &callbackWriter{cb: cb, side: side}
 	go func() {
 		defer close(session.done)
 		if reportServer != nil {
@@ -149,7 +149,7 @@ func startP2PReportServer(ctx context.Context, cb Callback, side string) (*http.
 		if report.Side == "" {
 			report.Side = side
 		}
-		cb.P2PReport(report.Topic, report.Status, report.Network, report.Mode, report.Peer, report.Timestamp, report.PID)
+		cb.P2PReport(report.Topic, report.Side, report.Status, report.Network, report.Mode, report.Peer, report.Timestamp, report.PID)
 		w.WriteHeader(http.StatusNoContent)
 	})
 
@@ -164,21 +164,50 @@ func startP2PReportServer(ctx context.Context, cb Callback, side string) (*http.
 }
 
 type callbackWriter struct {
-	cb Callback
+	cb                    Callback
+	side                  string
+	mu                    sync.Mutex
+	pendingSOCKS5Endpoint string
+	readySent             bool
 }
 
-func (w callbackWriter) Write(p []byte) (int, error) {
+func (w *callbackWriter) Write(p []byte) (int, error) {
 	if w.cb == nil {
 		return len(p), nil
 	}
 	message := strings.TrimSpace(string(p))
 	if message != "" {
 		w.cb.Event("info", message)
-		if endpoint := findLocalHTTPEndpoint(message); endpoint != "" {
-			w.cb.Ready(endpoint)
+		switch w.side {
+		case "receive":
+			if endpoint := findLocalHTTPEndpoint(message); endpoint != "" {
+				w.cb.Ready(endpoint)
+			}
+		case "tunnel":
+			if endpoint := w.findTunnelReadyEndpoint(message); endpoint != "" {
+				w.cb.Ready(endpoint)
+			}
 		}
 	}
 	return len(p), nil
+}
+
+func (w *callbackWriter) findTunnelReadyEndpoint(message string) string {
+	if endpoint := findLocalSOCKS5Endpoint(message); endpoint != "" {
+		w.mu.Lock()
+		w.pendingSOCKS5Endpoint = endpoint
+		w.mu.Unlock()
+	}
+	if !strings.Contains(message, "[link] Local service started.") {
+		return ""
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.readySent || w.pendingSOCKS5Endpoint == "" {
+		return ""
+	}
+	w.readySent = true
+	return w.pendingSOCKS5Endpoint
 }
 
 func findLocalHTTPEndpoint(message string) string {
@@ -200,4 +229,35 @@ func findLocalHTTPEndpoint(message string) string {
 		end++
 	}
 	return message[start:end]
+}
+
+func findLocalSOCKS5Endpoint(message string) string {
+	const marker = "[link-x] Listening on "
+	markerStart := strings.Index(message, marker)
+	if markerStart < 0 {
+		return ""
+	}
+	start := markerStart + len(marker)
+	end := start
+	for end < len(message) {
+		c := message[end]
+		if c <= ' ' || c == '(' {
+			break
+		}
+		end++
+	}
+	if end <= start {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(message[start:end])
+	if err != nil || port == "" {
+		return ""
+	}
+	switch host {
+	case "", "0.0.0.0":
+		host = "127.0.0.1"
+	case "::":
+		host = "::1"
+	}
+	return "socks5://" + net.JoinHostPort(host, port)
 }
