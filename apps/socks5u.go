@@ -3,6 +3,7 @@ package apps
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -66,6 +67,15 @@ type Socks5AuthConfig struct {
 	// 如果配置为 nil，则表示服务器不要求用户密码认证。
 	// 如果非 nil，服务器将要求客户端进行用户密码认证。
 	AuthenticateUser func(username, password string) bool
+}
+
+func isExpectedNetClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err == io.EOF ||
+		errors.Is(err, net.ErrClosed) ||
+		strings.Contains(err.Error(), "use of closed network connection")
 }
 
 type Socks5uConfig struct {
@@ -1524,7 +1534,7 @@ func handleRemoteUDPViaUpstream(config *Socks5uConfig, tunnelStream net.Conn) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				if err != io.EOF {
+				if !isExpectedNetClose(err) {
 					config.Logger.Printf("Error reading from tunnel for upstream UDP: %v", err)
 				}
 				return
@@ -1635,7 +1645,9 @@ func handleRemoteUDPViaUpstream(config *Socks5uConfig, tunnelStream net.Conn) {
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 						continue
 					}
-					config.Logger.Printf("Error reading from upstream UDP: %v", err)
+					if !isExpectedNetClose(err) {
+						config.Logger.Printf("Error reading from upstream UDP: %v", err)
+					}
 					return
 				}
 
@@ -1699,7 +1711,6 @@ func handleRemoteUDPViaUpstream(config *Socks5uConfig, tunnelStream net.Conn) {
 		upstreamConn.Close()
 	}
 	wg.Wait()
-	config.Logger.Printf("Remote UDP associate (upstream) ended.")
 }
 
 // forwardDNSOverTCP 将一个 UDP DNS 查询通过 TCP 转发到 config.DNSForwardAddr，
@@ -1864,10 +1875,8 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
 				}
-				if err == io.EOF {
-					config.Logger.Println("Tunnel stream closed from local proxy. Ending UDP relay from stream.")
-					// Stream 关闭，通知另一个 goroutine 也停止
-					return // 流关闭，退出此 goroutine
+				if isExpectedNetClose(err) {
+					return
 				}
 				config.Logger.Printf("Error reading length prefix from tunnel stream for UDP: %v", err)
 				return // 非 EOF 错误，退出此 goroutine
@@ -1890,8 +1899,8 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
 				}
-				if err == io.EOF {
-					config.Logger.Println("Tunnel stream closed from local proxy while reading UDP packet body. Exiting.")
+				if isExpectedNetClose(err) {
+					return
 				}
 				config.Logger.Printf("Error reading UDP packet body from tunnel stream: %v", err)
 				return // 错误，退出此 goroutine
@@ -2009,6 +2018,9 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // 超时，继续等待
 				}
+				if isExpectedNetClose(err) {
+					return
+				}
 				config.Logger.Printf("Error reading from remote local UDP: %v", err)
 				return // 非临时错误或连接关闭，退出此 goroutine
 			}
@@ -2061,7 +2073,6 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 	tunnelStream.Close()
 	remoteLocalUDPConn.Close()
 	wg.Wait()
-	config.Logger.Printf("Remote UDP associate for stream from %s ended.", tunnelStream)
 }
 
 // SOCKS5 客户端结构体

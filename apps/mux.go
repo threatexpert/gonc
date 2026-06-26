@@ -342,9 +342,25 @@ func App_mux_main_withconfig(conn net.Conn, config *AppMuxConfig) {
 	}
 
 	err := handleMuxSession(&cfg)
-	if err != nil {
+	if err != nil && !isExpectedMuxClose(err) {
 		config.Logger.Printf(":mux: %v\n", err)
 	}
+}
+
+func isExpectedMuxClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isExpectedNetClose(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "mux session closed") ||
+		strings.Contains(msg, "link session closed") ||
+		strings.Contains(msg, "linkagent session closed") ||
+		strings.Contains(msg, "forward session closed") ||
+		strings.Contains(msg, "session shutdown") ||
+		strings.Contains(msg, "session closed")
 }
 
 func handleMuxSession(cfg *MuxSessionConfig) error {
@@ -578,7 +594,7 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 	// 如果是纯 UDP 模式，不需要 TCP accept 循环
 	if scheme == "f" && rtConfig.ForwardProto == "udp" {
 		<-doneChan
-		return fmt.Errorf("forward session closed")
+		return nil
 	}
 
 	// 启动 UDP 透明代理（与 TCP 监听并行）
@@ -606,7 +622,9 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 
 		stream, err := openMuxStream(session)
 		if err != nil {
-			muxcfg.Logger.Println("mux Open failed:", err)
+			if !isExpectedMuxClose(err) {
+				muxcfg.Logger.Println("mux Open failed:", err)
+			}
 			return
 		}
 		streamWithCloseWrite := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
@@ -649,9 +667,12 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if isExpectedMuxClose(err) {
+				return nil
+			}
 			select {
 			case <-doneChan:
-				return fmt.Errorf("mux session closed")
+				return nil
 			default:
 				return fmt.Errorf("listener accept failed: %v", err)
 			}
@@ -774,7 +795,7 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 
 	<-sessionDone
-	return fmt.Errorf("link session closed")
+	return nil
 }
 
 // handleLinkMode (Local)
@@ -1040,7 +1061,7 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 	}
 
 	<-sessionDone
-	return fmt.Errorf("linkagent session closed")
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -1108,7 +1129,7 @@ func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, loc
 	for {
 		stream, err := listener.Accept()
 		if err != nil {
-			if err == io.EOF {
+			if isExpectedMuxClose(err) {
 				return nil
 			}
 			return err
