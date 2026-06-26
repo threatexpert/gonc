@@ -88,7 +88,7 @@ func startP2PWithFileSource(args []string, cb Callback, side string, source Andr
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
-	reportServer, reportURL := startP2PReportServer(ctx, cb, side)
+	reportServer, reportURL := startP2PReportServer(cb, side)
 	if reportURL != "" {
 		args = append([]string{}, args...)
 		args = append(args, "-p2p-report-url", reportURL)
@@ -123,7 +123,7 @@ type p2pStatusReport struct {
 	PID       int    `json:"pid"`
 }
 
-func startP2PReportServer(ctx context.Context, cb Callback, side string) (*http.Server, string) {
+func startP2PReportServer(cb Callback, side string) (*http.Server, string) {
 	if cb == nil {
 		return nil, ""
 	}
@@ -153,10 +153,6 @@ func startP2PReportServer(ctx context.Context, cb Callback, side string) (*http.
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	go func() {
-		<-ctx.Done()
-		_ = server.Close()
-	}()
 	go func() {
 		_ = server.Serve(ln)
 	}()
