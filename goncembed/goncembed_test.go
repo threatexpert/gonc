@@ -1,4 +1,4 @@
-package mobilegonc
+package goncembed
 
 import "testing"
 
