@@ -57,8 +57,41 @@ func TestTunnelReadyWaitsForLocalServiceStarted(t *testing.T) {
 	}
 }
 
+func TestTunnelReadyCanFireAfterReconnect(t *testing.T) {
+	cb := &recordingCallback{}
+	writer := &callbackWriter{cb: cb, side: "tunnel"}
+
+	if _, err := writer.Write([]byte("[link-x] Listening on 127.0.0.1:8888 (TProxy=false)")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("[link] Local service started.")); err != nil {
+		t.Fatal(err)
+	}
+	if cb.readyCount != 1 || cb.ready != "socks5://127.0.0.1:8888" {
+		t.Fatalf("first Ready count=%d endpoint=%q", cb.readyCount, cb.ready)
+	}
+
+	if _, err := writer.Write([]byte("[link] Local service started.")); err != nil {
+		t.Fatal(err)
+	}
+	if cb.readyCount != 1 {
+		t.Fatalf("duplicate Local service started fired Ready count=%d, want 1", cb.readyCount)
+	}
+
+	if _, err := writer.Write([]byte("[link-x] Listening on 127.0.0.1:9999 (TProxy=false)")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("[link] Local service started.")); err != nil {
+		t.Fatal(err)
+	}
+	if cb.readyCount != 2 || cb.ready != "socks5://127.0.0.1:9999" {
+		t.Fatalf("second Ready count=%d endpoint=%q", cb.readyCount, cb.ready)
+	}
+}
+
 type recordingCallback struct {
-	ready string
+	ready      string
+	readyCount int
 }
 
 func (c *recordingCallback) Event(level string, message string) {
@@ -69,6 +102,7 @@ func (c *recordingCallback) P2PReport(topic string, side string, status string, 
 
 func (c *recordingCallback) Ready(endpoint string) {
 	c.ready = endpoint
+	c.readyCount++
 }
 
 func (c *recordingCallback) Stopped(exitCode int) {

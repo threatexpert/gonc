@@ -189,7 +189,7 @@ type callbackWriter struct {
 	side                  string
 	mu                    sync.Mutex
 	pendingSOCKS5Endpoint string
-	readySent             bool
+	readyArmed            bool
 }
 
 func (w *callbackWriter) Write(p []byte) (int, error) {
@@ -217,6 +217,7 @@ func (w *callbackWriter) findTunnelReadyEndpoint(message string) string {
 	if endpoint := findLocalSOCKS5Endpoint(message); endpoint != "" {
 		w.mu.Lock()
 		w.pendingSOCKS5Endpoint = endpoint
+		w.readyArmed = true
 		w.mu.Unlock()
 	}
 	if !strings.Contains(message, "[link] Local service started.") {
@@ -224,10 +225,10 @@ func (w *callbackWriter) findTunnelReadyEndpoint(message string) string {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.readySent || w.pendingSOCKS5Endpoint == "" {
+	if !w.readyArmed || w.pendingSOCKS5Endpoint == "" {
 		return ""
 	}
-	w.readySent = true
+	w.readyArmed = false
 	return w.pendingSOCKS5Endpoint
 }
 
