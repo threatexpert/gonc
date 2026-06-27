@@ -24,6 +24,9 @@ func StartP2PTunnel(password string, useUDP bool, linkConfig string, extraArgs s
 		args = append(args, "-u")
 	}
 	args = append(args, "-link", linkConfig)
+	if _, ok := cb.(TrafficCallback); ok {
+		args = append(args, "-P")
+	}
 	if strings.TrimSpace(extraArgs) != "" {
 		args = append(args, splitExtraArgs(extraArgs)...)
 	}

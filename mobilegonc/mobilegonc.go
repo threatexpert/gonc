@@ -13,6 +13,7 @@ import (
 type Callback interface {
 	Event(level string, message string)
 	P2PReport(topic string, side string, status string, network string, mode string, peer string, timestamp int64, pid int)
+	Traffic(side string, inBytes int64, outBytes int64, inBps float64, outBps float64, elapsed int64, connCount int, final bool)
 	Ready(endpoint string)
 	Stopped(exitCode int)
 	Error(message string)

@@ -25,6 +25,10 @@ type Callback interface {
 	Error(message string)
 }
 
+type TrafficCallback interface {
+	Traffic(side string, inBytes int64, outBytes int64, inBps float64, outBps float64, elapsed int64, connCount int, final bool)
+}
+
 // Session represents one running gonc task.
 type Session struct {
 	mu     sync.Mutex
@@ -119,6 +123,7 @@ func startP2PWithFileSource(args []string, cb Callback, side string, source http
 		args = append(args, "-p2p-report-url", reportURL)
 	}
 	writer := &callbackWriter{cb: cb, side: side}
+	progressSink := progressSinkFor(cb, side)
 	go func() {
 		defer close(session.done)
 		if reportServer != nil {
@@ -126,15 +131,25 @@ func startP2PWithFileSource(args []string, cb Callback, side string, source http
 		}
 		exitCode := 0
 		if source != nil {
-			exitCode = apps.RunNetcatP2PWithHTTPFileSource(ctx, nil, writer, args, source)
+			exitCode = apps.RunNetcatP2PWithHTTPFileSourceAndProgress(ctx, nil, writer, args, source, progressSink)
 		} else {
-			exitCode = apps.RunNetcat(ctx, nil, writer, args)
+			exitCode = apps.RunNetcatWithProgress(ctx, nil, writer, args, progressSink)
 		}
 		if cb != nil {
 			cb.Stopped(exitCode)
 		}
 	}()
 	return session
+}
+
+func progressSinkFor(cb Callback, side string) func(apps.ProgressSnapshot) {
+	trafficCB, ok := cb.(TrafficCallback)
+	if !ok {
+		return nil
+	}
+	return func(snapshot apps.ProgressSnapshot) {
+		trafficCB.Traffic(side, snapshot.InBytes, snapshot.OutBytes, snapshot.InBps, snapshot.OutBps, int64(snapshot.Elapsed), snapshot.ConnCount, snapshot.Final)
+	}
 }
 
 type p2pStatusReport struct {

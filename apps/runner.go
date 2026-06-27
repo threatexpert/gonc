@@ -15,14 +15,22 @@ import (
 // main() or os.Args. It is intentionally thin so mobile integrations can first
 // reuse the battle-tested CLI path, then replace internals module by module.
 func RunNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args []string) int {
-	return runNetcat(ctx, console, logWriter, args, nil)
+	return runNetcat(ctx, console, logWriter, args, nil, nil)
+}
+
+func RunNetcatWithProgress(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, progressSink func(ProgressSnapshot)) int {
+	return runNetcat(ctx, console, logWriter, args, nil, progressSink)
 }
 
 func RunNetcatP2PWithHTTPFileSource(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, source httpfileshare.FileSource) int {
-	return runNetcat(ctx, console, logWriter, args, source)
+	return runNetcat(ctx, console, logWriter, args, source, nil)
 }
 
-func runNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, source httpfileshare.FileSource) int {
+func RunNetcatP2PWithHTTPFileSourceAndProgress(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, source httpfileshare.FileSource, progressSink func(ProgressSnapshot)) int {
+	return runNetcat(ctx, console, logWriter, args, source, progressSink)
+}
+
+func runNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args []string, source httpfileshare.FileSource, progressSink func(ProgressSnapshot)) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -42,6 +50,7 @@ func runNetcat(ctx context.Context, console net.Conn, logWriter io.Writer, args 
 	}
 	config.ctx = ctx
 	config.ConsoleMode = false
+	config.ProgressSink = progressSink
 	if source != nil {
 		if config.app_mux_Config == nil || config.app_mux_Config.AppMode != "httpserver" {
 			fmt.Fprintln(logWriter, "Error preparing P2P HTTP file source: P2P httpserver mode is required")

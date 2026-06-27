@@ -42,6 +42,7 @@ type AppNetcatConfig struct {
 	ConsoleMode                bool
 	Logger                     *log.Logger
 	LogWriter                  io.Writer
+	ProgressSink               func(ProgressSnapshot)
 	goroutineConnectionCounter int32
 
 	ctx                          context.Context
@@ -153,6 +154,16 @@ type AppNetcatConfig struct {
 	scanOnly             bool
 	daemon               bool
 	outputLogFile        string
+}
+
+type ProgressSnapshot struct {
+	InBytes   int64
+	OutBytes  int64
+	InBps     float64
+	OutBps    float64
+	Elapsed   int
+	ConnCount int
+	Final     bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -1858,6 +1869,17 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 					m := (elapsed % 3600) / 60
 					s := elapsed % 60
 					connCount := atomic.LoadInt32(&ncconfig.goroutineConnectionCounter)
+					if ncconfig.ProgressSink != nil {
+						ncconfig.ProgressSink(ProgressSnapshot{
+							InBytes:   in.TotalBytes,
+							OutBytes:  out.TotalBytes,
+							InBps:     in.SpeedBps,
+							OutBps:    out.SpeedBps,
+							Elapsed:   elapsed,
+							ConnCount: int(connCount),
+						})
+						continue
+					}
 					if connCount > 1 {
 						fmt.Fprintf(ncconfig.LogWriter,
 							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %d | %02d:%02d:%02d\r",
@@ -1885,6 +1907,18 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 					in := statsIn.Stats(now, true)
 					out := statsOut.Stats(now, true)
 					elapsed := int(now.Sub(statsIn.StartTime()).Seconds())
+					if ncconfig.ProgressSink != nil {
+						ncconfig.ProgressSink(ProgressSnapshot{
+							InBytes:   in.TotalBytes,
+							OutBytes:  out.TotalBytes,
+							InBps:     in.SpeedBps,
+							OutBps:    out.SpeedBps,
+							Elapsed:   elapsed,
+							ConnCount: int(atomic.LoadInt32(&ncconfig.goroutineConnectionCounter)),
+							Final:     true,
+						})
+						return
+					}
 					h := elapsed / 3600
 					m := (elapsed % 3600) / 60
 					s := elapsed % 60
