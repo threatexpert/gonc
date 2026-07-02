@@ -168,6 +168,15 @@ def human_size(num):
 
 # ---------- 获取 gonc.exe 的版本 ----------
 def get_gonc_version():
+    for key in ("GONC_VERSION", "GITHUB_REF_NAME"):
+        version = os.environ.get(key, "").strip()
+        if version.startswith("v"):
+            return version
+
+    github_ref = os.environ.get("GITHUB_REF", "").strip()
+    if github_ref.startswith("refs/tags/v"):
+        return github_ref.removeprefix("refs/tags/")
+
     exe = BIN_DIR / "gonc.exe"
     if not exe.exists():
         return "unknown"

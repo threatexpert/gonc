@@ -9,6 +9,14 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_PAGES_PROJECT_NAME: ${{ secrets.CLOUDFLARE_PAGES_PROJECT_NAME }}
+      CLOUDFLARE_PAGES_BRANCH: ${{ vars.CLOUDFLARE_PAGES_BRANCH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -17,6 +25,16 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.3'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Build binaries
         env:
@@ -29,6 +47,8 @@ jobs:
           # Windows
           GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_windows_amd64.exe .
           GOOS=windows GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_windows_arm64.exe .
+          cp bin/gonc_windows_amd64.exe bin/gonc.exe
+          cp bin/gonc_windows_arm64.exe bin/gonc_arm64.exe
           
           # Darwin (macOS)
           GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/gonc_darwin_amd64 .
@@ -58,3 +78,35 @@ jobs:
           files: bin/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload binaries to Cloudflare R2
+        if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_ACCESS_KEY_ID != '' && env.R2_SECRET_ACCESS_KEY != '' && env.R2_BUCKET != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 sync bin/ "s3://${R2_BUCKET}/${GITHUB_REF_NAME}/" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            --delete
+
+      - name: Build Cloudflare Pages package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install mkdocs-material
+          mkdocs build
+          GONC_VERSION="${GITHUB_REF_NAME}" python build_page.py
+          rm -rf page_dist
+          mkdir -p page_dist
+          unzip -q "bin/deploy_${GITHUB_REF_NAME}.zip" -d page_dist
+
+      - name: Deploy to Cloudflare Pages
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_PAGES_PROJECT_NAME != '' && env.R2_ACCOUNT_ID != '' }}
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.R2_ACCOUNT_ID }}
+        run: |
+          PAGES_BRANCH="${CLOUDFLARE_PAGES_BRANCH:-main}"
+          npx --yes wrangler@latest pages deploy page_dist \
+            --project-name "$CLOUDFLARE_PAGES_PROJECT_NAME" \
+            --branch "$PAGES_BRANCH" \
+            --commit-dirty=true
