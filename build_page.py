@@ -133,7 +133,7 @@ body {
             <ul>
             <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> —— 基于 <code>gonc</code> 的桌面（Windows）和 Android 应用：提供便捷的跨设备、跨网络点对点直连与安全文件传输，只需分享口令（或扫码），无需命令行。
                 <div style="margin-top: 6px;">
-                    Download:
+                    下载:
                     <a href="/gui/windows-amd64.zip">Windows x64</a> |
                     <a href="/gui/windows-arm64.zip">Windows ARM64</a> |
                     <a href="/gui/macos-arm64.zip">macOS Apple Silicon</a> |
