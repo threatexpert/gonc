@@ -15,6 +15,16 @@ NOTFOUND_HTML = BIN_DIR / "404.html"
 #HEADERS_FILE = BIN_DIR / "_headers"
 REDIRECTS_FILE = BIN_DIR / "_redirects"
 R2STORAGE_URL_BASE = "https://gonc.download"
+GUI_REDIRECTS = [
+    ("/gui/windows-amd64.zip", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/gonc-gui-windows-amd64.zip"),
+    ("/gui/windows-arm64.zip", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/gonc-gui-windows-arm64.zip"),
+    ("/gui/ubuntu-amd64.tar.gz", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/gonc-gui-ubuntu-amd64.tar.gz"),
+    ("/gui/macos-amd64.zip", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/gonc-gui-macos-amd64.zip"),
+    ("/gui/macos-arm64.zip", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/gonc-gui-macos-arm64.zip"),
+    ("/gui/android-arm64.apk", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/gonc-gui-android-arm64.apk"),
+    ("/gui/manifest.json", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/manifest.json"),
+    ("/gui/version.txt", f"{R2STORAGE_URL_BASE}/gonc-gui/latest/version.txt"),
+]
 
 # ---------- 固定文案 ----------
 HEADER_TEXT = """
@@ -121,7 +131,15 @@ body {
             </ul>
             <h3>相关项目</h3>
             <ul>
-            <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> —— 基于 <code>gonc</code> 的桌面（Windows）和 Android 应用：提供便捷的跨设备、跨网络点对点直连与安全文件传输，只需分享口令（或扫码），无需命令行。</li>
+            <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> —— 基于 <code>gonc</code> 的桌面（Windows）和 Android 应用：提供便捷的跨设备、跨网络点对点直连与安全文件传输，只需分享口令（或扫码），无需命令行。
+                <div style="margin-top: 6px;">
+                    Download:
+                    <a href="/gui/windows-amd64.zip">Windows x64</a> |
+                    <a href="/gui/windows-arm64.zip">Windows ARM64</a> |
+                    <a href="/gui/macos-arm64.zip">macOS Apple Silicon</a> |
+                    <a href="/gui/android-arm64.apk">Android APK</a>
+                </div>
+            </li>
             </ul>
         </div>
 
@@ -142,11 +160,20 @@ body {
             </ul>
             <h3>Related Projects</h3>
             <ul>
-            <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> — a desktop (Windows) and Android app built on <code>gonc</code>: convenient cross-device, cross-network P2P direct connection and secure file transfer, just share a passphrase (or scan a QR code), no command line required.</li>
+            <li><a href="https://github.com/threatexpert/gonc-gui">gonc-gui</a> — a desktop (Windows) and Android app built on <code>gonc</code>: convenient cross-device, cross-network P2P direct connection and secure file transfer, just share a passphrase (or scan a QR code), no command line required.
+                <div style="margin-top: 6px;">
+                    Download:
+                    <a href="/gui/windows-amd64.zip">Windows x64</a> |
+                    <a href="/gui/windows-arm64.zip">Windows ARM64</a> |
+                    <a href="/gui/macos-arm64.zip">macOS Apple Silicon</a> |
+                    <a href="/gui/android-arm64.apk">Android APK</a>
+                </div>
+            </li>
             </ul>
         </div>
 
     </div>
+
 </div>
 """
 
@@ -269,6 +296,9 @@ def build_redirects(files, version):
     for name, size, sha in files:
         target = f"{R2STORAGE_URL_BASE}/{version}/{name}"
         lines.append(f"/{name}    {target}    302")
+
+    for path, target in GUI_REDIRECTS:
+        lines.append(f"{path}    {target}    302")
 
     REDIRECTS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"✔ 已生成 {REDIRECTS_FILE}")
