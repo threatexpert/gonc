@@ -82,7 +82,7 @@ func TestDownloadFileInitialFullDownloadDoesNotLogPerFileInfo(t *testing.T) {
 		Concurrency:            1,
 		Resume:                 true,
 		NoCompress:             true,
-		LogLevel:               LogLevelInfo,
+		LogLevel:               LogLevelRepair,
 		LoggerOutput:           &logs,
 		ProgressOutput:         io.Discard,
 		ProgressUpdateInterval: time.Hour,
@@ -243,7 +243,7 @@ func TestDownloadFileBlake3RepairLogsPlanAndCompletion(t *testing.T) {
 		Concurrency:            1,
 		Resume:                 true,
 		NoCompress:             true,
-		LogLevel:               LogLevelInfo,
+		LogLevel:               LogLevelRepair,
 		LoggerOutput:           &logs,
 		ProgressOutput:         io.Discard,
 		ProgressUpdateInterval: time.Hour,
@@ -263,6 +263,33 @@ func TestDownloadFileBlake3RepairLogsPlanAndCompletion(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(gotLogs), []byte("Repair completed")) {
 		t.Fatalf("logs = %q, want repair completion", gotLogs)
+	}
+}
+
+func TestLogLevelRepairDoesNotLogGeneralInfo(t *testing.T) {
+	var logs bytes.Buffer
+	client, err := NewClient(ClientConfig{
+		ServerURL:              "http://127.0.0.1/",
+		LocalDir:               t.TempDir(),
+		Concurrency:            1,
+		LogLevel:               LogLevelRepair,
+		LoggerOutput:           &logs,
+		ProgressOutput:         io.Discard,
+		ProgressUpdateInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.logInfo("general info")
+	client.logRepair("repair info")
+
+	gotLogs := logs.String()
+	if bytes.Contains([]byte(gotLogs), []byte("general info")) {
+		t.Fatalf("logs = %q, want no general info at repair level", gotLogs)
+	}
+	if !bytes.Contains([]byte(gotLogs), []byte("repair info")) {
+		t.Fatalf("logs = %q, want repair info", gotLogs)
 	}
 }
 

@@ -1090,7 +1090,7 @@ func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 			Resume:                 true,
 			DryRun:                 false,
 			Verbose:                false,
-			LogLevel:               httpfileshare.LogLevelInfo,
+			LogLevel:               httpfileshare.LogLevelRepair,
 			LoggerOutput:           cfg.Logger.Writer(),
 			ProgressOutput:         cfg.Logger.Writer(),
 			ProgressUpdateInterval: 1 * time.Second,

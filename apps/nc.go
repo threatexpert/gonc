@@ -1494,7 +1494,7 @@ func runHTTPDownload(console net.Conn, ncconfig *AppNetcatConfig) int {
 		Resume:                 true,
 		DryRun:                 false,
 		Verbose:                false,
-		LogLevel:               httpfileshare.LogLevelInfo,
+		LogLevel:               httpfileshare.LogLevelRepair,
 		LoggerOutput:           ncconfig.LogWriter,
 		ProgressOutput:         ncconfig.LogWriter,
 		ProgressUpdateInterval: 1 * time.Second,

@@ -31,6 +31,8 @@ const (
 	LogLevelSilent LogLevel = iota
 	// LogLevelError logs only errors.
 	LogLevelError
+	// LogLevelRepair logs errors and repair/re-download decisions.
+	LogLevelRepair
 	// LogLevelInfo logs informational messages and errors.
 	LogLevelInfo
 	// LogLevelVerbose logs all messages including verbose debug info.
@@ -236,6 +238,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		// Both remain Discard
 	case LogLevelError:
 		errorWriter = cfg.LoggerOutput
+	case LogLevelRepair:
+		infoWriter = cfg.LoggerOutput
+		errorWriter = cfg.LoggerOutput
 	case LogLevelInfo:
 		infoWriter = cfg.LoggerOutput
 		errorWriter = cfg.LoggerOutput
@@ -268,6 +273,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 // logInfo logs informational messages if the log level permits.
 func (c *Client) logInfo(format string, v ...interface{}) {
 	if c.config.LogLevel >= LogLevelInfo {
+		c.infoLogger.Printf(format, v...)
+	}
+}
+
+// logRepair logs repair and re-download decisions if the log level permits.
+func (c *Client) logRepair(format string, v ...interface{}) {
+	if c.config.LogLevel >= LogLevelRepair {
 		c.infoLogger.Printf(format, v...)
 	}
 }
@@ -579,8 +591,12 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 			if repaired {
 				return nil
 			}
-			c.logInfo("BLAKE3 repair unavailable or inefficient for %s; re-downloading full file", localFilePath)
-			return c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo, true)
+			c.logRepair("BLAKE3 repair unavailable or inefficient for %s; re-downloading full file", localFilePath)
+			if err := c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo); err != nil {
+				return err
+			}
+			c.logRepair("Full download completed for %s: downloaded %s", localFilePath, formatBytes(fileInfo.Size))
+			return nil
 		}
 
 		if localFileExists && !c.config.Overwrite {
@@ -595,10 +611,10 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		}
 	}
 
-	return c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo, false)
+	return c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo)
 }
 
-func (c *Client) downloadFullFile(ctx context.Context, httpClient *http.Client, downloadURL, localFilePath string, fileInfo FileInfo, reportCompletion bool) error {
+func (c *Client) downloadFullFile(ctx context.Context, httpClient *http.Client, downloadURL, localFilePath string, fileInfo FileInfo) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("error creating download request for %s: %w", downloadURL, err)
@@ -680,12 +696,8 @@ func (c *Client) downloadFullFile(ctx context.Context, httpClient *http.Client, 
 		return fmt.Errorf("CRITICAL WARNING: Final size of %s (%d bytes) does not match expected server size (%d bytes)! File is incomplete or corrupted",
 			localFilePath, bytesCopiedSuccessfully, fileInfo.Size)
 	}
-	if reportCompletion {
-		c.logInfo("Full download completed for %s: downloaded %s", localFilePath, formatBytes(bytesCopiedSuccessfully))
-	} else {
-		c.logVerbose("Downloaded %s (%d bytes) to %s. Total size on disk: %d bytes (expected full: %d)",
-			filepath.Base(localFilePath), bytesCopiedSuccessfully, localFilePath, bytesCopiedSuccessfully, fileInfo.Size)
-	}
+	c.logVerbose("Downloaded %s (%d bytes) to %s. Total size on disk: %d bytes (expected full: %d)",
+		filepath.Base(localFilePath), bytesCopiedSuccessfully, localFilePath, bytesCopiedSuccessfully, fileInfo.Size)
 
 	if err := os.Chtimes(localFilePath, time.Now(), fileInfo.ModTime); err != nil {
 		c.logInfo("Warning: Could not set modification time for %s: %v", localFilePath, err)
@@ -708,7 +720,7 @@ func (c *Client) repairFileWithBlake3(ctx context.Context, httpClient *http.Clie
 	manifest, err := c.fetchBlake3Manifest(ctx, httpClient, downloadURL)
 	if err != nil {
 		if errors.Is(err, errBlake3ManifestUnsupported) {
-			c.logInfo("Repair check unavailable for %s: server does not provide BLAKE3 manifest; falling back to full download", localFilePath)
+			c.logRepair("Repair check unavailable for %s: server does not provide BLAKE3 manifest; falling back to full download", localFilePath)
 			return false, nil
 		}
 		return false, err
@@ -747,7 +759,7 @@ func (c *Client) repairFileWithBlake3(ctx context.Context, httpClient *http.Clie
 		if manifest.Size > 0 {
 			c.progressTracker.AddBytesDownloaded(manifest.Size)
 		}
-		c.logInfo("Repair completed for %s: no range download, final size %s", localFilePath, formatBytes(manifest.Size))
+		c.logRepair("Repair completed for %s: no range download, final size %s", localFilePath, formatBytes(manifest.Size))
 		return true, nil
 	}
 
@@ -778,7 +790,7 @@ func (c *Client) repairFileWithBlake3(ctx context.Context, httpClient *http.Clie
 	if retainedBytes := manifest.Size - transferBytes; retainedBytes > 0 {
 		c.progressTracker.AddBytesDownloaded(retainedBytes)
 	}
-	c.logInfo("Repair completed for %s: %d range request(s), downloaded %s, final size %s", localFilePath, len(ranges), formatBytes(transferBytes), formatBytes(manifest.Size))
+	c.logRepair("Repair completed for %s: %d range request(s), downloaded %s, final size %s", localFilePath, len(ranges), formatBytes(transferBytes), formatBytes(manifest.Size))
 	return true, nil
 }
 
@@ -798,10 +810,10 @@ func (c *Client) logRepairPlan(localFilePath string, summary repairSummary, acti
 
 	switch action {
 	case "full-download":
-		c.logInfo("Repair check for %s: local=%s remote=%s, %d changed/missing range(s) totaling %s; full download selected",
+		c.logRepair("Repair check for %s: local=%s remote=%s, %d changed/missing range(s) totaling %s; full download selected",
 			localFilePath, formatBytes(summary.localSize), formatBytes(summary.remoteSize), summary.rangeCount, formatBytes(summary.transferSize))
 	default:
-		c.logInfo("Repair plan for %s: local=%s remote=%s, keep %s, download %s in %d range request(s), truncate %s",
+		c.logRepair("Repair plan for %s: local=%s remote=%s, keep %s, download %s in %d range request(s), truncate %s",
 			localFilePath, formatBytes(summary.localSize), formatBytes(summary.remoteSize), formatBytes(retainedSize), formatBytes(summary.transferSize), summary.rangeCount, formatBytes(summary.truncateSize))
 	}
 }
