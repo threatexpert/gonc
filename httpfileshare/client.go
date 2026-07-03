@@ -357,6 +357,37 @@ func (c *Client) setAcceptEncodingForCompress(req *http.Request) {
 	}
 }
 
+var errUnsupportedContentEncoding = errors.New("unsupported content encoding")
+
+func (c *Client) decodedResponseReader(resp *http.Response, label string, allowUnknown bool) (io.Reader, func(), error) {
+	contentEncoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	switch contentEncoding {
+	case "zstd":
+		c.logVerbose("Decompressing %s with Zstandard (zstd)", label)
+		zstdReader, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error creating zstd reader for %s: %w", label, err)
+		}
+		return zstdReader, zstdReader.Close, nil
+	case "gzip":
+		c.logVerbose("Decompressing %s with Gzip", label)
+		gzipReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error creating gzip reader for %s: %w", label, err)
+		}
+		return gzipReader, func() { _ = gzipReader.Close() }, nil
+	case "", "identity":
+		c.logVerbose("No content encoding for %s", label)
+		return resp.Body, func() {}, nil
+	default:
+		if allowUnknown {
+			c.logInfo("Warning: Unknown Content-Encoding '%s' for %s. Attempting direct read.", contentEncoding, label)
+			return resp.Body, func() {}, nil
+		}
+		return nil, nil, fmt.Errorf("%w %q for %s", errUnsupportedContentEncoding, contentEncoding, label)
+	}
+}
+
 // fetchFileList connects to the server and streams recursive file info,
 // collecting all FileInfo objects before returning them.
 func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
@@ -397,31 +428,11 @@ func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
 		return collectedFiles, nil //let it keep running
 	}
 
-	var reader io.Reader = resp.Body
-	contentEncoding := resp.Header.Get("Content-Encoding")
-
-	switch contentEncoding {
-	case "zstd":
-		c.logVerbose("Decompressing file list with Zstandard (zstd)")
-		zstdReader, zstdErr := zstd.NewReader(resp.Body)
-		if zstdErr != nil {
-			return nil, fmt.Errorf("error creating zstd reader for file list: %w", zstdErr)
-		}
-		defer zstdReader.Close()
-		reader = zstdReader
-	case "gzip":
-		c.logVerbose("File list is Gzip encoded")
-		gzipReader, gzipErr := gzip.NewReader(resp.Body)
-		if gzipErr != nil {
-			return nil, fmt.Errorf("error creating gzip reader for file list: %w", gzipErr)
-		}
-		defer gzipReader.Close() // 确保解压器关闭
-		reader = gzipReader
-	case "":
-		c.logVerbose("No content encoding for file list")
-	default:
-		c.logInfo("Warning: Unknown Content-Encoding '%s' for file list. Attempting direct read.", contentEncoding)
+	reader, closeReader, err := c.decodedResponseReader(resp, "file list", true)
+	if err != nil {
+		return nil, err
 	}
+	defer closeReader()
 
 	scanner := bufio.NewScanner(reader)
 
@@ -562,8 +573,8 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 
 		standardizedPath := filepath.ToSlash(fileInfo.Path)
 
-		// 2. 对路径进行 URL 编码，保留斜杠。
-		//    这将处理路径中包含的 # 等特殊字符，将它们编码为 %23，而不是被 url.Parse 识别为 Fragment。
+		// Escape each URL path segment while preserving slashes, so special
+		// characters such as # stay inside the path instead of becoming fragments.
 		encodedFileInfoURLPath := encodePathSegmentPreservingSlashes(standardizedPath)
 
 		parsedFileInfoURLPath, err := url.Parse(encodedFileInfoURLPath)
@@ -646,31 +657,11 @@ func (c *Client) downloadFullFile(ctx context.Context, httpClient *http.Client, 
 	}
 	defer outFile.Close()
 
-	var bodyReader io.Reader = resp.Body
-	contentEncoding := resp.Header.Get("Content-Encoding")
-
-	switch contentEncoding {
-	case "zstd":
-		c.logVerbose("Decompressing %s with Zstandard (zstd)", fileInfo.Path)
-		zstdReader, zstdErr := zstd.NewReader(resp.Body)
-		if zstdErr != nil {
-			return fmt.Errorf("error creating zstd reader for %s: %w", fileInfo.Path, zstdErr)
-		}
-		defer zstdReader.Close()
-		bodyReader = zstdReader
-	case "gzip":
-		c.logVerbose("Decompressing %s with Gzip", fileInfo.Path)
-		gzipReader, gzipErr := gzip.NewReader(resp.Body)
-		if gzipErr != nil {
-			return fmt.Errorf("error creating gzip reader for file list: %w", gzipErr)
-		}
-		defer gzipReader.Close() // 确保解压器关闭
-		bodyReader = gzipReader
-	case "":
-		c.logVerbose("No content encoding for %s", fileInfo.Path)
-	default:
-		c.logInfo("Warning: Unknown Content-Encoding '%s' for %s. Attempting direct copy.", contentEncoding, fileInfo.Path)
+	bodyReader, closeReader, err := c.decodedResponseReader(resp, fileInfo.Path, true)
+	if err != nil {
+		return err
 	}
+	defer closeReader()
 
 	writerForCopy := io.Writer(outFile)
 	if !c.config.Verbose { // ProgressWriter is only active if Verbose is false
@@ -840,7 +831,7 @@ func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Clien
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "identity")
+	c.setAcceptEncodingForCompress(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -855,7 +846,16 @@ func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Clien
 		return nil, errBlake3ManifestUnsupported
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	reader, closeReader, err := c.decodedResponseReader(resp, "BLAKE3 manifest", false)
+	if err != nil {
+		if errors.Is(err, errUnsupportedContentEncoding) {
+			return nil, errBlake3ManifestUnsupported
+		}
+		return nil, err
+	}
+	defer closeReader()
+
+	scanner := bufio.NewScanner(reader)
 	var manifest blake3Manifest
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -989,7 +989,7 @@ func (c *Client) downloadRange(ctx context.Context, httpClient *http.Client, dow
 		return err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", repairRange.Offset, repairRange.endInclusive()))
-	req.Header.Set("Accept-Encoding", "identity")
+	c.setAcceptEncodingForCompress(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -1004,6 +1004,12 @@ func (c *Client) downloadRange(ctx context.Context, httpClient *http.Client, dow
 		return errRangeRepairUnsupported
 	}
 
+	bodyReader, closeReader, err := c.decodedResponseReader(resp, fmt.Sprintf("range %d-%d", repairRange.Offset, repairRange.endInclusive()), false)
+	if err != nil {
+		return errRangeRepairUnsupported
+	}
+	defer closeReader()
+
 	writer := io.Writer(&writeAtWriter{file: outFile, offset: repairRange.Offset})
 	if !c.config.Verbose {
 		writer = &ProgressWriter{
@@ -1011,7 +1017,7 @@ func (c *Client) downloadRange(ctx context.Context, httpClient *http.Client, dow
 			Progress: c.progressTracker,
 		}
 	}
-	written, err := io.Copy(writer, resp.Body)
+	written, err := io.Copy(writer, bodyReader)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package httpfileshare
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -219,6 +220,96 @@ func TestDownloadFileBlake3RepairOverwritesDirtyBlock(t *testing.T) {
 	}
 }
 
+func TestDownloadFileBlake3RepairSupportsCompressedManifestAndRange(t *testing.T) {
+	remoteModTime := time.Unix(1700004500, 0)
+	remoteBody := testBytes(20 * 1024 * 1024)
+	localBody := remoteBody[:16*1024*1024]
+
+	server, fileInfo, rangeRequests := newTestHTTPFileServerWithZstd(t, remoteBody, remoteModTime)
+	defer server.Close()
+
+	localDir := t.TempDir()
+	localPath := filepath.Join(localDir, "data.bin")
+	if err := os.WriteFile(localPath, localBody, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(localPath, time.Now(), remoteModTime.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewClient(ClientConfig{
+		ServerURL:              server.URL,
+		LocalDir:               localDir,
+		Concurrency:            1,
+		Resume:                 true,
+		ProgressOutput:         io.Discard,
+		ProgressUpdateInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.progressTracker.AddTotalBytes(fileInfo.Size)
+
+	if err := client.downloadFile(context.Background(), server.Client(), fileInfo); err != nil {
+		t.Fatal(err)
+	}
+
+	assertFileBody(t, localPath, remoteBody)
+	if got := rangeRequests.Load(); got == 0 {
+		t.Fatal("expected at least one compressed range request for repair")
+	}
+}
+
+func TestDownloadRangeSupportsGzipEncodedBody(t *testing.T) {
+	const rangeBody = "repair-data"
+	var sawCompressedRange atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "bytes=4-14" {
+			t.Fatalf("Range = %q, want %q", r.Header.Get("Range"), "bytes=4-14")
+		}
+		if r.Header.Get("Accept-Encoding") != "" {
+			sawCompressedRange.Store(true)
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusPartialContent)
+		gw := gzip.NewWriter(w)
+		_, _ = io.WriteString(gw, rangeBody)
+		_ = gw.Close()
+	}))
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	localPath := filepath.Join(tmpDir, "data.bin")
+	if err := os.WriteFile(localPath, []byte("00000000000000000000"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	outFile, err := os.OpenFile(localPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	client, err := newTestClient(server.URL, tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.config.NoCompress = false
+	if err := client.downloadRange(context.Background(), server.Client(), server.URL+"/data.bin", outFile, repairRange{Offset: 4, Size: int64(len(rangeBody))}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "0000"+rangeBody+"00000" {
+		t.Fatalf("local body = %q", got)
+	}
+	if !sawCompressedRange.Load() {
+		t.Fatal("expected compressed range request")
+	}
+}
+
 func TestDownloadFileBlake3RepairLogsPlanAndCompletion(t *testing.T) {
 	remoteModTime := time.Unix(1700006000, 0)
 	remoteBody := testBytes(20 * 1024 * 1024)
@@ -328,6 +419,40 @@ func newTestHTTPFileServer(t *testing.T, body []byte, modTime time.Time) (*httpt
 			rangeRequests.Add(1)
 		}
 		fileServer.serveFilesFromSource(w, r)
+	}))
+
+	return server, FileInfo{
+		Name:    "data.bin",
+		Path:    "/data.bin",
+		Size:    int64(len(body)),
+		ModTime: modTime,
+	}, &rangeRequests
+}
+
+func newTestHTTPFileServerWithZstd(t *testing.T, body []byte, modTime time.Time) (*httptest.Server, FileInfo, *atomic.Int64) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "data.bin")
+	if err := os.WriteFile(filePath, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filePath, time.Now(), modTime); err != nil {
+		t.Fatal(err)
+	}
+
+	fileServer, err := NewServer(ServerConfig{RootPaths: []string{tmpDir}, LoggerOutput: io.Discard, EnableZstd: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := fileServer.zstdMiddleware(http.HandlerFunc(fileServer.serveFilesFromSource))
+
+	var rangeRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			rangeRequests.Add(1)
+		}
+		handler.ServeHTTP(w, r)
 	}))
 
 	return server, FileInfo{
