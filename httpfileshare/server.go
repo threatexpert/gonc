@@ -94,6 +94,35 @@ func (z *zstdWriter) WriteHeader(status int) {
 	z.ResponseWriter.WriteHeader(status)
 }
 
+type responseStatsWriter struct {
+	http.ResponseWriter
+	status       int
+	bytesWritten int64
+}
+
+func (w *responseStatsWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *responseStatsWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytesWritten += int64(n)
+	return n, err
+}
+
+func (w *responseStatsWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
 // zstdMiddleware applies Zstandard compression if the client accepts it.
 func (s *Server) zstdMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -284,8 +313,18 @@ func (s *Server) serveFilesFromSource(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	s.logger.Printf("Serving file '%s' (size %s) to %s", r.URL.Path, formatBytes(stat.Size()), r.RemoteAddr)
-	s.handleFileDownload(w, r, f, stat)
-	s.logger.Printf("Served file '%s' (size %s) to %s", r.URL.Path, formatBytes(stat.Size()), r.RemoteAddr)
+	statsWriter := &responseStatsWriter{ResponseWriter: w}
+	s.handleFileDownload(statsWriter, r, f, stat)
+	s.logger.Printf("Served file '%s' status=%d full_size=%s served=%s range=%q content_range=%q encoding=%q to %s",
+		r.URL.Path,
+		statsWriter.Status(),
+		formatBytes(stat.Size()),
+		formatBytes(statsWriter.bytesWritten),
+		r.Header.Get("Range"),
+		statsWriter.Header().Get("Content-Range"),
+		statsWriter.Header().Get("Content-Encoding"),
+		r.RemoteAddr,
+	)
 }
 
 func (s *Server) serveDirectoryFromSource(w http.ResponseWriter, r *http.Request, requestedPath string) {

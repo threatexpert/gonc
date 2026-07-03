@@ -84,6 +84,45 @@ func TestHandleFileDownloadReadSeekerSupportsRange(t *testing.T) {
 	}
 }
 
+func TestServeFilesFromSourceLogsRangeResponseStats(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(filePath, []byte("0123456789"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var logs bytes.Buffer
+	server, err := NewServer(ServerConfig{RootPaths: []string{dir}, LoggerOutput: &logs})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/data.bin", nil)
+	req.Header.Set("Range", "bytes=3-")
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusPartialContent)
+	}
+
+	gotLogs := logs.String()
+	for _, want := range []string{
+		`Served file '/data.bin'`,
+		`status=206`,
+		`full_size=10 B`,
+		`served=7 B`,
+		`range="bytes=3-"`,
+		`content_range="bytes 3-9/10"`,
+	} {
+		if !strings.Contains(gotLogs, want) {
+			t.Fatalf("logs = %q, want %q", gotLogs, want)
+		}
+	}
+}
+
 func TestHandleFileDownloadNonSeekableIgnoresRange(t *testing.T) {
 	body := []byte("0123456789")
 	stat := testFileInfo{name: "stream.bin", size: int64(len(body))}
