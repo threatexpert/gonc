@@ -2,10 +2,12 @@
 package mobilegonc
 
 import (
+	"encoding/hex"
 	"errors"
 	"strings"
 
 	"github.com/threatexpert/gonc/v2/goncembed"
+	"github.com/zeebo/blake3"
 )
 
 // Callback is implemented by the Android layer. Keep this interface small and
@@ -56,4 +58,10 @@ func StartP2PReceive(password string, useUDP bool, cb Callback) (*Session, error
 		return nil, err
 	}
 	return &Session{inner: session}, nil
+}
+
+// Blake3Hex returns the BLAKE3-256 digest for a byte slice as lowercase hex.
+func Blake3Hex(data []byte) string {
+	sum := blake3.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
