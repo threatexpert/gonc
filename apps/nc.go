@@ -35,7 +35,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.9"
+	VERSION = "v2.5.10"
 )
 
 type AppNetcatConfig struct {
@@ -1494,7 +1494,7 @@ func runHTTPDownload(console net.Conn, ncconfig *AppNetcatConfig) int {
 		Resume:                 true,
 		DryRun:                 false,
 		Verbose:                false,
-		LogLevel:               httpfileshare.LogLevelError,
+		LogLevel:               httpfileshare.LogLevelInfo,
 		LoggerOutput:           ncconfig.LogWriter,
 		ProgressOutput:         ncconfig.LogWriter,
 		ProgressUpdateInterval: 1 * time.Second,

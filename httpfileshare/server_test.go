@@ -1,7 +1,9 @@
 package httpfileshare
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -228,6 +230,139 @@ func TestConfiguredFileSourceRecursiveList(t *testing.T) {
 	}
 	if got := rr.Body.String(); !strings.Contains(got, `"path":"/hello.txt"`) {
 		t.Fatalf("recursive list = %q, want /hello.txt entry", got)
+	}
+}
+
+func TestAcceptJSONRecursiveZeroListsOnlyCurrentDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "top.txt"), []byte("top"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "child.txt"), []byte("child"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	server, err := NewServer(ServerConfig{RootPaths: []string{dir}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/?recursive=0", nil)
+	req.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/x-ndjson" {
+		t.Fatalf("Content-Type = %q, want %q", got, "application/x-ndjson")
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"path":"/top.txt"`) {
+		t.Fatalf("non-recursive list = %q, want top-level file", body)
+	}
+	if !strings.Contains(body, `"path":"/sub"`) {
+		t.Fatalf("non-recursive list = %q, want top-level directory", body)
+	}
+	if strings.Contains(body, `"path":"/sub/child.txt"`) {
+		t.Fatalf("non-recursive list = %q, should not include nested file", body)
+	}
+}
+
+func TestServeBlake3ManifestFromSource(t *testing.T) {
+	dir := t.TempDir()
+	body := bytes.Repeat([]byte("a"), int(minManifestBlockSize)+123)
+	modTime := time.Unix(1700005000, 0)
+	filePath := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(filePath, body, 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chtimes(filePath, time.Now(), modTime); err != nil {
+		t.Fatalf("Chtimes() error = %v", err)
+	}
+
+	server, err := NewServer(ServerConfig{RootPaths: []string{dir}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/data.bin?manifest=blake3&block_size=65536", nil)
+	req.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/x-ndjson" {
+		t.Fatalf("Content-Type = %q, want %q", got, "application/x-ndjson")
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() {
+		t.Fatal("missing manifest header")
+	}
+	var header blake3ManifestFileRecord
+	if err := json.Unmarshal(scanner.Bytes(), &header); err != nil {
+		t.Fatalf("manifest header unmarshal error = %v", err)
+	}
+	if header.Type != "file" || header.Algo != "blake3" || header.Size != int64(len(body)) || header.BlockSize != minManifestBlockSize {
+		t.Fatalf("manifest header = %+v", header)
+	}
+
+	var blocks []blake3ManifestBlockRecord
+	for scanner.Scan() {
+		var block blake3ManifestBlockRecord
+		if err := json.Unmarshal(scanner.Bytes(), &block); err != nil {
+			t.Fatalf("manifest block unmarshal error = %v", err)
+		}
+		blocks = append(blocks, block)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanner error = %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("block count = %d, want 2", len(blocks))
+	}
+	if blocks[0].Offset != 0 || blocks[0].Size != minManifestBlockSize || blocks[0].Hash == "" {
+		t.Fatalf("first block = %+v", blocks[0])
+	}
+	if blocks[1].Offset != minManifestBlockSize || blocks[1].Size != 123 || blocks[1].Hash == "" {
+		t.Fatalf("second block = %+v", blocks[1])
+	}
+}
+
+func TestRecursiveQueryWithoutAcceptJSONStillServesHTMLDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "top.txt"), []byte("top"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	server, err := NewServer(ServerConfig{RootPaths: []string{dir}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/?recursive=0", nil)
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("Content-Type"); strings.Contains(got, "application/x-ndjson") {
+		t.Fatalf("Content-Type = %q, want HTML directory listing", got)
+	}
+	if got := rr.Body.String(); !strings.Contains(got, "Directory Listing") {
+		t.Fatalf("body = %q, want HTML directory listing", got)
 	}
 }
 

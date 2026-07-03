@@ -523,12 +523,12 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	var downloadURL string
 	var localFileExists bool
 	var localFileSize int64
-	fileMode := os.O_CREATE | os.O_WRONLY
-	resumeRequested := false
+	var localModTime time.Time
 
 	if stat, err := os.Stat(localFilePath); err == nil {
 		localFileExists = true
 		localFileSize = stat.Size()
+		localModTime = stat.ModTime()
 		c.logVerbose("Local file exists: %s, size: %d bytes", localFilePath, localFileSize)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("error checking local file %s: %w", localFilePath, err)
@@ -561,81 +561,74 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 
 		downloadURL = remoteURL.ResolveReference(parsedFileInfoURLPath).String()
 
-		if c.config.Resume && localFileExists && localFileSize < fileInfo.Size {
-			c.logVerbose("Resuming download for %s. Local size: %d, Server size: %d", localFilePath, localFileSize, fileInfo.Size)
-			fileMode |= os.O_APPEND
-			resumeRequested = true
-		} else if c.config.Resume && localFileExists && localFileSize >= fileInfo.Size {
-			c.logVerbose("File %s already appears complete (local size %d >= server size %d). Skipping download.", localFilePath, localFileSize, fileInfo.Size)
-			c.progressTracker.AddBytesDownloaded(localFileSize)
+		if c.config.Resume && localFileExists && localFileSize == fileInfo.Size && localModTime.Equal(fileInfo.ModTime) {
+			c.logVerbose("File %s already matches server size and modification time. Skipping download.", localFilePath)
+			c.progressTracker.AddBytesDownloaded(fileInfo.Size)
 			return nil
-		} else if localFileExists && !c.config.Overwrite {
+		}
+
+		if c.config.Resume && localFileExists {
+			if c.config.DryRun {
+				c.logInfo("Dry run: Would repair or re-download %s to %s", downloadURL, localFilePath)
+				return nil
+			}
+			repaired, err := c.repairFileWithBlake3(ctx, httpClient, downloadURL, localFilePath, fileInfo, localFileSize)
+			if err != nil {
+				return err
+			}
+			if repaired {
+				return nil
+			}
+			c.logInfo("BLAKE3 repair unavailable or inefficient for %s; re-downloading full file", localFilePath)
+			return c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo, true)
+		}
+
+		if localFileExists && !c.config.Overwrite {
 			c.logInfo("Skipping existing file (use -o to overwrite): %s", localFilePath)
 			c.progressTracker.AddBytesDownloaded(localFileSize)
 			return nil
 		} else if localFileExists && c.config.Overwrite {
 			c.logInfo("Overwriting existing file: %s", localFilePath)
-			fileMode |= os.O_TRUNC
 		} else if c.config.DryRun {
 			c.logInfo("Dry run: Would download %s to %s", downloadURL, localFilePath)
 			return nil
 		}
 	}
 
-	// Attach context to the request for HTTP client operation
+	return c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo, false)
+}
+
+func (c *Client) downloadFullFile(ctx context.Context, httpClient *http.Client, downloadURL, localFilePath string, fileInfo FileInfo, reportCompletion bool) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("error creating download request for %s: %w", downloadURL, err)
-	}
-
-	if resumeRequested {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", localFileSize))
-		c.logVerbose("Requesting bytes %d- for %s", localFileSize, downloadURL)
 	}
 
 	c.setAcceptEncodingForCompress(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		// Differentiate context cancellation from other errors
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err // Propagate context cancellation error
+			return err
 		}
 		c.logError("Error downloading %s: %v", downloadURL, err)
 		return fmt.Errorf("error downloading %s: %w", downloadURL, err)
 	}
 	defer resp.Body.Close()
 
-	responseBytesOffset := int64(0)
-	if resp.StatusCode == http.StatusPartialContent {
-		if !resumeRequested {
-			c.logInfo("Warning: Received 206 Partial Content for %s but not in resume mode or file already complete. Proceeding as full download.", downloadURL)
-		} else {
-			c.progressTracker.AddBytesDownloaded(localFileSize)
-		}
-		responseBytesOffset = localFileSize
-	} else if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned unexpected status %s for %s", resp.Status, downloadURL)
-	} else if resp.StatusCode == http.StatusOK && resumeRequested {
-		c.logInfo("Server does not support Range requests for %s (received 200 OK instead of 206). Restarting download.", downloadURL)
-		fileMode = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	}
 
 	if err := os.MkdirAll(filepath.Dir(localFilePath), 0755); err != nil {
 		return fmt.Errorf("error creating parent directories for %s: %w", localFilePath, err)
 	}
 
-	outFile, err := os.OpenFile(localFilePath, fileMode, 0644)
+	outFile, err := os.OpenFile(localFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("error opening/creating local file %s with mode %s: %v", localFilePath, getFileModeString(fileMode), err)
+		return fmt.Errorf("error opening/creating local file %s with mode %s: %v", localFilePath, getFileModeString(os.O_CREATE|os.O_WRONLY|os.O_TRUNC), err)
 	}
 	defer outFile.Close()
-
-	if resp.StatusCode == http.StatusPartialContent && resumeRequested {
-		if _, err := outFile.Seek(localFileSize, io.SeekStart); err != nil {
-			return fmt.Errorf("error seeking to end of file %s for resume: %w", localFilePath, err)
-		}
-	}
 
 	var bodyReader io.Reader = resp.Body
 	contentEncoding := resp.Header.Get("Content-Encoding")
@@ -664,8 +657,6 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	}
 
 	writerForCopy := io.Writer(outFile)
-	// ProgressWriter should wrap the actual file writer, not the decompression reader.
-	// The bytes will be counted *after* decompression.
 	if !c.config.Verbose { // ProgressWriter is only active if Verbose is false
 		writerForCopy = &ProgressWriter{
 			Writer:   outFile,
@@ -673,12 +664,9 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		}
 	}
 
-	// Use the potentially decompressed bodyReader
 	bytesCopiedSuccessfully, err := io.Copy(writerForCopy, bodyReader)
 
 	if err != nil && err != io.EOF {
-		// If the error is due to context cancellation, just return it.
-		// Otherwise, it's a genuine copy error.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
@@ -686,21 +674,17 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 		return fmt.Errorf("error during file copy for %s: %w", localFilePath, err)
 	}
 
-	// Note: resp.ContentLength will be the compressed size if compression was applied by server
-	// For zstd, resp.ContentLength will be the compressed size, but bytesCopiedSuccessfully will be decompressed.
-	// We should compare finalTotalBytesOnDisk with fileInfo.Size (original size).
-
-	finalTotalBytesOnDisk := bytesCopiedSuccessfully + responseBytesOffset
-
-	if finalTotalBytesOnDisk != fileInfo.Size {
-		// This check is crucial for integrity, comparing decompressed size with expected original size
+	if bytesCopiedSuccessfully != fileInfo.Size {
 		c.logError("CRITICAL WARNING: Final size of %s (%d bytes) does not match expected server size (%d bytes)! File is incomplete or corrupted",
-			localFilePath, finalTotalBytesOnDisk, fileInfo.Size)
+			localFilePath, bytesCopiedSuccessfully, fileInfo.Size)
 		return fmt.Errorf("CRITICAL WARNING: Final size of %s (%d bytes) does not match expected server size (%d bytes)! File is incomplete or corrupted",
-			localFilePath, finalTotalBytesOnDisk, fileInfo.Size)
+			localFilePath, bytesCopiedSuccessfully, fileInfo.Size)
+	}
+	if reportCompletion {
+		c.logInfo("Full download completed for %s: downloaded %s", localFilePath, formatBytes(bytesCopiedSuccessfully))
 	} else {
-		c.logInfo("Downloaded %s (%d bytes) to %s. Total size on disk: %d bytes (expected full: %d)",
-			filepath.Base(localFilePath), bytesCopiedSuccessfully, localFilePath, finalTotalBytesOnDisk, fileInfo.Size)
+		c.logVerbose("Downloaded %s (%d bytes) to %s. Total size on disk: %d bytes (expected full: %d)",
+			filepath.Base(localFilePath), bytesCopiedSuccessfully, localFilePath, bytesCopiedSuccessfully, fileInfo.Size)
 	}
 
 	if err := os.Chtimes(localFilePath, time.Now(), fileInfo.ModTime); err != nil {
@@ -708,6 +692,332 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	}
 
 	return nil
+}
+
+type blake3Manifest struct {
+	Path      string
+	Size      int64
+	ModTime   time.Time
+	BlockSize int64
+	Blocks    []blake3ManifestBlockRecord
+}
+
+var errBlake3ManifestUnsupported = errors.New("BLAKE3 manifest unsupported")
+
+func (c *Client) repairFileWithBlake3(ctx context.Context, httpClient *http.Client, downloadURL, localFilePath string, fileInfo FileInfo, localFileSize int64) (bool, error) {
+	manifest, err := c.fetchBlake3Manifest(ctx, httpClient, downloadURL)
+	if err != nil {
+		if errors.Is(err, errBlake3ManifestUnsupported) {
+			c.logInfo("Repair check unavailable for %s: server does not provide BLAKE3 manifest; falling back to full download", localFilePath)
+			return false, nil
+		}
+		return false, err
+	}
+	if manifest.Size != fileInfo.Size || !manifest.ModTime.Equal(fileInfo.ModTime) {
+		c.logVerbose("Using fresh manifest metadata for %s: size=%d, mod_time=%s", fileInfo.Path, manifest.Size, manifest.ModTime.Format(time.RFC3339Nano))
+		fileInfo.Size = manifest.Size
+		fileInfo.ModTime = manifest.ModTime
+	}
+
+	ranges, transferBytes, err := c.planBlake3Repair(localFilePath, localFileSize, manifest)
+	if err != nil {
+		return false, err
+	}
+	summary := repairSummary{
+		localSize:    localFileSize,
+		remoteSize:   manifest.Size,
+		rangeCount:   len(ranges),
+		transferSize: transferBytes,
+		truncateSize: positiveDelta(localFileSize, manifest.Size),
+	}
+	if shouldRedownloadInsteadOfRepair(manifest.Size, transferBytes, len(ranges)) {
+		c.logRepairPlan(localFilePath, summary, "full-download")
+		return false, nil
+	}
+
+	c.logRepairPlan(localFilePath, summary, "repair")
+
+	if len(ranges) == 0 {
+		if err := os.Truncate(localFilePath, manifest.Size); err != nil {
+			return false, fmt.Errorf("error truncating %s to %d bytes: %w", localFilePath, manifest.Size, err)
+		}
+		if err := os.Chtimes(localFilePath, time.Now(), manifest.ModTime); err != nil {
+			c.logInfo("Warning: Could not set modification time for %s: %v", localFilePath, err)
+		}
+		if manifest.Size > 0 {
+			c.progressTracker.AddBytesDownloaded(manifest.Size)
+		}
+		c.logInfo("Repair completed for %s: no range download, final size %s", localFilePath, formatBytes(manifest.Size))
+		return true, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(localFilePath), 0755); err != nil {
+		return false, fmt.Errorf("error creating parent directories for %s: %w", localFilePath, err)
+	}
+	outFile, err := os.OpenFile(localFilePath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return false, fmt.Errorf("error opening local file %s for repair: %w", localFilePath, err)
+	}
+	defer outFile.Close()
+
+	for _, repairRange := range ranges {
+		if err := c.downloadRange(ctx, httpClient, downloadURL, outFile, repairRange); err != nil {
+			if errors.Is(err, errRangeRepairUnsupported) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+
+	if err := outFile.Truncate(manifest.Size); err != nil {
+		return false, fmt.Errorf("error truncating %s to %d bytes after repair: %w", localFilePath, manifest.Size, err)
+	}
+	if err := os.Chtimes(localFilePath, time.Now(), manifest.ModTime); err != nil {
+		c.logInfo("Warning: Could not set modification time for %s: %v", localFilePath, err)
+	}
+	if retainedBytes := manifest.Size - transferBytes; retainedBytes > 0 {
+		c.progressTracker.AddBytesDownloaded(retainedBytes)
+	}
+	c.logInfo("Repair completed for %s: %d range request(s), downloaded %s, final size %s", localFilePath, len(ranges), formatBytes(transferBytes), formatBytes(manifest.Size))
+	return true, nil
+}
+
+type repairSummary struct {
+	localSize    int64
+	remoteSize   int64
+	rangeCount   int
+	transferSize int64
+	truncateSize int64
+}
+
+func (c *Client) logRepairPlan(localFilePath string, summary repairSummary, action string) {
+	retainedSize := summary.remoteSize - summary.transferSize
+	if retainedSize < 0 {
+		retainedSize = 0
+	}
+
+	switch action {
+	case "full-download":
+		c.logInfo("Repair check for %s: local=%s remote=%s, %d changed/missing range(s) totaling %s; full download selected",
+			localFilePath, formatBytes(summary.localSize), formatBytes(summary.remoteSize), summary.rangeCount, formatBytes(summary.transferSize))
+	default:
+		c.logInfo("Repair plan for %s: local=%s remote=%s, keep %s, download %s in %d range request(s), truncate %s",
+			localFilePath, formatBytes(summary.localSize), formatBytes(summary.remoteSize), formatBytes(retainedSize), formatBytes(summary.transferSize), summary.rangeCount, formatBytes(summary.truncateSize))
+	}
+}
+
+func positiveDelta(a, b int64) int64 {
+	if a > b {
+		return a - b
+	}
+	return 0
+}
+
+func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Client, downloadURL string) (*blake3Manifest, error) {
+	manifestURL, err := url.Parse(downloadURL)
+	if err != nil {
+		return nil, err
+	}
+	q := manifestURL.Query()
+	q.Set("manifest", blake3ManifestAlgo)
+	q.Set("block_size", fmt.Sprintf("%d", defaultManifestBlockSize))
+	manifestURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("error fetching BLAKE3 manifest for %s: %w", downloadURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errBlake3ManifestUnsupported
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var manifest blake3Manifest
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var typed struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(line, &typed); err != nil {
+			return nil, errBlake3ManifestUnsupported
+		}
+		switch typed.Type {
+		case "file":
+			var header blake3ManifestFileRecord
+			if err := json.Unmarshal(line, &header); err != nil {
+				return nil, err
+			}
+			if header.Algo != blake3ManifestAlgo {
+				return nil, errBlake3ManifestUnsupported
+			}
+			modTime, err := time.Parse(time.RFC3339Nano, header.ModTime)
+			if err != nil {
+				return nil, err
+			}
+			manifest.Path = header.Path
+			manifest.Size = header.Size
+			manifest.ModTime = modTime
+			manifest.BlockSize = normalizeManifestBlockSize(header.BlockSize)
+		case "block":
+			var block blake3ManifestBlockRecord
+			if err := json.Unmarshal(line, &block); err != nil {
+				return nil, err
+			}
+			manifest.Blocks = append(manifest.Blocks, block)
+		default:
+			return nil, errBlake3ManifestUnsupported
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if manifest.BlockSize <= 0 && manifest.Size > 0 {
+		return nil, errBlake3ManifestUnsupported
+	}
+	return &manifest, nil
+}
+
+type repairRange struct {
+	Offset int64
+	Size   int64
+}
+
+func (r repairRange) endInclusive() int64 {
+	return r.Offset + r.Size - 1
+}
+
+func (c *Client) planBlake3Repair(localFilePath string, localFileSize int64, manifest *blake3Manifest) ([]repairRange, int64, error) {
+	compareSize := localFileSize
+	if compareSize > manifest.Size {
+		compareSize = manifest.Size
+	}
+
+	localFile, err := os.Open(localFilePath)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer localFile.Close()
+
+	localBlocks, err := blake3BlockHashes(localFile, compareSize, manifest.BlockSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var ranges []repairRange
+	for _, remoteBlock := range manifest.Blocks {
+		needsDownload := remoteBlock.Offset+remoteBlock.Size > localFileSize
+		if !needsDownload {
+			if remoteBlock.Index >= len(localBlocks) {
+				needsDownload = true
+			} else {
+				localBlock := localBlocks[remoteBlock.Index]
+				needsDownload = localBlock.Size != remoteBlock.Size || localBlock.Hash != remoteBlock.Hash
+			}
+		}
+		if needsDownload {
+			ranges = append(ranges, repairRange{Offset: remoteBlock.Offset, Size: remoteBlock.Size})
+		}
+	}
+
+	ranges = mergeRepairRanges(ranges)
+	var transferBytes int64
+	for _, repairRange := range ranges {
+		transferBytes += repairRange.Size
+	}
+	return ranges, transferBytes, nil
+}
+
+func mergeRepairRanges(ranges []repairRange) []repairRange {
+	if len(ranges) < 2 {
+		return ranges
+	}
+	merged := ranges[:0]
+	for _, current := range ranges {
+		if len(merged) == 0 {
+			merged = append(merged, current)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if last.Offset+last.Size == current.Offset {
+			last.Size += current.Size
+			continue
+		}
+		merged = append(merged, current)
+	}
+	return merged
+}
+
+func shouldRedownloadInsteadOfRepair(remoteSize, transferBytes int64, rangeCount int) bool {
+	if remoteSize == 0 {
+		return false
+	}
+	if rangeCount > 128 {
+		return true
+	}
+	return transferBytes*2 > remoteSize
+}
+
+var errRangeRepairUnsupported = errors.New("range repair unsupported")
+
+func (c *Client) downloadRange(ctx context.Context, httpClient *http.Client, downloadURL string, outFile *os.File, repairRange repairRange) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", repairRange.Offset, repairRange.endInclusive()))
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return fmt.Errorf("error downloading range %d-%d from %s: %w", repairRange.Offset, repairRange.endInclusive(), downloadURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return errRangeRepairUnsupported
+	}
+
+	writer := io.Writer(&writeAtWriter{file: outFile, offset: repairRange.Offset})
+	if !c.config.Verbose {
+		writer = &ProgressWriter{
+			Writer:   writer,
+			Progress: c.progressTracker,
+		}
+	}
+	written, err := io.Copy(writer, resp.Body)
+	if err != nil {
+		return err
+	}
+	if written != repairRange.Size {
+		return fmt.Errorf("range repair wrote %d bytes for range %d-%d, want %d", written, repairRange.Offset, repairRange.endInclusive(), repairRange.Size)
+	}
+	return nil
+}
+
+type writeAtWriter struct {
+	file   *os.File
+	offset int64
+}
+
+func (w *writeAtWriter) Write(p []byte) (int, error) {
+	n, err := w.file.WriteAt(p, w.offset)
+	w.offset += int64(n)
+	return n, err
 }
 
 // Helper for logging file mode strings

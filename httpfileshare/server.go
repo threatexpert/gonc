@@ -256,7 +256,12 @@ func (s *Server) serveFilesFromSource(w http.ResponseWriter, r *http.Request) {
 	requestedPath := path.Clean(r.URL.Path)
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
-		s.serveRecursiveListFromSource(w, r)
+		if r.URL.Query().Get("manifest") == blake3ManifestAlgo {
+			s.serveBlake3ManifestFromSource(w, r, requestedPath)
+			return
+		}
+		recursive := r.URL.Query().Get("recursive") != "0"
+		s.serveNDJSONListFromSource(w, r, recursive)
 		return
 	}
 
@@ -454,8 +459,75 @@ func htmlEscape(s string) string {
 }
 
 func (s *Server) serveRecursiveListFromSource(w http.ResponseWriter, r *http.Request) {
+	s.serveNDJSONListFromSource(w, r, true)
+}
+
+func (s *Server) serveBlake3ManifestFromSource(w http.ResponseWriter, r *http.Request, requestedPath string) {
+	stat, err := s.source.Stat(requestedPath)
+	if err != nil {
+		s.serveSourceError(w, r, requestedPath, err)
+		return
+	}
+	if stat.IsDir() {
+		http.Error(w, "manifest is only available for files", http.StatusBadRequest)
+		return
+	}
+
+	blockSize := defaultManifestBlockSize
+	if rawBlockSize := r.URL.Query().Get("block_size"); rawBlockSize != "" {
+		parsedBlockSize, err := strconv.ParseInt(rawBlockSize, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid block_size", http.StatusBadRequest)
+			return
+		}
+		blockSize = normalizeManifestBlockSize(parsedBlockSize)
+	}
+
+	f, err := s.source.Open(requestedPath)
+	if err != nil {
+		s.serveSourceError(w, r, requestedPath, err)
+		return
+	}
+	defer f.Close()
+
+	blocks, err := blake3BlockHashes(f, stat.Size(), blockSize)
+	if err != nil {
+		s.logger.Printf("Error computing BLAKE3 manifest for %s: %v", requestedPath, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	encoder := json.NewEncoder(w)
+	header := blake3ManifestFileRecord{
+		Type:      "file",
+		Path:      requestedPath,
+		Size:      stat.Size(),
+		ModTime:   stat.ModTime().Format(time.RFC3339Nano),
+		Algo:      blake3ManifestAlgo,
+		BlockSize: blockSize,
+	}
+	if err := encoder.Encode(header); err != nil {
+		s.logger.Printf("Error encoding BLAKE3 manifest header for %s: %v", requestedPath, err)
+		return
+	}
+	for _, block := range blocks {
+		if err := encoder.Encode(block); err != nil {
+			s.logger.Printf("Error encoding BLAKE3 manifest block for %s: %v", requestedPath, err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) serveNDJSONListFromSource(w http.ResponseWriter, r *http.Request, recursive bool) {
 	requestedPath := path.Clean(r.URL.Path)
-	if _, err := s.source.Stat(requestedPath); err != nil {
+	stat, err := s.source.Stat(requestedPath)
+	if err != nil {
 		s.serveSourceError(w, r, requestedPath, err)
 		return
 	}
@@ -464,15 +536,11 @@ func (s *Server) serveRecursiveListFromSource(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Transfer-Encoding", "chunked")
 
 	encoder := json.NewEncoder(w)
-	err := s.source.Walk(requestedPath, func(sourcePath string, info fs.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			s.logger.Printf("Error walking path %s: %v", sourcePath, walkErr)
-			return nil
-		}
+
+	writeInfo := func(sourcePath string, info fs.FileInfo) error {
 		if info == nil {
 			return nil
 		}
-
 		fileInfo := FileInfo{
 			Name:    info.Name(),
 			IsDir:   info.IsDir(),
@@ -488,13 +556,55 @@ func (s *Server) serveRecursiveListFromSource(w http.ResponseWriter, r *http.Req
 			flusher.Flush()
 		}
 		return nil
+	}
+
+	if !recursive {
+		if !stat.IsDir() {
+			if err := writeInfo(requestedPath, stat); err != nil {
+				if strings.Contains(err.Error(), "client write error") {
+					s.logger.Printf("NDJSON list stopped due to client disconnect.")
+					return
+				}
+				s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
+			}
+			return
+		}
+
+		entries, err := s.source.ReadDir(requestedPath)
+		if err != nil {
+			s.serveSourceError(w, r, requestedPath, err)
+			return
+		}
+		for _, entry := range entries {
+			entryPath := path.Join(requestedPath, filepath.ToSlash(entry.Name()))
+			if !strings.HasPrefix(entryPath, "/") {
+				entryPath = "/" + entryPath
+			}
+			if err := writeInfo(entryPath, entry); err != nil {
+				if strings.Contains(err.Error(), "client write error") {
+					s.logger.Printf("NDJSON list stopped due to client disconnect.")
+					return
+				}
+				s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
+				return
+			}
+		}
+		return
+	}
+
+	err = s.source.Walk(requestedPath, func(sourcePath string, info fs.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			s.logger.Printf("Error walking path %s: %v", sourcePath, walkErr)
+			return nil
+		}
+		return writeInfo(sourcePath, info)
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "client write error") {
-			s.logger.Printf("Recursive list stopped due to client disconnect.")
+			s.logger.Printf("NDJSON list stopped due to client disconnect.")
 			return
 		}
-		s.logger.Printf("Recursive list failed for %s: %v", requestedPath, err)
+		s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
 	}
 }
 
