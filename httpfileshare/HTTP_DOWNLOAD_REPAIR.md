@@ -254,14 +254,20 @@ Set local file mtime to remoteModTime.
 The CLI client currently uses these thresholds only for `SparseRepair`:
 
 ```text
-dirty/missing range count > 128
+dirty range count > 128
   => Full re-download.
 
-dirty/missing total bytes > 50% of remoteSize
+dirty bytes inside the already-local prefix > 50% of remoteSize
   => Full re-download.
 ```
 
-`TailResume` and `TruncateOnly` bypass these thresholds.
+The missing tail is not counted toward the 50% threshold. This matters for a
+mixed case such as "a small dirty block near the beginning plus a large missing
+tail": the client should repair the dirty block and continue the tail instead
+of full re-downloading only because the missing tail is large.
+
+`TailResume`, `TruncateOnly`, and the tail portion of a mixed `SparseRepair`
+bypass these thresholds.
 
 GUI clients may reuse these thresholds or expose them as advanced settings.
 
@@ -296,6 +302,18 @@ Small in-place modification:
 ```text
 Only the affected block hash differs.
 => Download and overwrite that dirty block.
+```
+
+Small dirty prefix plus missing tail:
+
+```text
+Remote file is 500MB.
+Local partial file is 200MB.
+The first 8MB block was locally modified.
+Dirty bytes = 8MB.
+Missing tail = 300MB.
+=> Download the dirty 8MB block and continue the 300MB tail.
+=> Do not full re-download just because 8MB + 300MB exceeds 50%.
 ```
 
 Middle insertion/deletion causing offset shift:

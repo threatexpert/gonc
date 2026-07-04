@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -306,6 +307,77 @@ func TestDownloadFileBlake3RepairOverwritesDirtyBlock(t *testing.T) {
 	}
 	if got := rangeRequests.Load(); got != 1 {
 		t.Fatalf("rangeRequests = %d, want 1", got)
+	}
+}
+
+func TestDownloadFileBlake3RepairDirtyPrefixPlusMissingTailIgnoresTailForThreshold(t *testing.T) {
+	remoteModTime := time.Unix(1700004250, 0)
+	remoteBody := testBytes(24 * 1024 * 1024)
+	localBody := bytes.Clone(remoteBody[:16*1024*1024])
+	localBody[0] ^= 0xff
+
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "data.bin")
+	if err := os.WriteFile(filePath, remoteBody, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filePath, time.Now(), remoteModTime); err != nil {
+		t.Fatal(err)
+	}
+	fileServer, err := NewServer(ServerConfig{RootPaths: []string{tmpDir}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var rangeHeaders []string
+	var fullDownloads int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.URL.Query().Get("manifest") != blake3ManifestAlgo {
+			if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+				rangeHeaders = append(rangeHeaders, rangeHeader)
+			} else {
+				fullDownloads++
+			}
+		}
+		mu.Unlock()
+		fileServer.serveFilesFromSource(w, r)
+	}))
+	defer server.Close()
+
+	localDir := t.TempDir()
+	localPath := filepath.Join(localDir, "data.bin")
+	if err := os.WriteFile(localPath, localBody, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(localPath, time.Now(), remoteModTime.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := newTestClient(server.URL, localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileInfo := FileInfo{Name: "data.bin", Path: "/data.bin", Size: int64(len(remoteBody)), ModTime: remoteModTime}
+	client.progressTracker.AddTotalBytes(fileInfo.Size)
+
+	if err := client.downloadFile(context.Background(), server.Client(), fileInfo); err != nil {
+		t.Fatal(err)
+	}
+
+	assertFileBody(t, localPath, remoteBody)
+	mu.Lock()
+	defer mu.Unlock()
+	wantRanges := []string{
+		fmt.Sprintf("bytes=%d-%d", 0, 8*1024*1024-1),
+		fmt.Sprintf("bytes=%d-%d", 16*1024*1024, len(remoteBody)-1),
+	}
+	if !reflect.DeepEqual(rangeHeaders, wantRanges) {
+		t.Fatalf("range headers = %v, want %v", rangeHeaders, wantRanges)
+	}
+	if fullDownloads != 0 {
+		t.Fatalf("fullDownloads = %d, want 0", fullDownloads)
 	}
 }
 

@@ -747,14 +747,16 @@ func (c *Client) repairFileWithBlake3(ctx context.Context, httpClient *http.Clie
 		}
 	}
 	summary := repairSummary{
-		localSize:    localFileSize,
-		remoteSize:   manifest.Size,
-		kind:         plan.Kind,
-		rangeCount:   len(plan.Ranges),
-		transferSize: plan.TransferBytes,
-		truncateSize: positiveDelta(localFileSize, manifest.Size),
+		localSize:       localFileSize,
+		remoteSize:      manifest.Size,
+		kind:            plan.Kind,
+		rangeCount:      len(plan.Ranges),
+		transferSize:    plan.TransferBytes,
+		dirtyRangeCount: plan.DirtyRangeCount,
+		dirtySize:       plan.DirtyBytes,
+		truncateSize:    positiveDelta(localFileSize, manifest.Size),
 	}
-	if plan.Kind == repairPlanSparseRepair && shouldRedownloadInsteadOfRepair(manifest.Size, plan.TransferBytes, len(plan.Ranges)) {
+	if plan.Kind == repairPlanSparseRepair && shouldRedownloadInsteadOfRepair(manifest.Size, plan.DirtyBytes, plan.DirtyRangeCount) {
 		c.logRepairPlan(localFilePath, summary, "full-download")
 		return false, nil
 	}
@@ -821,18 +823,22 @@ const (
 )
 
 type blake3RepairPlan struct {
-	Kind          repairPlanKind
-	Ranges        []repairRange
-	TransferBytes int64
+	Kind            repairPlanKind
+	Ranges          []repairRange
+	TransferBytes   int64
+	DirtyBytes      int64
+	DirtyRangeCount int
 }
 
 type repairSummary struct {
-	localSize    int64
-	remoteSize   int64
-	kind         repairPlanKind
-	rangeCount   int
-	transferSize int64
-	truncateSize int64
+	localSize       int64
+	remoteSize      int64
+	kind            repairPlanKind
+	rangeCount      int
+	transferSize    int64
+	dirtyRangeCount int
+	dirtySize       int64
+	truncateSize    int64
 }
 
 func (c *Client) logRepairPlan(localFilePath string, summary repairSummary, action string) {
@@ -843,11 +849,11 @@ func (c *Client) logRepairPlan(localFilePath string, summary repairSummary, acti
 
 	switch action {
 	case "full-download":
-		c.logRepair("Repair check for %s: kind=%s local=%s remote=%s, %d changed/missing range(s) totaling %s; full download selected",
-			localFilePath, summary.kind, formatBytes(summary.localSize), formatBytes(summary.remoteSize), summary.rangeCount, formatBytes(summary.transferSize))
+		c.logRepair("Repair check for %s: kind=%s local=%s remote=%s, %d dirty range(s) totaling %s, download %s in %d range request(s); full download selected",
+			localFilePath, summary.kind, formatBytes(summary.localSize), formatBytes(summary.remoteSize), summary.dirtyRangeCount, formatBytes(summary.dirtySize), formatBytes(summary.transferSize), summary.rangeCount)
 	default:
-		c.logRepair("Repair plan for %s: kind=%s local=%s remote=%s, keep %s, download %s in %d range request(s), truncate %s",
-			localFilePath, summary.kind, formatBytes(summary.localSize), formatBytes(summary.remoteSize), formatBytes(retainedSize), formatBytes(summary.transferSize), summary.rangeCount, formatBytes(summary.truncateSize))
+		c.logRepair("Repair plan for %s: kind=%s local=%s remote=%s, keep %s, download %s in %d range request(s), dirty %s in %d range(s), truncate %s",
+			localFilePath, summary.kind, formatBytes(summary.localSize), formatBytes(summary.remoteSize), formatBytes(retainedSize), formatBytes(summary.transferSize), summary.rangeCount, formatBytes(summary.dirtySize), summary.dirtyRangeCount, formatBytes(summary.truncateSize))
 	}
 }
 
@@ -978,6 +984,7 @@ func (c *Client) planBlake3Repair(localFilePath string, localFileSize int64, man
 	}
 
 	var ranges []repairRange
+	var dirtyRanges []repairRange
 	prefixEnd := (localFileSize / manifest.BlockSize) * manifest.BlockSize
 	if prefixEnd > manifest.Size {
 		prefixEnd = manifest.Size
@@ -994,7 +1001,11 @@ func (c *Client) planBlake3Repair(localFilePath string, localFileSize int64, man
 			}
 		}
 		if needsDownload {
-			ranges = append(ranges, repairRange{Offset: remoteBlock.Offset, Size: remoteBlock.Size})
+			repairRange := repairRange{Offset: remoteBlock.Offset, Size: remoteBlock.Size}
+			ranges = append(ranges, repairRange)
+			if remoteBlock.Offset < prefixEnd {
+				dirtyRanges = append(dirtyRanges, repairRange)
+			}
 		}
 		if remoteBlock.Offset+remoteBlock.Size <= prefixEnd && needsDownload {
 			prefixMatches = false
@@ -1002,6 +1013,7 @@ func (c *Client) planBlake3Repair(localFilePath string, localFileSize int64, man
 	}
 
 	ranges = mergeRepairRanges(ranges)
+	dirtyRanges = mergeRepairRanges(dirtyRanges)
 
 	if localFileSize < manifest.Size && prefixMatches {
 		ranges = []repairRange{{Offset: prefixEnd, Size: manifest.Size - prefixEnd}}
@@ -1018,9 +1030,11 @@ func (c *Client) planBlake3Repair(localFilePath string, localFileSize int64, man
 	}
 
 	return blake3RepairPlan{
-		Kind:          kind,
-		Ranges:        ranges,
-		TransferBytes: repairRangesSize(ranges),
+		Kind:            kind,
+		Ranges:          ranges,
+		TransferBytes:   repairRangesSize(ranges),
+		DirtyBytes:      repairRangesSize(dirtyRanges),
+		DirtyRangeCount: len(dirtyRanges),
 	}, nil
 }
 
