@@ -23,7 +23,7 @@ var (
 		"tcp://turn.cloudflare.com:80",
 		"udp://turn.cloudflare.com:53?3478",
 		"udp://stun.l.google.com:19302",
-		"udp://stun.miwifi.com:3478",
+		"stun.gonc.cc:3478",
 		"global.turn.twilio.com:3478",
 		"stun.nextcloud.com:443",
 	}
@@ -317,7 +317,8 @@ type STUNResult struct {
 	Local   string // Local IP address and port used for the STUN request
 	Nat     string // NAT IP address and port returned by the STUN server
 	Remote  string // Stun Server address used
-	Err     error  // Error, if any, encountered during the STUN request
+	Elapsed time.Duration
+	Err     error // Error, if any, encountered during the STUN request
 }
 
 // validateNatIP checks that the NAT IP returned by a STUN server is valid:
@@ -407,6 +408,15 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 		return network, addr, err
 	}
 
+	resultNetwork := "udp4"
+	if netProto == "tcp" {
+		resultNetwork = "tcp4"
+	}
+	if isIPv6 {
+		resultNetwork = strings.TrimSuffix(resultNetwork, "4") + "6"
+	}
+	pendingResults := make(map[int]struct{})
+
 	for i, rawAddr := range STUNServers {
 		scheme := ""
 		addr := rawAddr
@@ -425,9 +435,15 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			continue
 		}
 
+		pendingResults[i] = struct{}{}
 		wg.Add(1)
 		go func(index int, stunAddr string) {
 			defer wg.Done()
+			startedAt := time.Now()
+			sendResult := func(result STUNResult) {
+				result.Elapsed = time.Since(startedAt).Truncate(time.Millisecond)
+				resultsChan <- result
+			}
 
 			// Check if context is already canceled to avoid unnecessary dialing
 			if ctx.Err() != nil {
@@ -439,7 +455,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			useNetwork, laddr, err := resolveAddr(netProto)
 			if err != nil {
 				//logSTUN("stun resolve local addr: %s://%s err: %v\n", useNetwork, stunAddr, err)
-				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("resolveAddr failed: %v", err)}
+				sendResult(STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("resolveAddr failed: %v", err)})
 				return
 			}
 			var conn net.Conn
@@ -460,7 +476,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			}
 
 			if err != nil {
-				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN dial failed: %v", err)}
+				sendResult(STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN dial failed: %v", err)})
 				return
 			}
 			defer conn.Close() // Ensure connection is closed when the goroutine finishes
@@ -472,7 +488,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 
 			client, err := stun.NewClient(conn, stun.WithRTO(120*time.Millisecond))
 			if err != nil {
-				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN NewClient failed: %v", err)}
+				sendResult(STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN NewClient failed: %v", err)})
 				return
 			}
 			defer client.Close() // Ensure client is closed when the goroutine finishes
@@ -498,29 +514,29 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 			})
 
 			if err != nil {
-				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN Do failed: %v", err)}
+				sendResult(STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN Do failed: %v", err)})
 				return
 			}
 			if callErr != nil {
-				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN response error: %v", callErr)}
+				sendResult(STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN response error: %v", callErr)})
 				return
 			}
 
 			// Validate the returned NAT IP: reject private IPs and IPs matching the STUN server itself
 			if err := validateNatIP(xorAddr.IP, conn.RemoteAddr()); err != nil {
-				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN result invalid from %s: %v", stunAddr, err)}
+				sendResult(STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN result invalid from %s: %v", stunAddr, err)})
 				return
 			}
 
 			// Send the successful result to the channel
-			resultsChan <- STUNResult{
+			sendResult(STUNResult{
 				Index:   index,
 				Network: useNetwork,
 				Local:   conn.LocalAddr().String(),
 				Nat:     xorAddr.String(),
 				Remote:  conn.RemoteAddr().String(),
 				Err:     nil,
-			}
+			})
 
 		}(i, addr)
 
@@ -543,6 +559,14 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 		select {
 		case <-ctx.Done():
 			// Timeout or cancelled. Process collected results and exit.
+			for index := range pendingResults {
+				collectedResults = append(collectedResults, &STUNResult{
+					Index:   index,
+					Network: resultNetwork,
+					Elapsed: timeout.Truncate(time.Millisecond),
+					Err:     ctx.Err(),
+				})
+			}
 			// Drain the channel to ensure all goroutines can finish (and their defers run).
 			go func() {
 				for range resultsChan {
@@ -561,6 +585,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 				// Return the collected unique results.
 				return collectedResults, nil
 			}
+			delete(pendingResults, r.Index)
 
 			if r.Err == nil {
 				// Successfully got a STUN result.
@@ -581,6 +606,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 						Local:   r.Local,
 						Nat:     r.Nat,
 						Remote:  r.Remote,
+						Elapsed: r.Elapsed,
 						Err:     nil, // No error for successful results
 					})
 				}
@@ -594,6 +620,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 						Local:   r.Local,
 						Nat:     r.Nat, // Might be empty or partial if error occurred early
 						Remote:  r.Remote,
+						Elapsed: r.Elapsed,
 						Err:     r.Err,
 					})
 				}

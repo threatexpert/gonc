@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/threatexpert/gonc/v2/misc"
 )
 
 type mqttSignalRecvPayload struct {
@@ -25,19 +27,24 @@ type mqttSignalWaiter struct {
 	errCh       chan error
 }
 
+type mqttSignalClient struct {
+	client mqtt.Client
+	index  int
+}
+
 // MQTTSignalSession keeps broker connections alive across multiple signaling
 // exchanges in the same P2P attempt.
 type MQTTSignalSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	brokers   []string
-	clientID  string
-	localIP   string
-	logWriter io.Writer
+	brokers  []string
+	clientID string
+	localIP  string
+	logger   *log.Logger
 
 	mu            sync.Mutex
-	clients       []mqtt.Client
+	clients       []mqttSignalClient
 	allClients    []mqtt.Client
 	subscriptions map[string]byte
 	waiters       map[string]map[*mqttSignalWaiter]struct{}
@@ -56,6 +63,10 @@ func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID,
 		clientID = MQTT_GenerateClientID("SG", "mqtt-signal-session", 0)
 	}
 
+	if logWriter == nil {
+		logWriter = io.Discard
+	}
+
 	sctx, cancel := context.WithCancel(ctx)
 	s := &MQTTSignalSession{
 		ctx:           sctx,
@@ -63,7 +74,7 @@ func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID,
 		brokers:       append([]string(nil), brokerServers...),
 		clientID:      clientID,
 		localIP:       localIP,
-		logWriter:     logWriter,
+		logger:        misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix),
 		subscriptions: make(map[string]byte),
 		waiters:       make(map[string]map[*mqttSignalWaiter]struct{}),
 	}
@@ -179,8 +190,10 @@ func (s *MQTTSignalSession) connectBroker(brokerAddr string, qvals url.Values, i
 		client.Disconnect(250)
 		return
 	}
-	s.clients = append(s.clients, client)
+	s.clients = append(s.clients, mqttSignalClient{client: client, index: index})
 	s.mu.Unlock()
+
+	s.logger.Printf("broker connected: %s (%d/%d)\n", brokerAddr, index+1, len(s.brokers))
 
 	select {
 	case ready <- struct{}{}:
@@ -205,10 +218,10 @@ func (s *MQTTSignalSession) Close() {
 	time.Sleep(500 * time.Millisecond)
 }
 
-func (s *MQTTSignalSession) clientsSnapshot() []mqtt.Client {
+func (s *MQTTSignalSession) clientsSnapshot() []mqttSignalClient {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]mqtt.Client, len(s.clients))
+	out := make([]mqttSignalClient, len(s.clients))
 	copy(out, s.clients)
 	return out
 }
@@ -237,13 +250,13 @@ func (s *MQTTSignalSession) subscribe(topic string, qos byte) error {
 		return nil
 	}
 	s.subscriptions[topic] = qos
-	clients := make([]mqtt.Client, len(s.clients))
+	clients := make([]mqttSignalClient, len(s.clients))
 	copy(clients, s.clients)
 	s.mu.Unlock()
 
 	success := 0
-	for index, client := range clients {
-		if s.subscribeClient(client, index, topic, qos) {
+	for _, client := range clients {
+		if s.subscribeClient(client.client, client.index, topic, qos) {
 			success++
 		}
 	}
@@ -316,21 +329,50 @@ func (s *MQTTSignalSession) dispatchMessage(topic string, index int, data string
 	}
 }
 
+func publishAtLeastN(clients []mqttSignalClient, topic string, qos byte, payload string, minSuccess int) int {
+	if len(clients) == 0 {
+		return 0
+	}
+	if minSuccess <= 0 || minSuccess > len(clients) {
+		minSuccess = len(clients)
+	}
+
+	var wg sync.WaitGroup
+	successCh := make(chan struct{}, len(clients))
+
+	for _, c := range clients {
+		wg.Add(1)
+		go func(client mqtt.Client) {
+			defer wg.Done()
+			token := client.Publish(topic, qos, false, payload)
+			if token.Wait() && token.Error() == nil {
+				successCh <- struct{}{}
+			}
+		}(c.client)
+	}
+
+	go func() {
+		wg.Wait()
+		close(successCh)
+	}()
+
+	count := 0
+	for range successCh {
+		count++
+		if count >= minSuccess {
+			break
+		}
+	}
+	return count
+}
+
 func (s *MQTTSignalSession) publish(topic string, qos byte, payload string, minSuccess int) int {
 	return publishAtLeastN(s.clientsSnapshot(), topic, qos, payload, minSuccess)
 }
 
-func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), cfg mqttExchangeConfig) (recvData string, recvIndex int, keepAlive bool, err error) {
+func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, keepAlive bool, err error) {
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
-	startedAt := time.Now()
-
-	logTiming := func(format string, args ...any) {
-		if cfg.logWriter == nil || cfg.phase == "" {
-			return
-		}
-		fmt.Fprintf(cfg.logWriter, "[MQTT] "+cfg.phase+": "+format+"\n", args...)
-	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -340,8 +382,6 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 			return "", -1, false, err
 		}
 	}
-	readyAt := time.Now()
-
 	stopPublish := make(chan struct{})
 	var stopPublishOnce sync.Once
 	stopPublisher := func() {
@@ -415,30 +455,15 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 	switch exmode {
 	case EXMODE_waitOnly, EXMODE_reply:
 	case exmodePublishOnly:
-		publishStart := time.Now()
 		success := s.publish(topic, qos, sendData, 1)
 		if success == 0 {
 			return "", -1, false, fmt.Errorf("failed to publish MQTT reply")
 		}
 		startBackgroundPublisher()
 		stopPublisherAfter(5 * time.Second)
-		logTiming("reply published; ready=%s publish=%s total=%s brokers=%d/%d",
-			readyAt.Sub(startedAt).Truncate(time.Millisecond),
-			time.Since(publishStart).Truncate(time.Millisecond),
-			time.Since(startedAt).Truncate(time.Millisecond),
-			success,
-			len(s.brokers),
-		)
 		return "", 0, true, nil
 	default:
-		publishStart := time.Now()
-		success := s.publish(topic, qos, sendData, 1)
-		logTiming("initial publish; ready=%s publish=%s brokers=%d/%d",
-			readyAt.Sub(startedAt).Truncate(time.Millisecond),
-			time.Since(publishStart).Truncate(time.Millisecond),
-			success,
-			len(s.brokers),
-		)
+		s.publish(topic, qos, sendData, 1)
 		startBackgroundPublisher()
 	}
 
@@ -451,14 +476,6 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 		} else {
 			stopPublisher()
 		}
-		logTiming("received; ready=%s wait=%s total=%s broker=%d brokers=%d/%d",
-			readyAt.Sub(startedAt).Truncate(time.Millisecond),
-			time.Since(readyAt).Truncate(time.Millisecond),
-			time.Since(startedAt).Truncate(time.Millisecond),
-			r.index,
-			len(s.clientsSnapshot()),
-			len(s.brokers),
-		)
 		return r.data, r.index, keepAlive, nil
 	case err := <-waiter.errCh:
 		stopPublisher()

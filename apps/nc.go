@@ -35,7 +35,7 @@ import (
 )
 
 var (
-	VERSION = "v2.5.10"
+	VERSION = "v2.6.0"
 )
 
 type AppNetcatConfig struct {
@@ -1533,13 +1533,15 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 	ncconfig.Logger.Printf("STUN Results (Local -> NAT -> STUNServer)\n")
 	ncconfig.Logger.Printf("-----------\n")
 
+	stunStart := time.Now()
 	Addresses, allSTUNResults, err := easyp2p.DetectNATAddressInfo(networksToTryStun, ncconfig.localbind, nil, io.Discard)
+	stunElapsed := time.Since(stunStart).Truncate(time.Millisecond)
 	if len(allSTUNResults) > 0 && len(Addresses) > 0 {
 		for _, r := range allSTUNResults {
 			srv := strings.TrimPrefix(easyp2p.STUNServers[r.Index], "udp://")
 			srv = strings.TrimPrefix(srv, "tcp://")
 			if r.Err != nil {
-				ncconfig.Logger.Printf("%s://%s\t(failed)\n", r.Network, srv)
+				ncconfig.Logger.Printf("%s://%s\t(failed, elapsed %s)\n", r.Network, srv, r.Elapsed)
 			}
 		}
 
@@ -1549,13 +1551,13 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 			srv = strings.TrimPrefix(srv, "tcp://")
 			if r.Err == nil {
 				succeeded += 1
-				ncconfig.Logger.Printf("%s://%s\n", r.Network, srv)
+				ncconfig.Logger.Printf("%s://%s\t(elapsed %s)\n", r.Network, srv, r.Elapsed)
 				ncconfig.Logger.Printf("    %s -> %s -> %s\n", r.Local, r.Nat, r.Remote)
 			}
 		}
 
 		ncconfig.Logger.Printf("\n")
-		ncconfig.Logger.Printf("NAT Summary (%d STUN servers, %d answers)\n", len(easyp2p.STUNServers), succeeded)
+		ncconfig.Logger.Printf("NAT Summary (%d STUN servers, %d answers, elapsed %s)\n", len(easyp2p.STUNServers), succeeded, stunElapsed)
 		ncconfig.Logger.Printf("-----------\n")
 
 		for _, info := range Addresses {
@@ -1572,7 +1574,11 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 		return 0
 	} else {
-		ncconfig.Logger.Printf("failed: %v\n", err)
+		if err != nil {
+			ncconfig.Logger.Printf("failed after %s: %v\n", stunElapsed, err)
+		} else {
+			ncconfig.Logger.Printf("failed after %s\n", stunElapsed)
+		}
 	}
 
 	return 1
