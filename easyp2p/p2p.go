@@ -63,6 +63,7 @@ const (
 // P2PSessionContext 描述一次打洞会话的全局上下文（所有候选共享）
 type P2PSessionContext struct {
 	SharedKey             [32]byte
+	MQTTSignal            *MQTTSignalSession
 	LocalBindIP           string
 	LocalPublicIPv4Count  int // 本端公网IPv4出口数量，用于调整打洞策略
 	LocalPublicIPv6Count  int
@@ -191,7 +192,14 @@ func deriveKey(salt, uid string) [32]byte {
 	return sha256.Sum256(h.Sum(nil))
 }
 
-func publishAtLeastN(clients []mqtt.Client, topic string, qos byte, payload string, minSuccess int) {
+func publishAtLeastN(clients []mqtt.Client, topic string, qos byte, payload string, minSuccess int) int {
+	if len(clients) == 0 {
+		return 0
+	}
+	if minSuccess <= 0 || minSuccess > len(clients) {
+		minSuccess = len(clients)
+	}
+
 	var wg sync.WaitGroup
 	successCh := make(chan struct{}, len(clients))
 
@@ -219,13 +227,40 @@ func publishAtLeastN(clients []mqtt.Client, topic string, qos byte, payload stri
 			break
 		}
 	}
+	return count
 }
 
 var (
 	EXMODE_mutual   int = 0
 	EXMODE_waitOnly int = 1
 	EXMODE_reply    int = 2
+
+	exmodePublishOnly int = 3
 )
+
+type mqttExchangeConfig struct {
+	logWriter io.Writer
+	phase     string
+}
+
+type mqttExchangeConfigKey struct{}
+
+func withMQTTExchangeLog(ctx context.Context, logWriter io.Writer, phase string) context.Context {
+	if logWriter == nil || phase == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, mqttExchangeConfigKey{}, mqttExchangeConfig{
+		logWriter: logWriter,
+		phase:     phase,
+	})
+}
+
+func mqttExchangeConfigFromContext(ctx context.Context) mqttExchangeConfig {
+	if cfg, ok := ctx.Value(mqttExchangeConfigKey{}).(mqttExchangeConfig); ok {
+		return cfg
+	}
+	return mqttExchangeConfig{}
+}
 
 func MQTT_SecureExchange[T any](ctx context.Context, exmode int, sendData any, topicCID, topicSalt, sessionUid, localIP string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
 	var zero T
@@ -271,6 +306,79 @@ func MQTT_SecureExchange[T any](ctx context.Context, exmode int, sendData any, t
 	return remotePayload, srvIndex, err
 }
 
+func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSignalSession, exmode int, sendData any, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
+	var zero T
+	if signal == nil {
+		return zero, -1, fmt.Errorf("nil MQTT signal session")
+	}
+
+	myKey := deriveKey("mqtt-exchange-gonc-v2.2.0", sessionUid)
+	infoBytes, _ := json.Marshal(sendData)
+	encPayload, _ := encryptAES(myKey[:], infoBytes)
+	encPayloadBytes, _ := json.Marshal(encPayload)
+
+	decoder := func(data string) (T, error) {
+		var zero T
+		var remoteSecurePayload securePayload
+		verIncomp := "possible version incompatibility with the peer"
+		if err = json.Unmarshal([]byte(data), &remoteSecurePayload); err != nil {
+			return zero, fmt.Errorf("failed to unmarshal remote secure payload: %w (%s)", err, verIncomp)
+		}
+		plain, err := decryptAES(myKey[:], &remoteSecurePayload)
+		if err != nil {
+			return zero, fmt.Errorf("failed to decrypt remote payload: %w (%s)", err, verIncomp)
+		}
+		var remotePayload T
+		if err = json.Unmarshal(plain, &remotePayload); err != nil {
+			return zero, fmt.Errorf("failed to unmarshal remote exchange payload: %w (%s)", err, verIncomp)
+		}
+		return remotePayload, nil
+	}
+
+	msgHandler := func(data string) (bool, error) {
+		decodedData, err := decoder(data)
+		if err != nil {
+			return false, err
+		}
+		if messageFilter != nil {
+			return messageFilter(decodedData)
+		}
+		return true, nil
+	}
+
+	cfg := mqttExchangeConfigFromContext(ctx)
+	remoteInfoRaw, srvIndex, _, err := signal.exchange(ctx, exmode, string(encPayloadBytes), topicCID, topicSalt, sessionUid, timeout, msgHandler, cfg)
+	if err != nil {
+		return zero, srvIndex, err
+	}
+	remotePayload, err := decoder(remoteInfoRaw)
+	return remotePayload, srvIndex, err
+}
+
+func mqttSecurePublish(ctx context.Context, sendData any, topicCID, topicSalt, sessionUid, localIP string, timeout time.Duration) (int, error) {
+	myKey := deriveKey("mqtt-exchange-gonc-v2.2.0", sessionUid)
+	infoBytes, _ := json.Marshal(sendData)
+	encPayload, _ := encryptAES(myKey[:], infoBytes)
+	encPayloadBytes, _ := json.Marshal(encPayload)
+
+	_, srvIndex, err := MQTT_Exchange(ctx, exmodePublishOnly, string(encPayloadBytes), topicCID, topicSalt, sessionUid, localIP, timeout, nil)
+	return srvIndex, err
+}
+
+func mqttSecurePublishWithSession(ctx context.Context, signal *MQTTSignalSession, sendData any, topicCID, topicSalt, sessionUid string, timeout time.Duration) (int, error) {
+	if signal == nil {
+		return -1, fmt.Errorf("nil MQTT signal session")
+	}
+	myKey := deriveKey("mqtt-exchange-gonc-v2.2.0", sessionUid)
+	infoBytes, _ := json.Marshal(sendData)
+	encPayload, _ := encryptAES(myKey[:], infoBytes)
+	encPayloadBytes, _ := json.Marshal(encPayload)
+
+	cfg := mqttExchangeConfigFromContext(ctx)
+	_, srvIndex, _, err := signal.exchange(ctx, exmodePublishOnly, string(encPayloadBytes), topicCID, topicSalt, sessionUid, timeout, nil, cfg)
+	return srvIndex, err
+}
+
 func topicFromSaltAndSessionUid(topicSalt, sessionUid string) string {
 	return TopicExchange + deriveKeyForTopic(topicSalt, sessionUid)
 }
@@ -288,12 +396,43 @@ func MQTT_GenerateClientID(topicDesc, sessionUid string, seed int64) string {
 }
 
 func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid, localIP string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, err error) {
+	cfg := mqttExchangeConfigFromContext(ctx)
+	signal, err := NewMQTTSignalSession(ctx, topicCID, localIP, cfg.logWriter)
+	if err != nil {
+		return "", -1, err
+	}
+	recvData, recvIndex, keepAlive, err := signal.exchange(ctx, exmode, sendData, topicCID, topicSalt, sessionUid, timeout, messageHandler, cfg)
+	if err != nil {
+		signal.Close()
+		return "", recvIndex, err
+	}
+	if keepAlive {
+		go func() {
+			time.Sleep(5 * time.Second)
+			signal.Close()
+		}()
+	} else {
+		signal.Close()
+	}
+	return recvData, recvIndex, nil
+}
+
+func mqttExchangeLegacy(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid, localIP string, timeout time.Duration, messageHandler func(string) (bool, error)) (recvData string, recvIndex int, err error) {
 	brokerServers := MQTTBrokerServers
 	if len(brokerServers) == 0 {
 		return "", -1, fmt.Errorf("no MQTT broker servers configured")
 	}
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
+	cfg := mqttExchangeConfigFromContext(ctx)
+	startedAt := time.Now()
+
+	logTiming := func(format string, args ...any) {
+		if cfg.logWriter == nil || cfg.phase == "" {
+			return
+		}
+		fmt.Fprintf(cfg.logWriter, "[MQTT] "+cfg.phase+": "+format+"\n", args...)
+	}
 
 	type recvPayload struct {
 		data  string
@@ -305,6 +444,18 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 	var clientsMu sync.Mutex
 	recvRemoteData := make(chan recvPayload, 1)
 	errChan := make(chan error, 1)
+
+	clientsSnapshot := func() []mqtt.Client {
+		clientsMu.Lock()
+		defer clientsMu.Unlock()
+		out := make([]mqtt.Client, len(clients))
+		copy(out, clients)
+		return out
+	}
+
+	publishSnapshot := func(minSuccess int) int {
+		return publishAtLeastN(clientsSnapshot(), topic, qos, sendData, minSuccess)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 
@@ -503,21 +654,34 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 	case <-successOrAllFail:
 	case <-ctx.Done():
 	}
+	connectedAt := time.Now()
 
-	if len(clients) == 0 {
+	if len(clientsSnapshot()) == 0 {
 		return "", -1, fmt.Errorf("failed to connect to any MQTT broker")
 	}
 
 	stopPublish := make(chan struct{})
-
-	switch exmode {
-	case EXMODE_waitOnly, EXMODE_reply:
-		//不主动发布消息
-	default:
-		// 广播数据
-		publishAtLeastN(clients, topic, qos, sendData, 2)
-		// 定时重发 goroutine
+	startBackgroundPublisher := func() {
 		go func() {
+			burstDelays := []time.Duration{
+				200 * time.Millisecond,
+				800 * time.Millisecond,
+				2 * time.Second,
+			}
+			for _, delay := range burstDelays {
+				timer := time.NewTimer(delay)
+				select {
+				case <-stopPublish:
+					timer.Stop()
+					return
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+					publishSnapshot(1)
+				}
+			}
+
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -527,10 +691,49 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					publishAtLeastN(clients, topic, qos, sendData, 2)
+					publishSnapshot(1)
 				}
 			}
 		}()
+	}
+
+	switch exmode {
+	case EXMODE_waitOnly, EXMODE_reply:
+		//不主动发布消息
+	case exmodePublishOnly:
+		publishStart := time.Now()
+		success := publishSnapshot(1)
+		if success == 0 {
+			return "", -1, fmt.Errorf("failed to publish MQTT reply")
+		}
+		backgroundCleanup = true
+		startBackgroundPublisher()
+		go func() {
+			defer cancel()
+			defer cleanupClients()
+			defer close(stopPublish)
+			time.Sleep(5 * time.Second)
+		}()
+		logTiming("reply published; connect=%s publish=%s total=%s brokers=%d/%d",
+			connectedAt.Sub(startedAt).Truncate(time.Millisecond),
+			time.Since(publishStart).Truncate(time.Millisecond),
+			time.Since(startedAt).Truncate(time.Millisecond),
+			success,
+			len(brokerServers),
+		)
+		return "", 0, nil
+	default:
+		// 广播数据
+		publishStart := time.Now()
+		success := publishSnapshot(1)
+		logTiming("initial publish; connect=%s publish=%s brokers=%d/%d",
+			connectedAt.Sub(startedAt).Truncate(time.Millisecond),
+			time.Since(publishStart).Truncate(time.Millisecond),
+			success,
+			len(brokerServers),
+		)
+		// 定时重发 goroutine
+		startBackgroundPublisher()
 
 	}
 
@@ -543,7 +746,7 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 	select {
 	case r := <-recvRemoteData:
 		if exmode != EXMODE_waitOnly {
-			publishAtLeastN(clients, topic, qos, sendData, 2)
+			publishSnapshot(1)
 			// 后台继续发布几秒，确保对方收到，然后再清理连接
 			backgroundCleanup = true
 			go func() {
@@ -554,6 +757,14 @@ func MQTT_Exchange(ctx context.Context, exmode int, sendData, topicCID, topicSal
 				time.Sleep(5 * time.Second)
 			}()
 		}
+		logTiming("received; connect=%s wait=%s total=%s broker=%d brokers=%d/%d",
+			connectedAt.Sub(startedAt).Truncate(time.Millisecond),
+			time.Since(connectedAt).Truncate(time.Millisecond),
+			time.Since(startedAt).Truncate(time.Millisecond),
+			r.index,
+			len(clientsSnapshot()),
+			len(brokerServers),
+		)
 		return r.data, r.index, nil
 	case err := <-errChan:
 		return "", -1, err
@@ -658,10 +869,10 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 }
 
 func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, *P2PSessionContext, error) {
-	return Do_autoP2PEx2(context.Background(), networks, "", sessionUid, timeout, needSharedKey, relayConn, logWriter)
+	return Do_autoP2PEx2(context.Background(), networks, "", sessionUid, timeout, needSharedKey, relayConn, logWriter, nil)
 }
 
-func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer) ([]*P2PAddressInfo, *P2PSessionContext, error) {
+func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession) ([]*P2PAddressInfo, *P2PSessionContext, error) {
 
 	myInfoForExchange := exchangeAddressPayload{
 		Addresses: []PunchingAddressInfo{},
@@ -670,6 +881,13 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 	localBindIP := ""
 	if bind != "" {
 		localBindIP, _, _ = net.SplitHostPort(bind)
+	}
+	if signal == nil {
+		signal, err = NewMQTTSignalSession(ctx, MQTT_GenerateClientID(TopicDesc_ExchangeAddress, sessionUid, 0), localBindIP, logWriter)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer signal.Close()
 	}
 
 	myInfoForExchange.Addresses, _, _ = DetectNATAddressInfo(networks, bind, relayConn, logWriter)
@@ -701,8 +919,10 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 
 	fmt.Fprintf(logWriter, "    Exchanging address info with peer via %d MQTT servers...\n", len(MQTTBrokerServers))
 	topicCID := MQTT_GenerateClientID(TopicDesc_ExchangeAddress, sessionUid, 0)
-	remotePayload, srvIndex, err := MQTT_SecureExchange[exchangeAddressPayload](
-		ctx, EXMODE_mutual, myInfoForExchange, topicCID, "gonc-exchange-address", sessionUid, localBindIP, timeout, nil)
+	var remotePayload exchangeAddressPayload
+	var srvIndex int
+	remotePayload, srvIndex, err = MQTT_SecureExchangeWithSession[exchangeAddressPayload](
+		withMQTTExchangeLog(ctx, logWriter, "address-exchange"), signal, EXMODE_mutual, myInfoForExchange, topicCID, "gonc-exchange-address", sessionUid, timeout, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -861,6 +1081,7 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 
 	sessCtx := &P2PSessionContext{
 		SharedKey:             sharedKey,
+		MQTTSignal:            signal,
 		LocalBindIP:           localBindIP,
 		LocalPublicIPv4Count:  LocalPublicIPv4Count,
 		LocalPublicIPv6Count:  LocalPublicIPv6Count,
@@ -1098,14 +1319,14 @@ type P2PConnInfo struct {
 }
 
 func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
-	connInfo, err := Easy_P2P_MP(context.Background(), network, "", sessionUid, false, relayConn, logWriter)
+	connInfo, err := Easy_P2P_MP(context.Background(), network, "", sessionUid, false, relayConn, logWriter, nil)
 	if err != nil {
 		return nil, err
 	}
 	return connInfo, nil
 }
 
-func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
+func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession) (*P2PConnInfo, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	networksToTryStun, err := NetworksForStun(network)
 	if err != nil {
@@ -1114,8 +1335,20 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 
 	fmt.Fprintf(logWriter, "=== Checking NAT reachability ===\n")
 
+	if signal == nil {
+		localBindIP := ""
+		if bind != "" {
+			localBindIP, _, _ = net.SplitHostPort(bind)
+		}
+		signal, err = NewMQTTSignalSession(ctx, MQTT_GenerateClientID(TopicDesc_ExchangeAddress, sessionUid, 0), localBindIP, logWriter)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare MQTT signal session: %w", err)
+		}
+		defer signal.Close()
+	}
+
 	// --- 2. Get address information for all required networks in one go ---
-	p2pInfos, sessCtx, err := Do_autoP2PEx2(ctx, networksToTryStun, bind, sessionUid, 25*time.Second, true, relayConn, logWriter)
+	p2pInfos, sessCtx, err := Do_autoP2PEx2(ctx, networksToTryStun, bind, sessionUid, 25*time.Second, true, relayConn, logWriter, signal)
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
 		return nil, fmt.Errorf("failed to exchange address info: %w", err)
@@ -1858,8 +2091,11 @@ func Mqtt_P2P_Round_Sync(ctx context.Context, sessionUid string, sessCtx *P2PSes
 
 	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ...\n", round)
 	topicCID := MQTT_GenerateClientID(TopicDesc_RoundSync, sessionUid, 0)
-	msgRecv, _, err := MQTT_SecureExchange(
-		ctx, EXMODE_mutual, msgSend, topicCID, "gonc-exchange-sync", sessionUid, sessCtx.LocalBindIP, timeout, filter)
+	if sessCtx == nil || sessCtx.MQTTSignal == nil {
+		return fmt.Errorf("missing MQTT signal session")
+	}
+	msgRecv, _, err := MQTT_SecureExchangeWithSession(
+		withMQTTExchangeLog(ctx, logWriter, fmt.Sprintf("round-sync-%d", round)), sessCtx.MQTTSignal, EXMODE_mutual, msgSend, topicCID, "gonc-exchange-sync", sessionUid, timeout, filter)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
 	}
@@ -2334,12 +2570,28 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 }
 
 func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Duration, logWriter io.Writer) (string, error) {
+	tid, signal, err := MqttWaitSession(ctx, sessionUid, localIP, timeout, logWriter)
+	if signal != nil {
+		go func() {
+			time.Sleep(5 * time.Second)
+			signal.Close()
+		}()
+	}
+	return tid, err
+}
+
+func MqttWaitSession(ctx context.Context, sessionUid, localIP string, timeout time.Duration, logWriter io.Writer) (string, *MQTTSignalSession, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	topicCID := MQTT_GenerateClientID(TopicDesc_WAIT, sessionUid, 0)
 	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
 	logger.Printf("Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
+
+	signal, err := NewMQTTSignalSession(ctx, topicCID, localIP, logWriter)
+	if err != nil {
+		return "", nil, err
+	}
 
 	expectMsgPrefix := "SYN@"
 	filterSYN := func(data string) (bool, error) {
@@ -2349,29 +2601,28 @@ func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Dura
 		return true, nil
 	}
 
-	recvData, srvIndex, err := MQTT_SecureExchange(ctx, EXMODE_waitOnly, "", topicCID, topicSalt, sessionUid, localIP, timeout, filterSYN)
+	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(withMQTTExchangeLog(ctx, logWriter, "hello-wait"), signal, EXMODE_waitOnly, "", topicCID, topicSalt, sessionUid, timeout, filterSYN)
 	if err != nil {
-		return "", err
+		signal.Close()
+		return "", nil, err
 	}
 	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
 	logger.Printf("Received event: %s, (via %s)\n", string(recvData), brokerServer)
 	if !strings.HasPrefix(recvData, "SYN@") {
-		return "", fmt.Errorf("not the expected message")
+		signal.Close()
+		return "", nil, fmt.Errorf("not the expected message")
 	}
 	tid := strings.TrimPrefix(recvData, "SYN@")
 	msgACK := "ACK@" + tid
 
-	logger.Printf("Waiting for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
-	expectMsgPrefix = recvData
-	recvData2, _, err := MQTT_SecureExchange(ctx, EXMODE_reply, msgACK, topicCID, topicSalt, sessionUid, localIP, 15*time.Second, filterSYN)
+	logger.Printf("Publishing ACK for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
+	_, err = mqttSecurePublishWithSession(withMQTTExchangeLog(ctx, logWriter, "hello-ack"), signal, msgACK, topicCID, topicSalt, sessionUid, 15*time.Second)
 	if err != nil {
-		return "", err
-	}
-	if recvData != recvData2 {
-		return "", fmt.Errorf("not the expected message")
+		signal.Close()
+		return "", nil, err
 	}
 
-	return tid, err
+	return tid, signal, err
 }
 
 type HelloPayload struct {
@@ -2486,6 +2737,17 @@ func ParseMQTTHelloPayload(topicSalt string) (control, app, prefix string) {
 }
 
 func MQTTHello(ctx context.Context, sessionUid, localIP string, helloPayload HelloPayload, timeout time.Duration, logWriter io.Writer) (string, error) {
+	tid, signal, err := MQTTHelloSession(ctx, sessionUid, localIP, helloPayload, timeout, logWriter)
+	if signal != nil {
+		go func() {
+			time.Sleep(5 * time.Second)
+			signal.Close()
+		}()
+	}
+	return tid, err
+}
+
+func MQTTHelloSession(ctx context.Context, sessionUid, localIP string, helloPayload HelloPayload, timeout time.Duration, logWriter io.Writer) (string, *MQTTSignalSession, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
@@ -2493,9 +2755,15 @@ func MQTTHello(ctx context.Context, sessionUid, localIP string, helloPayload Hel
 	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
 	logger.Printf("Pushing Hello to topic %s across %d servers\n", topic, len(MQTTBrokerServers))
 
+	signal, err := NewMQTTSignalSession(ctx, topicCID, localIP, logWriter)
+	if err != nil {
+		return "", nil, err
+	}
+
 	tid, err := secure.GenerateSecureRandomString(10)
 	if err != nil {
-		return "", fmt.Errorf("generate salt failed: %v", err)
+		signal.Close()
+		return "", nil, fmt.Errorf("generate salt failed: %v", err)
 	}
 	tid += helloPayload.String()
 	msgSYN := "SYN@" + tid
@@ -2508,17 +2776,19 @@ func MQTTHello(ctx context.Context, sessionUid, localIP string, helloPayload Hel
 		return true, nil
 	}
 
-	recvData, srvIndex, err := MQTT_SecureExchange(ctx, EXMODE_mutual, msgSYN, topicCID, topicSalt, sessionUid, localIP, timeout, filterACK)
+	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(withMQTTExchangeLog(ctx, logWriter, "hello"), signal, EXMODE_mutual, msgSYN, topicCID, topicSalt, sessionUid, timeout, filterACK)
 	if err != nil {
-		return "", err
+		signal.Close()
+		return "", nil, err
 	}
 	if recvData != msgACK {
-		return "", fmt.Errorf("not the expected message")
+		signal.Close()
+		return "", nil, fmt.Errorf("not the expected message")
 	}
 
 	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
 	logger.Printf("Hello operation completed (via %s). tid: %s\n", brokerServer, tid)
-	return tid, nil
+	return tid, signal, nil
 }
 
 // getNetworkPriority assigns a numerical priority to network types. Higher value means higher priority.

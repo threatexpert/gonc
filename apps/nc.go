@@ -2857,35 +2857,39 @@ func ShowPublicIP(ncconfig *AppNetcatConfig, network, bind string) error {
 	return err
 }
 
-func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
+func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, *easyp2p.MQTTSignalSession, error) {
 	var err error
 	var salt string
+	var signal *easyp2p.MQTTSignalSession
 
 	if ncconfig.useMQTTWait {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MqttWait(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
+		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
-			return "", fmt.Errorf("mqtt-wait: %v", err)
+			return "", nil, fmt.Errorf("mqtt-wait: %v", err)
 		}
 	}
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MQTTHello(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
+		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
-			return "", fmt.Errorf("mqtt-hello: %v", err)
+			return "", nil, fmt.Errorf("mqtt-hello: %v", err)
 		}
 	}
-	return salt, nil
+	return salt, signal, nil
 }
 
 func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	//使用其他客户端push过来的salt，构建一个仅和对端单独共享的topic，避免P2P交换地址时有多个端点在一起错乱发生
 
-	topicSalt, err := Mqtt_ensure_ready(ncconfig)
+	topicSalt, mqttSignalSession, err := Mqtt_ensure_ready(ncconfig)
 	if err != nil {
 		ReportP2PStatus(ncconfig, "", fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
+	}
+	if mqttSignalSession != nil {
+		defer mqttSignalSession.Close()
 	}
 
 	ReportP2PStatus(ncconfig, topicSalt, "connecting", ncconfig.network, "", "")
@@ -2948,7 +2952,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 
 		//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-		connInfo, err = easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+		connInfo, err = easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter, mqttSignalSession)
 		if err != nil {
 			if relayConn != nil {
 				relayConn.Close()

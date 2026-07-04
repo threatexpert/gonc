@@ -309,7 +309,7 @@ func makeP2PDataSession(config *AppPortRotateConfig, id int, networkOverride str
 	topicSalt := fmt.Sprintf("%d", id)
 
 	// 注意：这里我们将 networkOverride 传递给 Easy_P2P_MP
-	connInfo, err := easyp2p.Easy_P2P_MP(config.ncconfig.ctx, targetNetwork, config.ncconfig.localbind, config.ncconfig.p2pSessionKey+topicSalt, false, nil, config.ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P_MP(config.ncconfig.ctx, targetNetwork, config.ncconfig.localbind, config.ncconfig.p2pSessionKey+topicSalt, false, nil, config.ncconfig.LogWriter, nil)
 	if err != nil {
 		return nil, err
 	}
