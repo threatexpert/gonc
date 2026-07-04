@@ -26,16 +26,36 @@ Accept: application/json
 Accept-Encoding: zstd, gzip
 ```
 
+For interrupted downloads, the client can request only the prefix it needs to
+validate:
+
+```http
+GET /path/to/file.bin?manifest=blake3&block_size=8388608&limit_size=52428800
+Accept: application/json
+Accept-Encoding: zstd, gzip
+```
+
+`limit_size` means "return enough blocks to cover this many bytes". The server
+rounds it up to a block boundary. For example, `limit_size=50MB` with an `8MB`
+block size returns hashes through `56MB`.
+
 The response is NDJSON:
 
 ```http
 Content-Type: application/x-ndjson
 ```
 
-The first line is the file record:
+The first line is the file record. For a full manifest:
 
 ```json
 {"type":"file","path":"/path/to/file.bin","size":123456789,"mod_time":"2026-07-03T12:00:00Z","algo":"blake3","block_size":8388608}
+```
+
+For a limited manifest, the header also includes the hashed size and requested
+limit:
+
+```json
+{"type":"file","path":"/path/to/file.bin","size":123456789,"mod_time":"2026-07-03T12:00:00Z","algo":"blake3","block_size":8388608,"manifest_size":58720256,"limit_size":52428800}
 ```
 
 Each following line is one block record:
@@ -86,7 +106,8 @@ can be reused.
 
 ## Repair Flow
 
-1. Request the remote BLAKE3 manifest.
+1. Request the remote BLAKE3 manifest. If `localSize < remoteSize`, first
+   request a limited manifest with `limit_size=localSize`.
 2. Compute local BLAKE3 block hashes using the manifest `block_size`.
 3. Compare local blocks against remote blocks by offset and size.
 
@@ -104,6 +125,67 @@ Otherwise:
 ```
 
 Merge adjacent dirty/missing blocks into larger ranges.
+
+If the limited manifest proves that all complete local prefix blocks match,
+classify the plan as `TailResume` and download from the last complete block
+boundary to the remote file end. This does not require the full manifest.
+
+If the limited manifest does not prove a clean prefix, request a full manifest
+and classify the result as `SparseRepair` or full re-download.
+
+## Repair Plan Kinds
+
+`Complete`:
+
+```text
+localSize == remoteSize && localMtime == remoteModTime
+=> Skip.
+```
+
+`TailResume`:
+
+```text
+localSize < remoteSize
+all complete local prefix blocks match
+=> Range download from the last complete block boundary to remote EOF.
+=> Do not apply the 50% full re-download threshold.
+```
+
+Example:
+
+```text
+remoteSize = 500MB
+localSize  = 50MB
+blockSize  = 8MB
+
+Complete local block prefix ends at 48MB.
+If 0..48MB matches, download Range bytes=48MB-EOF.
+```
+
+`TruncateOnly`:
+
+```text
+localSize > remoteSize
+all remote blocks match the local prefix
+=> Truncate to remoteSize.
+=> Do not apply the 50% full re-download threshold.
+```
+
+`SparseRepair`:
+
+```text
+Middle blocks are dirty/missing.
+=> Download dirty/missing ranges.
+=> Apply range count and 50% full re-download thresholds.
+```
+
+`FullRedownload`:
+
+```text
+Prefix mismatch, repair too expensive, manifest unsupported, range unsupported,
+or too many ranges.
+=> Full file download.
+```
 
 Example range request:
 
@@ -169,7 +251,7 @@ Set local file mtime to remoteModTime.
 
 ## Full Re-download Thresholds
 
-The CLI client currently uses these thresholds:
+The CLI client currently uses these thresholds only for `SparseRepair`:
 
 ```text
 dirty/missing range count > 128
@@ -178,6 +260,8 @@ dirty/missing range count > 128
 dirty/missing total bytes > 50% of remoteSize
   => Full re-download.
 ```
+
+`TailResume` and `TruncateOnly` bypass these thresholds.
 
 GUI clients may reuse these thresholds or expose them as advanced settings.
 
@@ -189,6 +273,15 @@ Remote file only appended data:
 Existing local blocks match.
 Tail blocks are missing.
 => Download only the missing tail.
+```
+
+Interrupted first download:
+
+```text
+Remote file is 500MB.
+Local partial file is 50MB.
+With 8MB blocks, verify complete prefix through 48MB.
+If prefix matches, resume from 48MB.
 ```
 
 Remote file became shorter:

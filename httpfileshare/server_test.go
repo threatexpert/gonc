@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -375,6 +376,61 @@ func TestServeBlake3ManifestFromSource(t *testing.T) {
 	}
 	if blocks[1].Offset != minManifestBlockSize || blocks[1].Size != 123 || blocks[1].Hash == "" {
 		t.Fatalf("second block = %+v", blocks[1])
+	}
+}
+
+func TestServeBlake3ManifestLimitSize(t *testing.T) {
+	dir := t.TempDir()
+	body := bytes.Repeat([]byte("a"), int(3*minManifestBlockSize))
+	filePath := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(filePath, body, 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	server, err := NewServer(ServerConfig{RootPaths: []string{dir}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	limitSize := minManifestBlockSize + 1
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/data.bin?manifest=blake3&block_size=%d&limit_size=%d", minManifestBlockSize, limitSize), nil)
+	req.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	server.serveFilesFromSource(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() {
+		t.Fatal("missing manifest header")
+	}
+	var header blake3ManifestFileRecord
+	if err := json.Unmarshal(scanner.Bytes(), &header); err != nil {
+		t.Fatalf("manifest header unmarshal error = %v", err)
+	}
+	if header.Size != int64(len(body)) {
+		t.Fatalf("header size = %d, want %d", header.Size, len(body))
+	}
+	if header.ManifestSize != 2*minManifestBlockSize {
+		t.Fatalf("manifest size = %d, want %d", header.ManifestSize, 2*minManifestBlockSize)
+	}
+	if header.LimitSize != limitSize {
+		t.Fatalf("limit size = %d, want %d", header.LimitSize, limitSize)
+	}
+
+	var blockCount int
+	for scanner.Scan() {
+		blockCount++
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanner error = %v", err)
+	}
+	if blockCount != 2 {
+		t.Fatalf("block count = %d, want 2", blockCount)
 	}
 }
 

@@ -20,12 +20,14 @@ const (
 )
 
 type blake3ManifestFileRecord struct {
-	Type      string `json:"type"`
-	Path      string `json:"path"`
-	Size      int64  `json:"size"`
-	ModTime   string `json:"mod_time"`
-	Algo      string `json:"algo"`
-	BlockSize int64  `json:"block_size"`
+	Type         string `json:"type"`
+	Path         string `json:"path"`
+	Size         int64  `json:"size"`
+	ModTime      string `json:"mod_time"`
+	Algo         string `json:"algo"`
+	BlockSize    int64  `json:"block_size"`
+	ManifestSize int64  `json:"manifest_size,omitempty"`
+	LimitSize    int64  `json:"limit_size,omitempty"`
 }
 
 type blake3ManifestBlockRecord struct {
@@ -47,6 +49,18 @@ func normalizeManifestBlockSize(blockSize int64) int64 {
 		return maxManifestBlockSize
 	}
 	return blockSize
+}
+
+func manifestHashSize(fileSize, blockSize, limitSize int64) int64 {
+	if limitSize <= 0 || limitSize >= fileSize {
+		return fileSize
+	}
+	blockSize = normalizeManifestBlockSize(blockSize)
+	hashSize := ((limitSize + blockSize - 1) / blockSize) * blockSize
+	if hashSize > fileSize {
+		return fileSize
+	}
+	return hashSize
 }
 
 func blake3BlockHashes(file fs.File, fileSize, blockSize int64) ([]blake3ManifestBlockRecord, error) {

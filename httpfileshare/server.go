@@ -521,6 +521,16 @@ func (s *Server) serveBlake3ManifestFromSource(w http.ResponseWriter, r *http.Re
 		}
 		blockSize = normalizeManifestBlockSize(parsedBlockSize)
 	}
+	var limitSize int64
+	if rawLimitSize := r.URL.Query().Get("limit_size"); rawLimitSize != "" {
+		parsedLimitSize, err := strconv.ParseInt(rawLimitSize, 10, 64)
+		if err != nil || parsedLimitSize < 0 {
+			http.Error(w, "invalid limit_size", http.StatusBadRequest)
+			return
+		}
+		limitSize = parsedLimitSize
+	}
+	hashSize := manifestHashSize(stat.Size(), blockSize, limitSize)
 
 	f, err := s.source.Open(requestedPath)
 	if err != nil {
@@ -529,7 +539,7 @@ func (s *Server) serveBlake3ManifestFromSource(w http.ResponseWriter, r *http.Re
 	}
 	defer f.Close()
 
-	blocks, err := blake3BlockHashes(f, stat.Size(), blockSize)
+	blocks, err := blake3BlockHashes(f, hashSize, blockSize)
 	if err != nil {
 		s.logger.Printf("Error computing BLAKE3 manifest for %s: %v", requestedPath, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -547,6 +557,10 @@ func (s *Server) serveBlake3ManifestFromSource(w http.ResponseWriter, r *http.Re
 		ModTime:   stat.ModTime().Format(time.RFC3339Nano),
 		Algo:      blake3ManifestAlgo,
 		BlockSize: blockSize,
+	}
+	if hashSize != stat.Size() {
+		header.ManifestSize = hashSize
+		header.LimitSize = limitSize
 	}
 	if err := encoder.Encode(header); err != nil {
 		s.logger.Printf("Error encoding BLAKE3 manifest header for %s: %v", requestedPath, err)

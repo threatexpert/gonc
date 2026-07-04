@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,6 +144,93 @@ func TestDownloadFileBlake3RepairAppendsMissingTail(t *testing.T) {
 	}
 	if got := rangeRequests.Load(); got == 0 {
 		t.Fatal("expected at least one range request for repair")
+	}
+}
+
+func TestDownloadFileBlake3RepairTailResumeBypassesLargeTransferThreshold(t *testing.T) {
+	remoteModTime := time.Unix(1700002500, 0)
+	remoteBody := testBytes(20 * 1024 * 1024)
+	localBody := remoteBody[:10*1024*1024]
+
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "data.bin")
+	if err := os.WriteFile(filePath, remoteBody, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filePath, time.Now(), remoteModTime); err != nil {
+		t.Fatal(err)
+	}
+	fileServer, err := NewServer(ServerConfig{RootPaths: []string{tmpDir}, LoggerOutput: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var rangeHeaders []string
+	var manifestLimitSizes []string
+	var fullDownloads int
+	var client *Client
+	progressAtFirstRange := int64(-1)
+	speedBytesAtFirstRange := int64(-1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.URL.Query().Get("manifest") == blake3ManifestAlgo {
+			manifestLimitSizes = append(manifestLimitSizes, r.URL.Query().Get("limit_size"))
+		} else if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			if len(rangeHeaders) == 0 && client != nil {
+				progressAtFirstRange = client.progressTracker.bytesDownloaded.Load()
+				speedBytesAtFirstRange = client.progressTracker.bytesDownloadedLastInterval.Load()
+			}
+			rangeHeaders = append(rangeHeaders, rangeHeader)
+		} else {
+			fullDownloads++
+		}
+		mu.Unlock()
+		fileServer.serveFilesFromSource(w, r)
+	}))
+	defer server.Close()
+
+	localDir := t.TempDir()
+	localPath := filepath.Join(localDir, "data.bin")
+	if err := os.WriteFile(localPath, localBody, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(localPath, time.Now(), remoteModTime.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err = newTestClient(server.URL, localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileInfo := FileInfo{Name: "data.bin", Path: "/data.bin", Size: int64(len(remoteBody)), ModTime: remoteModTime}
+	client.progressTracker.AddTotalBytes(fileInfo.Size)
+
+	if err := client.downloadFile(context.Background(), server.Client(), fileInfo); err != nil {
+		t.Fatal(err)
+	}
+
+	assertFileBody(t, localPath, remoteBody)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(manifestLimitSizes) == 0 || manifestLimitSizes[0] != fmt.Sprintf("%d", len(localBody)) {
+		t.Fatalf("manifest limit sizes = %v, want first %d", manifestLimitSizes, len(localBody))
+	}
+	if len(rangeHeaders) != 1 {
+		t.Fatalf("range headers = %v, want one tail-resume range", rangeHeaders)
+	}
+	wantRange := fmt.Sprintf("bytes=%d-%d", 8*1024*1024, len(remoteBody)-1)
+	if rangeHeaders[0] != wantRange {
+		t.Fatalf("range = %q, want %q", rangeHeaders[0], wantRange)
+	}
+	if progressAtFirstRange != 8*1024*1024 {
+		t.Fatalf("progressAtFirstRange = %d, want retained block size %d", progressAtFirstRange, 8*1024*1024)
+	}
+	if speedBytesAtFirstRange != 0 {
+		t.Fatalf("speedBytesAtFirstRange = %d, want 0", speedBytesAtFirstRange)
+	}
+	if fullDownloads != 0 {
+		t.Fatalf("fullDownloads = %d, want 0", fullDownloads)
 	}
 }
 
