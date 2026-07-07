@@ -35,7 +35,7 @@ import (
 )
 
 var (
-	VERSION = "v2.6.1"
+	VERSION = "v2.6.2"
 )
 
 type AppNetcatConfig struct {
