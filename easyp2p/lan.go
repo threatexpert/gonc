@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -200,12 +201,24 @@ type lanMcast struct {
 	rawConn net.PacketConn
 	conn    *ipv4.PacketConn
 	dst     *net.UDPAddr
-	ifaces  []net.Interface
+	ifaces  []lanMcastIface
+	logger  *log.Logger
+	warned  map[string]struct{}
+	warnMu  sync.Mutex
+	enumErr error
 }
 
-func newLanMcast() (*lanMcast, error) {
+type lanMcastIface struct {
+	iface net.Interface
+}
+
+func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
 	gip := net.ParseIP(LANMulticastIP)
 	dst := &net.UDPAddr{IP: gip, Port: LANMulticastPort}
+	var logger *log.Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
 
 	c, err := net.ListenPacket("udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
 	if err != nil {
@@ -213,29 +226,94 @@ func newLanMcast() (*lanMcast, error) {
 	}
 	p := ipv4.NewPacketConn(c)
 
-	ifaces, _ := net.Interfaces()
-	var good []net.Interface
+	ifaces, enumErr := net.Interfaces()
+	var good []lanMcastIface
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagMulticast == 0 {
 			continue
 		}
 		if err := p.JoinGroup(&iface, &net.UDPAddr{IP: gip}); err == nil {
-			good = append(good, iface)
+			good = append(good, lanMcastIface{iface: iface})
+		} else if logger != nil {
+			logger.Printf("WARN: multicast join on %s failed: %v\n", iface.Name, err)
 		}
 	}
 	p.SetMulticastLoopback(true)
 
-	return &lanMcast{rawConn: c, conn: p, dst: dst, ifaces: good}, nil
+	return &lanMcast{
+		rawConn: c, conn: p, dst: dst, ifaces: good,
+		logger: logger, warned: map[string]struct{}{},
+		enumErr: enumErr,
+	}, nil
 }
 
 func (mc *lanMcast) Close() { mc.rawConn.Close() }
 
 func (mc *lanMcast) broadcast(data []byte) {
-	for i := range mc.ifaces {
-		mc.conn.SetMulticastInterface(&mc.ifaces[i])
-		mc.conn.SetMulticastTTL(2)
-		mc.conn.WriteTo(data, nil, mc.dst)
+	if mc.enumErr != nil {
+		mc.warnOnce("ifaces-enum", "interface enumeration failed: %v", mc.enumErr)
 	}
+	for i := range mc.ifaces {
+		iface := &mc.ifaces[i]
+		if err := mc.conn.SetMulticastInterface(&iface.iface); err != nil {
+			mc.warnOnce("mcast-iface:"+iface.iface.Name, "multicast iface %s: %v", iface.iface.Name, err)
+			continue
+		}
+		mc.conn.SetMulticastTTL(2)
+		if _, err := mc.conn.WriteTo(data, nil, mc.dst); err != nil {
+			mc.warnOnce("mcast-write:"+iface.iface.Name, "multicast send on %s to %s: %v", iface.iface.Name, mc.dst, err)
+		}
+	}
+	if len(mc.ifaces) == 0 {
+		if _, err := mc.conn.WriteTo(data, nil, mc.dst); err != nil {
+			mc.warnOnce("fallback-write:"+mc.dst.String(), "fallback multicast send to %s: %v", mc.dst, err)
+		}
+	}
+}
+
+func (mc *lanMcast) sendTo(data []byte, dst net.Addr) {
+	if dst == nil {
+		return
+	}
+	if _, err := mc.conn.WriteTo(data, nil, dst); err != nil {
+		mc.warnOnce("unicast-write:"+dst.String(), "unicast send to %s: %v", dst, err)
+	}
+}
+
+func (mc *lanMcast) broadcastAndSendTo(data []byte, dst net.Addr) {
+	mc.broadcast(data)
+	mc.sendTo(data, dst)
+}
+
+func (mc *lanMcast) ifaceSummary() string {
+	if len(mc.ifaces) == 0 {
+		summary := "none"
+		if mc.enumErr != nil {
+			summary += fmt.Sprintf(" (enumErr=%v)", mc.enumErr)
+		}
+		return summary + " (fallback=239.255.255.250)"
+	}
+	parts := make([]string, 0, len(mc.ifaces))
+	for _, iface := range mc.ifaces {
+		parts = append(parts, iface.iface.Name)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (mc *lanMcast) warnOnce(key, format string, args ...interface{}) {
+	if mc.logger == nil {
+		return
+	}
+	mc.warnMu.Lock()
+	defer mc.warnMu.Unlock()
+	if _, ok := mc.warned[key]; ok {
+		return
+	}
+	mc.warned[key] = struct{}{}
+	mc.logger.Printf("WARN: "+format+"\n", args...)
 }
 
 // ============================================================================
@@ -324,7 +402,7 @@ func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 		return nil, fmt.Errorf("alloc port: %v", err)
 	}
 
-	mc, err := newLanMcast()
+	mc, err := newLanMcast(logger)
 	if err != nil {
 		return nil, err
 	}
@@ -332,6 +410,7 @@ func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 
 	logger.Printf("Multicast %s:%d, %d ifaces, punchPort=%d\n",
 		LANMulticastIP, LANMulticastPort, len(mc.ifaces), punchPort)
+	logger.Printf("Interfaces: %s\n", mc.ifaceSummary())
 
 	// 启动分发器
 	disp := newLanDispatcher()
@@ -419,6 +498,7 @@ func lanInitiator(
 
 	// ── Phase 1: 从 responseCh 等 Response ──
 	var resp lanResponse
+	var respSrc net.Addr
 	for {
 		select {
 		case <-ctx.Done():
@@ -431,6 +511,7 @@ func lanInitiator(
 			if resp.NonceA != nonceA {
 				continue
 			}
+			respSrc = pkt.src
 			// 收到有效 response, 停止发 beacon
 			close(beaconStop)
 			goto GotResponse
@@ -451,7 +532,7 @@ GotResponse:
 
 		// 立即发几轮
 		for i := 0; i < 3; i++ {
-			mc.broadcast(confirmData)
+			mc.broadcastAndSendTo(confirmData, respSrc)
 			time.Sleep(50 * time.Millisecond)
 		}
 
@@ -464,7 +545,7 @@ GotResponse:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-confirmTk.C:
-				mc.broadcast(confirmData)
+				mc.broadcastAndSendTo(confirmData, respSrc)
 			case pkt := <-disp.ackCh:
 				var ack lanAck
 				if err := lanUnmarshal(pkt.msg, &ack); err != nil {
@@ -508,7 +589,7 @@ func lanResponder(
 		// ── Phase 1: 从 beaconCh 等 Beacon ──
 		var b lanBeacon
 		var remoteIP, localIP string
-
+		var beaconSrc net.Addr
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -529,6 +610,7 @@ func lanResponder(
 			if err != nil || localIP == remoteIP {
 				continue
 			}
+			beaconSrc = pkt.src
 		}
 
 		logger.Printf("Responder: beacon from %s, bestLocal=%s\n", remoteIP, localIP)
@@ -542,7 +624,7 @@ func lanResponder(
 
 		// 立即发几轮
 		for i := 0; i < 3; i++ {
-			mc.broadcast(respData)
+			mc.broadcastAndSendTo(respData, beaconSrc)
 			time.Sleep(50 * time.Millisecond)
 		}
 
@@ -550,6 +632,7 @@ func lanResponder(
 		respTk := time.NewTicker(300 * time.Millisecond)
 		confirmDeadline := time.After(10 * time.Second)
 		var confirm lanConfirm
+		var confirmSrc net.Addr
 		gotConfirm := false
 
 		for !gotConfirm {
@@ -562,7 +645,7 @@ func lanResponder(
 				logger.Printf("Responder: confirm timeout, resume beacon listen\n")
 				goto NextBeacon
 			case <-respTk.C:
-				mc.broadcast(respData)
+				mc.broadcastAndSendTo(respData, beaconSrc)
 			case pkt := <-disp.confirmCh:
 				if err := lanUnmarshal(pkt.msg, &confirm); err != nil {
 					continue
@@ -570,6 +653,7 @@ func lanResponder(
 				if confirm.NonceB != nonceB {
 					continue
 				}
+				confirmSrc = pkt.src
 				gotConfirm = true
 			}
 		}
@@ -581,7 +665,7 @@ func lanResponder(
 
 			// 多发几轮, 确保 initiator 收到
 			for i := 0; i < 8; i++ {
-				mc.broadcast(ackData)
+				mc.broadcastAndSendTo(ackData, confirmSrc)
 				time.Sleep(100 * time.Millisecond)
 			}
 
