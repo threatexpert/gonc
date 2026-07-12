@@ -122,6 +122,7 @@ type AppNetcatConfig struct {
 	useMQTTWait          bool
 	useMQTTHello         bool
 	useLAN               bool
+	useLANPassive        bool
 	MQTTHelloPayload     easyp2p.HelloPayload
 	useIPv4              bool
 	useIPv6              bool
@@ -233,6 +234,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.useMQTTHello, "mqtt-hello", false, "send MQTT hello message before initiating P2P connection")
 	fs.BoolVar(&config.useMQTTHello, "H", false, "alias for -mqtt-hello")
 	fs.BoolVar(&config.useLAN, "lan", false, "use LAN broadcast discovery instead of STUN/MQTT for P2P (can combine with -W/-H)")
+	fs.BoolVar(&config.useLANPassive, "lan-passive", false, "low-frequency LAN discovery mode for long-running responders (implies -lan)")
 	fs.BoolVar(&config.useIPv4, "4", false, "Forces to use IPv4 addresses only")
 	fs.BoolVar(&config.useIPv6, "6", false, "Forces to use IPv4 addresses only")
 	fs.StringVar(&config.useDNS, "dns", "", "set DNS Server")
@@ -865,6 +867,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 		} else if ncconfig.autoP2P != "" {
 			ncconfig.listenMode = false
 			P2PSessionKey = ncconfig.autoP2P
+			if ncconfig.useLANPassive {
+				ncconfig.useLAN = true
+			}
 			if ncconfig.useLAN {
 				if ncconfig.udpProtocol {
 					network = "udp4"
@@ -1003,7 +1008,7 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 				continue
 			}
 
-			if ncconfig.useMQTTWait {
+			if ncconfig.useMQTTWait || ncconfig.useLANPassive {
 				go func(c *secure.NegotiatedConn) {
 					addr := c.RemoteAddr().String()
 					handleP2PConnection(console, ncconfig, c, stats_in, stats_out)
@@ -2863,13 +2868,13 @@ func ShowPublicIP(ncconfig *AppNetcatConfig, network, bind string) error {
 	return err
 }
 
-func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, *easyp2p.MQTTSignalSession, error) {
+func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (string, *easyp2p.MQTTSignalSession, error) {
 	var err error
 	var salt string
 	var signal *easyp2p.MQTTSignalSession
 
 	if ncconfig.useMQTTWait {
-		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
+		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
 		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
 			return "", nil, fmt.Errorf("mqtt-wait: %v", err)
@@ -2877,7 +2882,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, *easyp2p.MQTTSignalSe
 	}
 
 	if ncconfig.useMQTTHello {
-		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
+		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
 		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			return "", nil, fmt.Errorf("mqtt-hello: %v", err)
@@ -2887,18 +2892,17 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, *easyp2p.MQTTSignalSe
 }
 
 func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
+	reportSessionID := newP2PReportSessionID()
 	//使用其他客户端push过来的salt，构建一个仅和对端单独共享的topic，避免P2P交换地址时有多个端点在一起错乱发生
 
-	topicSalt, mqttSignalSession, err := Mqtt_ensure_ready(ncconfig)
+	topicSalt, mqttSignalSession, err := Mqtt_ensure_ready(ncconfig, reportSessionID)
 	if err != nil {
-		ReportP2PStatus(ncconfig, "", fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+		ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
 	}
 	if mqttSignalSession != nil {
 		defer mqttSignalSession.Close()
 	}
-
-	ReportP2PStatus(ncconfig, topicSalt, "connecting", ncconfig.network, "", "")
 
 	cipherSuite := ""
 	if ncconfig.plainTransport {
@@ -2916,7 +2920,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		case "br":
 			//Wait模式，如果对方hello的载荷是bridge类型，则提前验证session是否接受，免得浪费资源建立连接
 			if !Bridge_IsP2PHelloAllowed(helloPayload.AppString()) {
-				ReportP2PStatus(ncconfig, topicSalt, "error:bridge session not found", ncconfig.network, "", "")
+				ReportP2PStatus(ncconfig, reportSessionID, "error:bridge session not found", ncconfig.network, "", "")
 				return nil, fmt.Errorf("bridge session not found: %s", helloPayload.AppString())
 			}
 		}
@@ -2932,21 +2936,29 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 
 	var connInfo *easyp2p.P2PConnInfo
-
+	statusMode := ""
 	if ncconfig.useLAN {
 		// ─── LAN 模式分支 ───
+		ReportP2PStatus(ncconfig, reportSessionID, "discovering", ncconfig.network, "", "")
+
 		transportPref := easyp2p.LANTransportFromConfig(ncconfig.udpProtocol)
-		connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		if ncconfig.useLANPassive {
+			connInfo, err = easyp2p.Easy_P2P_LAN_Passive(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		} else {
+			connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		}
 		if err != nil {
-			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err
 		}
+		statusMode = "LAN"
 	} else {
 		// ─── STUN/NAT 打洞 ───
+		ReportP2PStatus(ncconfig, reportSessionID, "connecting", ncconfig.network, "", "")
 		var relayConn *easyp2p.RelayPacketConn
 		socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
 		if err != nil {
-			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
+			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
 			return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
 		} else if socks5UDPClient != nil {
 			relayConn = &easyp2p.RelayPacketConn{
@@ -2963,26 +2975,26 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			if relayConn != nil {
 				relayConn.Close()
 			}
-			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err
 		}
 		if !connInfo.RelayUsed && relayConn != nil {
 			relayConn.Close()
 		}
+		statusMode = "P2P"
+		if connInfo.RelayMode {
+			statusMode = "Relay"
+		}
 	}
 
 	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
-	statusMode := "P2P"
-	if connInfo.RelayMode {
-		statusMode = "Relay"
-	}
-	ReportP2PStatus(ncconfig, topicSalt, "negotiating", statusNetwork, statusMode, connInfo.PeerAddress)
+	ReportP2PStatus(ncconfig, reportSessionID, "negotiating", statusNetwork, statusMode, connInfo.PeerAddress)
 
 	rawconn := connInfo.Conns[0]
 	nconn, err := p2pSecureNegotiation(ncconfig, connInfo, cipherSuite, ncconfig.useLAN)
 	if err != nil {
 		rawconn.Close()
-		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+		ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
 	}
 	if nconn.IsUDP {
@@ -3000,10 +3012,10 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	} else {
 		ncconfig.Logger.Printf("Connected to: %s\n", rawconn.RemoteAddr().String())
 	}
-	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
+	ReportP2PStatus(ncconfig, reportSessionID, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
 	preOnClose := nconn.OnClose
 	nconn.OnClose = func() {
-		ReportP2PStatus(ncconfig, topicSalt, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
+		ReportP2PStatus(ncconfig, reportSessionID, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
 		if preOnClose != nil {
 			preOnClose()
 		}
@@ -3153,7 +3165,7 @@ func cleanupUnixSocket(path string) error {
 }
 
 type P2PStatusReport struct {
-	Topic     string `json:"topic"`     // random string
+	Topic     string `json:"topic"`     // report session id; legacy field name
 	Status    string `json:"status"`    // wait / connecting / negotiating / connected / disconnected / error
 	Network   string `json:"network"`   // tcp / udp
 	Mode      string `json:"mode"`      // p2p / relay
@@ -3162,13 +3174,21 @@ type P2PStatusReport struct {
 	PID       int    `json:"pid"`       // process ID
 }
 
-func ReportP2PStatus(ncconfig *AppNetcatConfig, mqttsess, status, network, mode, peer string) {
+func newP2PReportSessionID() string {
+	sessID, err := secure.GenerateSecureRandomString(10)
+	if err == nil {
+		return "p2p-" + sessID
+	}
+	return fmt.Sprintf("p2p-%d-%d", time.Now().UnixNano(), os.Getpid())
+}
+
+func ReportP2PStatus(ncconfig *AppNetcatConfig, sessionID, status, network, mode, peer string) {
 	if ncconfig.p2pReportURL == "" {
 		return
 	}
 
 	report := P2PStatusReport{
-		Topic:     mqttsess,
+		Topic:     sessionID,
 		Status:    status,
 		Network:   network,
 		Mode:      mode,

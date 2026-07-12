@@ -37,6 +37,9 @@ const (
 	LANBeaconMagic   = "GONC-LAN-V1"
 	LANNonceSize     = 16
 
+	lanActiveBeaconInterval  = 1500 * time.Millisecond
+	lanPassiveBeaconInterval = 10 * time.Second
+
 	lanMsgBeacon   = "B"
 	lanMsgResponse = "R"
 	lanMsgConfirm  = "C"
@@ -389,6 +392,14 @@ func (d *lanDispatcher) run(ctx context.Context, mc *lanMcast, key []byte) {
 // ============================================================================
 
 func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*LANDiscoverResult, error) {
+	return lanDiscover(ctx, sessionKey, transportPref, timeout, false, logWriter)
+}
+
+func LANDiscoverPassive(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*LANDiscoverResult, error) {
+	return lanDiscover(ctx, sessionKey, transportPref, timeout, true, logWriter)
+}
+
+func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*LANDiscoverResult, error) {
 	logger := misc.NewLog(logWriter, "[LAN] ", log.LstdFlags|log.Lmsgprefix)
 	key := lanDeriveKey(sessionKey)
 	sid := lanDeriveSessionID(sessionKey)
@@ -422,8 +433,16 @@ func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 	}
 	ch := make(chan dr, 2)
 
+	const workers = 2
+	beaconInterval := lanActiveBeaconInterval
+	initiatorRole := "Initiator"
+	if passive {
+		beaconInterval = lanPassiveBeaconInterval
+		initiatorRole = "Passive"
+		logger.Printf("Mode: passive low-frequency beacon every %s\n", lanPassiveBeaconInterval)
+	}
 	go func() {
-		r, e := lanInitiator(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger)
+		r, e := lanInitiatorWithInterval(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger, beaconInterval, initiatorRole)
 		ch <- dr{r, e}
 	}()
 	go func() {
@@ -432,7 +451,7 @@ func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 	}()
 
 	var lastErr error
-	for i := 0; i < 2; i++ {
+	for i := 0; i < workers; i++ {
 		select {
 		case d := <-ch:
 			if d.err == nil && d.r != nil {
@@ -463,10 +482,11 @@ func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 //   4. 从 disp.ackCh 等 Ack → 完成
 // ============================================================================
 
-func lanInitiator(
+func lanInitiatorWithInterval(
 	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
 	key []byte, sid, tp string, punchPort int,
 	sf *lanSelfFilter, logger *log.Logger,
+	beaconInterval time.Duration, roleName string,
 ) (*LANDiscoverResult, error) {
 
 	nonceA := lanNonce()
@@ -476,13 +496,13 @@ func lanInitiator(
 		SessionID: sid, NonceA: nonceA, Transport: tp,
 	})
 
-	logger.Printf("Initiator: broadcasting beacon\n")
+	logger.Printf("%s: broadcasting beacon\n", roleName)
 	mc.broadcast(beaconData)
 
 	// 持续广播 beacon
 	beaconStop := make(chan struct{})
 	go func() {
-		tk := time.NewTicker(1500 * time.Millisecond)
+		tk := time.NewTicker(beaconInterval)
 		defer tk.Stop()
 		for {
 			select {
@@ -521,7 +541,7 @@ GotResponse:
 
 	localIP, _ := bestLocalIPForRemote(resp.IP)
 	finalTP := negotiateTransport(tp, resp.Transport)
-	logger.Printf("Initiator: got response from %s:%d, localIP=%s\n", resp.IP, resp.Port, localIP)
+	logger.Printf("%s: got response from %s:%d, localIP=%s\n", roleName, resp.IP, resp.Port, localIP)
 
 	// ── Phase 2: 发 Confirm + 等 Ack ──
 	{
@@ -555,7 +575,7 @@ GotResponse:
 					continue
 				}
 
-				logger.Printf("Initiator: got ACK → discovery complete\n")
+				logger.Printf("%s: got ACK → discovery complete\n", roleName)
 				logger.Printf("  local=%s:%d remote=%s:%d tp=%s\n",
 					localIP, punchPort, resp.IP, resp.Port, finalTP)
 
@@ -700,9 +720,23 @@ func lanResponder(
 // ============================================================================
 
 func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
+	return easyP2PLAN(ctx, sessionKey, transportPref, timeout, false, logWriter)
+}
+
+func Easy_P2P_LAN_Passive(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
+	return easyP2PLAN(ctx, sessionKey, transportPref, timeout, true, logWriter)
+}
+
+func easyP2PLAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*P2PConnInfo, error) {
 	fmt.Fprintf(logWriter, "=== LAN Discovery Mode ===\n")
 
-	result, err := LANDiscover(ctx, sessionKey, transportPref, timeout, logWriter)
+	var result *LANDiscoverResult
+	var err error
+	if passive {
+		result, err = LANDiscoverPassive(ctx, sessionKey, transportPref, timeout, logWriter)
+	} else {
+		result, err = LANDiscover(ctx, sessionKey, transportPref, timeout, logWriter)
+	}
 	if err != nil {
 		return nil, err
 	}
