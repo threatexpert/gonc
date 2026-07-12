@@ -870,6 +870,9 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 	var maxRounds = 5
 
 	for _, p2pInfo = range p2pInfos {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if sessCtx.RelayAvailable && relayModeAttempted == 0 && round+1 >= maxRounds {
 			// 在最后一轮前至少尝试一次 relay 模式，如果还没有尝试过，并且后续的候选里有 relay 的话
 			if p2pInfo.LocalNATType != "relay" && p2pInfo.RemoteNATType != "relay" {
@@ -923,11 +926,16 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 			}
 			err = err2
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		fmt.Fprintf(logWriter, "ERROR: %v\n", err)
 		if IsUnRetryable(err) || round >= maxRounds {
 			break
 		}
-		time.Sleep(1 * time.Second)
+		if err := netx.WaitContext(ctx, time.Second); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(mconn) > 0 {
@@ -1101,8 +1109,8 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 	fmt.Fprintf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
 
-	ctxStopPunching, stopPunching := context.WithCancel(ctx)
 	ctxRound, cancel := context.WithTimeout(ctx, time.Duration(count)*time.Second)
+	ctxStopPunching, stopPunching := context.WithCancel(ctxRound)
 	defer cancel()
 	defer stopPunching()
 
@@ -1128,9 +1136,14 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					buconn.SetRemoteAddr(buconn.GetLastPacketRemoteAddr())
 					netx.SetUDPTTL(uconn, 64)
 					buconn.Write(punchPayload) //类似TCP三次握手收到SYN+ACK后，发送个ACK
-					time.Sleep(250 * time.Millisecond)
+					if err := netx.WaitContext(ctxRound, 250*time.Millisecond); err != nil {
+						return
+					}
 					buconn.Write(punchPayload)
-					recvChan <- true
+					select {
+					case recvChan <- true:
+					case <-ctxRound.Done():
+					}
 				})
 				return
 			}
@@ -1168,7 +1181,10 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 							pickOnce.Do(func() {
 								forceRebind = true
 								buconn.SetRemoteAddr(remoteUDPAddr.String())
-								recvChan <- true
+								select {
+								case recvChan <- true:
+								case <-ctxRound.Done():
+								}
 							})
 							return true
 						} else {
@@ -1332,7 +1348,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 							// 标记成功并发送确认包
 							netx.SetUDPTTL(c, 64)
 							_, _ = c.WriteToUDP(punchPayload, raddr)
-							time.Sleep(250 * time.Millisecond)
+							if err := netx.WaitContext(ctxRound, 250*time.Millisecond); err != nil {
+								return
+							}
 							_, _ = c.WriteToUDP(punchPayload, raddr)
 
 							// 获取本地地址并传递结果
@@ -1342,7 +1360,11 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 							case gotHoleCh <- AddrPair{laddr, raddr}:
 							default:
 							}
-							gotCh <- true
+							select {
+							case gotCh <- true:
+							case <-ctxRSP.Done():
+							case <-ctxRound.Done():
+							}
 						})
 						break
 					}
@@ -1396,7 +1418,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 						pickOnce.Do(func() {
 							netx.SetUDPTTL(c, 64)
 							_, _ = c.WriteToUDP(punchPayload, raddr)
-							time.Sleep(250 * time.Millisecond)
+							if err := netx.WaitContext(ctxRound, 250*time.Millisecond); err != nil {
+								return
+							}
 							_, _ = c.WriteToUDP(punchPayload, raddr)
 
 							laddr := c.LocalAddr().(*net.UDPAddr)
@@ -1431,7 +1455,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					if err != nil {
 						return
 					}
-					time.Sleep(2 * time.Second)
+					if err := netx.WaitContext(ctxStopPunching, 2*time.Second); err != nil {
+						return
+					}
 				}
 			}()
 
@@ -1444,11 +1470,15 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			// 客户端：立即发 ping
 		} else {
 			// 服务端：2秒后发 ping
-			time.Sleep(2 * time.Second)
+			if err := netx.WaitContext(ctxStopPunching, 2*time.Second); err != nil {
+				return
+			}
 		}
 		for i := 0; i < count; i++ {
 			if i > 0 {
-				time.Sleep(1 * time.Second)
+				if err := netx.WaitContext(ctxStopPunching, time.Second); err != nil {
+					return
+				}
 			}
 			select {
 			case <-ctxStopPunching.Done():
@@ -1470,7 +1500,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					} else if randomDstPort {
 						sendRDPPing()
 						//大批量发的话，多等等，等回复，如果有回复立刻终止，否则持续大量，即使这批打洞成功，却被下批打爆NAT的映射表
-						time.Sleep(RPP_TIMEOUT / 2 * time.Second)
+						if err := netx.WaitContext(ctxStopPunching, time.Duration(RPP_TIMEOUT/2)*time.Second); err != nil {
+							return
+						}
 					} else if p2pInfo.LocalNATType != "relay" && p2pInfo.RemoteNATType == "relay" {
 						// relay模式下，前几个sendPing失败了，尝试换源端口
 						sendPingOnNewPort(i)
@@ -1488,6 +1520,11 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	var uconnBrandnew net.Conn
 	select {
 	case addrPair := <-gotHoleCh:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			errFin = ctxErr
+			buconn.Close()
+			break
+		}
 		if relayMode {
 			fmt.Fprintf(logWriter, "UDP relay connection established (RSP)!\n")
 		} else {
@@ -1506,6 +1543,11 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			uconnBrandnew.Write(punchPayload)
 		}
 	case <-recvChan:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			errFin = ctxErr
+			buconn.Close()
+			break
+		}
 		if relayMode {
 			fmt.Fprintf(logWriter, "UDP relay connection established!\n")
 		} else {
@@ -1528,13 +1570,24 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	case errFin = <-errChan:
 		buconn.Close()
 	case <-ctxRound.Done():
-		errFin = fmt.Errorf("timeout (%ds)", count)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			errFin = ctxErr
+		} else {
+			errFin = fmt.Errorf("timeout (%ds)", count)
+		}
 		buconn.Close()
 	}
 	cancel()
 	stopPunching()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if uconnBrandnew != nil {
+			_ = uconnBrandnew.Close()
+			uconnBrandnew = nil
+		}
+		errFin = ctxErr
+	}
 	if errFin != nil {
-		return nil, false, relayMode, fmt.Errorf("P2P UDP hole punching failed: %v", errFin)
+		return nil, false, relayMode, fmt.Errorf("P2P UDP hole punching failed: %w", errFin)
 	}
 	return uconnBrandnew, isClient, relayMode, nil
 }
@@ -1619,6 +1672,9 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	)
 
 	fmt.Fprintf(logWriter, "=== Trying P2P Connection ===\n")
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 
 	isClient = SelectRole(p2pInfo, sessCtx)
 
@@ -1707,21 +1763,31 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	timeoutMax := 25
 	timeoutPerconn := 6
 	// Setup context and channels
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	parentCtx := ctx
+	attemptCtx, cancelAttempts := context.WithCancel(parentCtx)
+	defer cancelAttempts()
 	type ConnWithTag struct {
 		Conn net.Conn
 		Tag  string
 	}
-	connChan := make(chan ConnWithTag, 1)
+	connChan := make(chan ConnWithTag)
 	errChan := make(chan error, 1)
+	reportErr := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case errChan <- err:
+		case <-attemptCtx.Done():
+		}
+	}
 	punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
 	var punchAckOnce sync.Once
 	var commitOnce sync.Once
 
 	// Start listener
 	lc := net.ListenConfig{Control: netx.ControlTCP}
-	listener, err := lc.Listen(ctx, network, localAddr.String())
+	listener, err := lc.Listen(attemptCtx, network, localAddr.String())
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to listen: %v", err)
 	}
@@ -1729,7 +1795,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	//端口监听准备好了，开始P2P
 
 	if round > 0 {
-		err = Mqtt_P2P_Round_Sync(ctx, sessionUid, sessCtx, isClient, round, 25*time.Second, logWriter)
+		err = Mqtt_P2P_Round_Sync(attemptCtx, sessionUid, sessCtx, isClient, round, 25*time.Second, logWriter)
 		if err != nil {
 			return nil, false, WrapUnRetryable(fmt.Errorf("failed to sync P2P round: %w", err))
 		}
@@ -1764,41 +1830,46 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	tryCommit := func(conn net.Conn, tag string) bool {
 		committed := false
 		commitOnce.Do(func() {
-			connChan <- ConnWithTag{Conn: conn, Tag: tag}
-			cancel()
-			committed = true
+			select {
+			case connChan <- ConnWithTag{Conn: conn, Tag: tag}:
+				committed = true
+				cancelAttempts()
+			case <-attemptCtx.Done():
+			}
 		})
 
-		<-ctx.Done()
+		<-attemptCtx.Done()
 
 		if !committed {
-			conn.Close()
+			_ = conn.Close()
 		}
 		return committed
 	}
 
 	//打洞有时候有多个连接都打洞成功了，通过doHandshake实现双向确认，共同选择同一条连接，其他关闭
 	doHandshake := func(conn net.Conn, isClient bool, tag string) error {
+		const (
+			handshakeTimeout      = 5 * time.Second
+			handshakePollInterval = 250 * time.Millisecond
+		)
 		var success bool
 		buf := make([]byte, len(punchAckPayload))
 		if isClient {
 			//所有C主动发送Ack
-			_, writeErr := conn.Write(punchAckPayload)
+			_, writeErr := netx.WriteFullWithContext(attemptCtx, conn, punchAckPayload, handshakeTimeout, handshakePollInterval)
 			if writeErr != nil {
-				return fmt.Errorf("connection(%s) failed to write: %v", tag, writeErr)
+				return fmt.Errorf("connection(%s) failed to write: %w", tag, writeErr)
 			}
 
 			//然后进入等待S回复ACK。
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, readErr := conn.Read(buf)
+			n, readErr := netx.ReadFullWithContext(attemptCtx, conn, buf, handshakeTimeout, handshakePollInterval)
 
 			if readErr != nil {
-				return fmt.Errorf("connection(%s) failed to read: %v", tag, readErr)
+				return fmt.Errorf("connection(%s) failed to read: %w", tag, readErr)
 			}
 			if !bytes.Equal(buf[:n], punchAckPayload) {
 				return fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
 			}
-			conn.SetReadDeadline(time.Time{})
 
 			//正常来说，只有一个S会回复，这里用punchAckOnce只允许一个C成功。
 			punchAckOnce.Do(func() {
@@ -1811,20 +1882,18 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			// S端尝试接收C, 然后从收到ACK的连接里只挑选一个回复ACK。确保只有一个C收到ACK，其他C都会关闭连接。
 			errS := fmt.Errorf("connection(%s) not selected", tag)
 
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, readErr := conn.Read(buf)
+			n, readErr := netx.ReadFullWithContext(attemptCtx, conn, buf, handshakeTimeout, handshakePollInterval)
 			if readErr != nil {
-				return errS
+				return fmt.Errorf("connection(%s) failed to read: %w", tag, readErr)
 			}
 			if !bytes.Equal(buf[:n], punchAckPayload) {
 				return fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
 			}
-			conn.SetReadDeadline(time.Time{})
 
 			punchAckOnce.Do(func() {
-				_, writeErr := conn.Write(punchAckPayload)
+				_, writeErr := netx.WriteFullWithContext(attemptCtx, conn, punchAckPayload, handshakeTimeout, handshakePollInterval)
 				if writeErr != nil {
-					errS = fmt.Errorf("connection(%s) failed to write: %v", tag, writeErr)
+					errS = fmt.Errorf("connection(%s) failed to write: %w", tag, writeErr)
 					return
 				}
 				success = true
@@ -1843,14 +1912,14 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		listener.(*net.TCPListener).SetDeadline(deadline)
 		conn, err := listener.Accept()
 		if err != nil {
-			errChan <- err
+			reportErr(err)
 			return
 		}
 
 		err = doHandshake(conn, isClient, "accept")
 		if err != nil {
 			conn.Close()
-			errChan <- err
+			reportErr(err)
 			return
 		}
 
@@ -1867,13 +1936,17 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			if err == nil {
 				err = fmt.Errorf("unexpected peer connection from %s", peerIP)
 			}
-			errChan <- err
+			reportErr(err)
 		}
 	}
 
 	// Start concurrent dialing
 	doPunching := func() {
-		defer cancel()
+		if !isClient && !p2pInfo.LANProbeOnly {
+			if err := netx.WaitContext(attemptCtx, 2*time.Second); err != nil {
+				return
+			}
+		}
 
 		// Setup worker pool for concurrent dialing
 		var wg sync.WaitGroup
@@ -1885,7 +1958,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			<-workerChan // Release worker slot when done
 
 			select {
-			case <-ctx.Done():
+			case <-attemptCtx.Done():
 				return false
 			default:
 				dialer := &net.Dialer{
@@ -1898,7 +1971,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					}
 				}
 
-				conn, err := dialer.DialContext(ctx, network, targetAddr)
+				conn, err := dialer.DialContext(attemptCtx, network, targetAddr)
 				if err != nil {
 					return false
 				}
@@ -1918,7 +1991,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		// [新增] === LAN 直连探测 ===
 		if lanProbeEnabled {
 			select {
-			case <-ctx.Done():
+			case <-attemptCtx.Done():
 				return
 			default:
 			}
@@ -1937,11 +2010,11 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 				// LANProbeOnly 模式：只等 LAN 探测结果，不做公网打洞
 				wg.Wait()
 				select {
-				case <-ctx.Done():
+				case <-attemptCtx.Done():
 					return
 				default:
 				}
-				errChan <- fmt.Errorf("LAN probe failed, no other punching method available")
+				reportErr(fmt.Errorf("LAN probe failed, no other punching method available"))
 				return
 			}
 		}
@@ -1950,7 +2023,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		triedDirectDial := false
 		if inSameLAN || (p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy") {
 			select {
-			case <-ctx.Done():
+			case <-attemptCtx.Done():
 				return
 			default:
 			}
@@ -1964,7 +2037,9 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			if !inSameLAN {
 				if isClient {
 					//easy - easy 失败，可能对方的洞口没开是不可以先碰的
-					time.Sleep(3 * time.Second)
+					if err := netx.WaitContext(attemptCtx, 3*time.Second); err != nil {
+						return
+					}
 					randomDstPort = true
 				} else {
 					randomSrcPort = true
@@ -1974,7 +2049,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 		for i := 0; i < 3 && (randomDstPort || randomSrcPort); i++ {
 			select {
-			case <-ctx.Done():
+			case <-attemptCtx.Done():
 				return
 			default:
 			}
@@ -1989,7 +2064,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 						continue
 					}
 					select {
-					case <-ctx.Done():
+					case <-attemptCtx.Done():
 						return
 					case workerChan <- struct{}{}: // Acquire worker slot
 						wg.Add(1)
@@ -2015,7 +2090,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					}
 
 					select {
-					case <-ctx.Done():
+					case <-attemptCtx.Done():
 						return
 					case workerChan <- struct{}{}: // Acquire worker slot
 						if !triedDirectDial {
@@ -2030,6 +2105,8 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 							select {
 							case <-done:
 								// tryConnect 提前完成了，不等待了
+							case <-attemptCtx.Done():
+								return
 							case <-time.After(1500 * time.Millisecond):
 								// 超时了，还没结束，那我们继续
 							}
@@ -2045,31 +2122,38 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			wg.Wait()
 		}
 		select {
-		case <-ctx.Done():
+		case <-attemptCtx.Done():
 			return
 		default:
 		}
-		errChan <- fmt.Errorf("all connection attempts failed")
+		reportErr(fmt.Errorf("all connection attempts failed"))
 	}
 
 	go doAccept()
-	// Delay for passive side
-	if !isClient && !p2pInfo.LANProbeOnly {
-		time.Sleep(2 * time.Second)
-	}
 	go doPunching()
 
 	// Wait for results
+	timer := time.NewTimer(time.Duration(timeoutMax) * time.Second)
+	defer timer.Stop()
 	select {
 	case connInfo := <-connChan:
-		cancel()
+		cancelAttempts()
+		if err := parentCtx.Err(); err != nil {
+			_ = connInfo.Conn.Close()
+			return nil, false, err
+		}
 		conn := connInfo.Conn    // 获取实际的连接对象
 		connType := connInfo.Tag // 获取连接类型描述
 		fmt.Fprintf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
 		return conn, isClient, nil
 	case errCh := <-errChan:
-		return nil, false, fmt.Errorf("P2P TCP hole punching failed: %s", errCh.Error())
-	case <-time.After(time.Duration(timeoutMax) * time.Second):
+		if err := parentCtx.Err(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, fmt.Errorf("P2P TCP hole punching failed: %w", errCh)
+	case <-parentCtx.Done():
+		return nil, false, parentCtx.Err()
+	case <-timer.C:
 		return nil, false, fmt.Errorf("P2P TCP hole punching failed: Timeout")
 	}
 }
