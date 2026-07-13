@@ -22,6 +22,29 @@ type readyLogWriter struct {
 	ready chan struct{}
 }
 
+func TestDoAutoP2PEx2PreservesCancelCause(t *testing.T) {
+	want := errors.New("candidate superseded")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(want)
+
+	_, _, err := Do_autoP2PEx2(ctx, []string{"tcp4"}, "", "context-cause-test", time.Second, true, nil, io.Discard, nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("Do_autoP2PEx2 error = %v, want cancellation cause", err)
+	}
+}
+
+func TestMQTTSignalExchangePreservesParentCancelCause(t *testing.T) {
+	want := errors.New("candidate superseded")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(want)
+
+	signal := &MQTTSignalSession{}
+	_, _, _, err := signal.exchange(ctx, EXMODE_waitOnly, "", "", "", "", time.Second, nil, mqttNoPreferredBroker)
+	if !errors.Is(err, want) {
+		t.Fatalf("MQTT exchange error = %v, want cancellation cause", err)
+	}
+}
+
 func newReadyLogWriter() *readyLogWriter {
 	return &readyLogWriter{ready: make(chan struct{})}
 }

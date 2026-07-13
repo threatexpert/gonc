@@ -484,14 +484,21 @@ func (s *MQTTSignalSession) publishPreferred(topic string, qos byte, payload str
 func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), preferredBrokerIndex int) (recvData string, recvIndex int, keepAlive bool, err error) {
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
+	parentCtx := ctx
+	if cause := context.Cause(parentCtx); cause != nil {
+		return "", -1, false, cause
+	}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	exchangeCtx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	if exmode != exmodePublishOnly {
 		if err := s.subscribe(topic, qos); err != nil {
 			return "", -1, false, err
 		}
+	}
+	if cause := context.Cause(parentCtx); cause != nil {
+		return "", -1, false, cause
 	}
 	stopPublish := make(chan struct{})
 	var stopPublishOnce sync.Once
@@ -589,11 +596,17 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 	case err := <-waiter.errCh:
 		stopPublisher()
 		return "", -1, false, err
-	case <-ctx.Done():
+	case <-exchangeCtx.Done():
 		stopPublisher()
+		if cause := context.Cause(parentCtx); cause != nil {
+			return "", -1, false, cause
+		}
 		return "", -1, false, fmt.Errorf("timeout waiting for remote data exchange on topic %s (brokers=%d/%d subscribed=%d)", topic, len(s.clientsSnapshot()), len(s.brokers), s.subscribedCount(topic))
 	case <-s.ctx.Done():
 		stopPublisher()
+		if cause := context.Cause(parentCtx); cause != nil {
+			return "", -1, false, cause
+		}
 		return "", -1, false, fmt.Errorf("MQTT signal session closed")
 	}
 }

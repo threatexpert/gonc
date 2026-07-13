@@ -37,7 +37,7 @@ func StartP2PTunnel(password string, useUDP bool, linkConfig string, extraArgs s
 		}
 		cb.Event("info", fmt.Sprintf("Starting gonc tunnel with args: -p2p ***%s -link %s", udpArg, linkConfig))
 	}
-	return start(args, cb, "tunnel"), nil
+	return start(args, cb, "tunnel")
 }
 
 // StartP2PLinkAgent starts gonc in linkagent (dual proxy service) mode. This is
@@ -89,7 +89,7 @@ func StartP2PLinkAgent(password string, useUDP bool, upstream string, dnsForward
 		}
 		cb.Event("info", fmt.Sprintf("Starting gonc linkagent with args: -p2p ***%s -k -W -P -e \"%s\"", udpArg, mux))
 	}
-	return start(args, cb, "linkagent"), nil
+	return start(args, cb, "linkagent")
 }
 
 // splitExtraArgs tokenizes a command-line string shell-style: whitespace

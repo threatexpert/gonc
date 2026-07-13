@@ -371,6 +371,9 @@ func Do_autoP2PEx(networks []string, sessionUid string, timeout time.Duration, n
 }
 
 func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid string, timeout time.Duration, needSharedKey bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession) ([]*P2PAddressInfo, *P2PSessionContext, error) {
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, cause
+	}
 
 	myInfoForExchange := exchangeAddressPayload{
 		Addresses: []PunchingAddressInfo{},
@@ -394,8 +397,14 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 	if err := signal.prepareTopic("gonc-exchange-sync", sessionUid); err != nil {
 		return nil, nil, fmt.Errorf("failed to prepare MQTT sync topic: %w", err)
 	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, cause
+	}
 
 	myInfoForExchange.Addresses, _, _ = DetectNATAddressInfo(networks, bind, relayConn, logWriter)
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, cause
+	}
 
 	// 声明本端支持的特性（能力列表），用于和对端协商打洞策略等。老版本不发送这个字段，默认对方不支持这些能力。
 	myInfoForExchange.Caps = []string{
@@ -420,6 +429,9 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		}
 		pubBytes := elliptic.Marshal(elliptic.P256(), priv.PublicKey.X, priv.PublicKey.Y)
 		myInfoForExchange.PubKey = base64.StdEncoding.EncodeToString(pubBytes)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, cause
 	}
 
 	fmt.Fprintf(logWriter, "    Exchanging address info with peer via %d MQTT servers...\n", len(MQTTBrokerServers))
@@ -823,6 +835,10 @@ type P2PConnInfo struct {
 	PeerAddress  string
 }
 
+type EasyP2PMPOptions struct {
+	OnAddressExchangeDone func()
+}
+
 func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
 	connInfo, err := Easy_P2P_MP(context.Background(), network, "", sessionUid, false, relayConn, logWriter, nil)
 	if err != nil {
@@ -832,6 +848,10 @@ func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter 
 }
 
 func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession) (*P2PConnInfo, error) {
+	return Easy_P2P_MPWithOptions(ctx, network, bind, sessionUid, multipathEnabled, relayConn, logWriter, signal, nil)
+}
+
+func Easy_P2P_MPWithOptions(ctx context.Context, network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession, options *EasyP2PMPOptions) (*P2PConnInfo, error) {
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	networksToTryStun, err := NetworksForStun(network)
 	if err != nil {
@@ -857,6 +877,12 @@ func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipat
 	if err != nil {
 		// If we can't even get the address info, we can't proceed.
 		return nil, fmt.Errorf("failed to exchange address info: %w", err)
+	}
+	if options != nil && options.OnAddressExchangeDone != nil {
+		options.OnAddressExchangeDone()
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, cause
 	}
 	// Do_autoP2PEx返回的p2pInfos是优先考虑建立TCP来排序的。
 	var p2pInfo *P2PAddressInfo

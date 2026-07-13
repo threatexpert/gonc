@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -27,6 +28,11 @@ type Callback interface {
 
 type TrafficCallback interface {
 	Traffic(side string, inBytes int64, outBytes int64, inBps float64, outBps float64, elapsed int64, connCount int, final bool)
+}
+
+type P2POptions struct {
+	UseUDP         bool
+	P2PWithLANMode bool
 }
 
 // Session represents one running gonc task.
@@ -61,6 +67,10 @@ func (s *Session) Done() <-chan struct{} {
 // source. The source is consulted on each HTTP request, so callers can implement
 // a mutable source for live share-list updates.
 func StartP2PShareSource(source httpfileshare.FileSource, password string, useUDP bool, cb Callback) (*Session, error) {
+	return StartP2PShareSourceWithOptions(source, password, P2POptions{UseUDP: useUDP}, cb)
+}
+
+func StartP2PShareSourceWithOptions(source httpfileshare.FileSource, password string, options P2POptions, cb Callback) (*Session, error) {
 	if source == nil {
 		return nil, errors.New("file source is required")
 	}
@@ -68,16 +78,22 @@ func StartP2PShareSource(source httpfileshare.FileSource, password string, useUD
 		return nil, errors.New("password is required")
 	}
 	args := []string{"-p2p", password}
-	if useUDP {
+	if options.UseUDP {
 		args = append(args, "-u")
 	}
-	args = append(args, "-httpserver", ".")
-	return startP2PWithFileSource(args, cb, "send", source), nil
+	args = append(args, "-httpserver", os.DevNull) // a Placeholder
+	return startP2PWithFileSourceAndOptions(args, cb, "send", source, apps.RunOptions{
+		P2PWithLANMode: options.P2PWithLANMode,
+	})
 }
 
 // StartP2PSharePaths starts the P2P sender side from fixed local filesystem
 // paths. Use StartP2PShareSource when the root list must be updated live.
 func StartP2PSharePaths(paths []string, password string, useUDP bool, cb Callback) (*Session, error) {
+	return StartP2PSharePathsWithOptions(paths, password, P2POptions{UseUDP: useUDP}, cb)
+}
+
+func StartP2PSharePathsWithOptions(paths []string, password string, options P2POptions, cb Callback) (*Session, error) {
 	if len(paths) == 0 {
 		return nil, errors.New("select at least one file or folder to send")
 	}
@@ -85,38 +101,48 @@ func StartP2PSharePaths(paths []string, password string, useUDP bool, cb Callbac
 		return nil, errors.New("password is required")
 	}
 	args := []string{"-p2p", password}
-	if useUDP {
+	if options.UseUDP {
 		args = append(args, "-u")
 	}
 	args = append(args, "-httpserver")
 	args = append(args, paths...)
-	return start(args, cb, "send"), nil
+	return startP2PWithFileSourceAndOptions(args, cb, "send", nil, apps.RunOptions{
+		P2PWithLANMode: options.P2PWithLANMode,
+	})
 }
 
 // StartP2PReceive starts the P2P receiver side and exposes the peer's HTTP
 // share on a local endpoint.
 func StartP2PReceive(password string, useUDP bool, cb Callback) (*Session, error) {
+	return StartP2PReceiveWithOptions(password, P2POptions{UseUDP: useUDP}, cb)
+}
+
+// StartP2PReceiveWithOptions optionally races normal P2P with active LAN
+// discovery and exposes only the winning connection to the local HTTP client.
+func StartP2PReceiveWithOptions(password string, options P2POptions, cb Callback) (*Session, error) {
 	if strings.TrimSpace(password) == "" {
 		return nil, errors.New("password is required")
 	}
 	args := []string{"-p2p", password}
-	if useUDP {
+	if options.UseUDP {
 		args = append(args, "-u")
 	}
 	args = append(args, "-httplocal")
-	return start(args, cb, "receive"), nil
+	return startP2PWithFileSourceAndOptions(args, cb, "receive", nil, apps.RunOptions{
+		P2PWithLANMode: options.P2PWithLANMode,
+	})
 }
 
-func start(args []string, cb Callback, side string) *Session {
+func start(args []string, cb Callback, side string) (*Session, error) {
 	return startP2PWithFileSource(args, cb, side, nil)
 }
 
-func startP2PWithFileSource(args []string, cb Callback, side string, source httpfileshare.FileSource) *Session {
+func startP2PWithFileSource(args []string, cb Callback, side string, source httpfileshare.FileSource) (*Session, error) {
+	return startP2PWithFileSourceAndOptions(args, cb, side, source, apps.RunOptions{})
+}
+
+func startP2PWithFileSourceAndOptions(args []string, cb Callback, side string, source httpfileshare.FileSource, runOptions apps.RunOptions) (*Session, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	session := &Session{
-		cancel: cancel,
-		done:   make(chan struct{}),
-	}
 	reportServer, reportURL := startP2PReportServer(cb, side)
 	if reportURL != "" {
 		args = append([]string{}, args...)
@@ -124,22 +150,34 @@ func startP2PWithFileSource(args []string, cb Callback, side string, source http
 	}
 	writer := &callbackWriter{cb: cb, side: side}
 	progressSink := progressSinkFor(cb, side)
+	runOptions.HTTPFileSource = source
+	runOptions.ProgressSink = progressSink
+	config, err := apps.PrepareNetcatConfigWithOptions(ctx, writer, args, runOptions)
+	if err != nil {
+		cancel()
+		if reportServer != nil {
+			_ = reportServer.Close()
+		}
+		if cb != nil {
+			cb.Error(err.Error())
+		}
+		return nil, err
+	}
+	session := &Session{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
 	go func() {
 		defer close(session.done)
 		if reportServer != nil {
 			defer reportServer.Close()
 		}
-		exitCode := 0
-		if source != nil {
-			exitCode = apps.RunNetcatP2PWithHTTPFileSourceAndProgress(ctx, nil, writer, args, source, progressSink)
-		} else {
-			exitCode = apps.RunNetcatWithProgress(ctx, nil, writer, args, progressSink)
-		}
+		exitCode := apps.RunPreparedNetcat(nil, config)
 		if cb != nil {
 			cb.Stopped(exitCode)
 		}
 	}()
-	return session
+	return session, nil
 }
 
 func progressSinkFor(cb Callback, side string) func(apps.ProgressSnapshot) {

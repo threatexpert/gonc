@@ -1,6 +1,10 @@
 package goncembed
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestFindLocalSOCKS5Endpoint(t *testing.T) {
 	tests := []struct {
@@ -89,9 +93,29 @@ func TestTunnelReadyCanFireAfterReconnect(t *testing.T) {
 	}
 }
 
+func TestStartP2PTunnelReturnsPrepareError(t *testing.T) {
+	cb := &recordingCallback{}
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	session, err := StartP2PTunnel("A9f#K2m!Q7x@L4v$R8p%T6z", false, "1080", "-stunsrv @"+missing, cb)
+	if err == nil {
+		t.Fatal("StartP2PTunnel returned nil error")
+	}
+	if session != nil {
+		t.Fatal("StartP2PTunnel returned a session after prepare failure")
+	}
+	if !strings.Contains(err.Error(), "stun server file") {
+		t.Fatalf("error = %q, want stun server file", err.Error())
+	}
+	if cb.errorMessage == "" {
+		t.Fatal("callback Error was not called")
+	}
+}
+
 type recordingCallback struct {
-	ready      string
-	readyCount int
+	ready        string
+	readyCount   int
+	errorMessage string
 }
 
 func (c *recordingCallback) Event(level string, message string) {
@@ -109,4 +133,5 @@ func (c *recordingCallback) Stopped(exitCode int) {
 }
 
 func (c *recordingCallback) Error(message string) {
+	c.errorMessage = message
 }

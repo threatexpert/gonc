@@ -37,8 +37,10 @@ const (
 	LANBeaconMagic   = "GONC-LAN-V1"
 	LANNonceSize     = 16
 
-	lanActiveBeaconInterval  = 1500 * time.Millisecond
-	lanPassiveBeaconInterval = 10 * time.Second
+	lanActiveBeaconInterval     = 1500 * time.Millisecond
+	lanActiveSlowBeaconInterval = 5 * time.Second
+	lanActiveFastBeaconWindow   = 30 * time.Second
+	lanPassiveBeaconInterval    = 15 * time.Second
 
 	lanMsgBeacon   = "B"
 	lanMsgResponse = "R"
@@ -434,15 +436,16 @@ func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 	ch := make(chan dr, 2)
 
 	const workers = 2
-	beaconInterval := lanActiveBeaconInterval
 	initiatorRole := "Initiator"
 	if passive {
-		beaconInterval = lanPassiveBeaconInterval
 		initiatorRole = "Passive"
-		logger.Printf("Mode: passive low-frequency beacon every %s\n", lanPassiveBeaconInterval)
+		logger.Printf("Mode: passive startup burst, then beacon every %s\n", lanPassiveBeaconInterval)
+	} else {
+		logger.Printf("Mode: active beacon every %s for %s, then every %s\n",
+			lanActiveBeaconInterval, lanActiveFastBeaconWindow, lanActiveSlowBeaconInterval)
 	}
 	go func() {
-		r, e := lanInitiatorWithInterval(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger, beaconInterval, initiatorRole)
+		r, e := lanInitiator(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger, passive, initiatorRole)
 		ch <- dr{r, e}
 	}()
 	go func() {
@@ -482,11 +485,11 @@ func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 //   4. 从 disp.ackCh 等 Ack → 完成
 // ============================================================================
 
-func lanInitiatorWithInterval(
+func lanInitiator(
 	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
 	key []byte, sid, tp string, punchPort int,
 	sf *lanSelfFilter, logger *log.Logger,
-	beaconInterval time.Duration, roleName string,
+	passive bool, roleName string,
 ) (*LANDiscoverResult, error) {
 
 	nonceA := lanNonce()
@@ -499,22 +502,9 @@ func lanInitiatorWithInterval(
 	logger.Printf("%s: broadcasting beacon\n", roleName)
 	mc.broadcast(beaconData)
 
-	// 持续广播 beacon
-	beaconStop := make(chan struct{})
-	go func() {
-		tk := time.NewTicker(beaconInterval)
-		defer tk.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-beaconStop:
-				return
-			case <-tk.C:
-				mc.broadcast(beaconData)
-			}
-		}
-	}()
+	beaconsSent := 1
+	beaconTimer := time.NewTimer(lanNextBeaconDelay(passive, beaconsSent))
+	defer beaconTimer.Stop()
 
 	// ── Phase 1: 从 responseCh 等 Response ──
 	var resp lanResponse
@@ -522,8 +512,11 @@ func lanInitiatorWithInterval(
 	for {
 		select {
 		case <-ctx.Done():
-			close(beaconStop)
 			return nil, ctx.Err()
+		case <-beaconTimer.C:
+			mc.broadcast(beaconData)
+			beaconsSent++
+			beaconTimer.Reset(lanNextBeaconDelay(passive, beaconsSent))
 		case pkt := <-disp.responseCh:
 			if err := lanUnmarshal(pkt.msg, &resp); err != nil {
 				continue
@@ -532,8 +525,6 @@ func lanInitiatorWithInterval(
 				continue
 			}
 			respSrc = pkt.src
-			// 收到有效 response, 停止发 beacon
-			close(beaconStop)
 			goto GotResponse
 		}
 	}
@@ -587,6 +578,28 @@ GotResponse:
 			}
 		}
 	}
+}
+
+func lanNextBeaconDelay(passive bool, beaconsSent int) time.Duration {
+	if !passive {
+		fastBeaconCount := int(lanActiveFastBeaconWindow / lanActiveBeaconInterval)
+		if beaconsSent > fastBeaconCount {
+			return lanActiveSlowBeaconInterval
+		}
+		return lanActiveBeaconInterval
+	}
+
+	startupDelays := [...]time.Duration{
+		250 * time.Millisecond,
+		750 * time.Millisecond,
+		4 * time.Second,
+		10 * time.Second,
+	}
+	if index := beaconsSent - 1; index >= 0 && index < len(startupDelays) {
+		return startupDelays[index]
+	}
+
+	return lanPassiveBeaconInterval
 }
 
 // ============================================================================
