@@ -431,18 +431,25 @@ func LANDiscoverPassive(ctx context.Context, sessionKey, transportPref string, t
 }
 
 func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*LANDiscoverResult, error) {
+	return lanDiscoverWithPortAllocator(ctx, sessionKey, transportPref, timeout, passive, logWriter, GetFreePort)
+}
+
+func lanDiscoverWithPortAllocator(
+	ctx context.Context,
+	sessionKey, transportPref string,
+	timeout time.Duration,
+	passive bool,
+	logWriter io.Writer,
+	allocate func() (int, error),
+) (*LANDiscoverResult, error) {
 	logger := misc.NewLog(logWriter, "[LAN] ", log.LstdFlags|log.Lmsgprefix)
 	key := lanDeriveKey(sessionKey)
 	sid := lanDeriveSessionID(sessionKey)
 	sf := newSelfFilter()
+	punchPorts := newLanPunchPortSelector(allocate, logger)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
-	punchPort, err := GetFreePort()
-	if err != nil {
-		return nil, fmt.Errorf("alloc port: %v", err)
-	}
 
 	mc, err := newLanMcast(logger)
 	if err != nil {
@@ -450,8 +457,7 @@ func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 	}
 	defer mc.Close()
 
-	logger.Printf("Multicast %s:%d, %d ifaces, punchPort=%d\n",
-		LANMulticastIP, LANMulticastPort, len(mc.ifaces), punchPort)
+	logger.Printf("Multicast %s:%d, %d ifaces\n", LANMulticastIP, LANMulticastPort, len(mc.ifaces))
 	logger.Printf("Interfaces: %s\n", mc.ifaceSummary())
 
 	// 启动分发器
@@ -474,11 +480,11 @@ func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 			lanActiveBeaconInterval, lanActiveFastBeaconWindow, lanActiveSlowBeaconInterval)
 	}
 	go func() {
-		r, e := lanInitiator(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger, passive, initiatorRole)
+		r, e := lanInitiator(ctx, mc, disp, key, sid, transportPref, punchPorts, sf, logger, passive, initiatorRole)
 		ch <- dr{r, e}
 	}()
 	go func() {
-		r, e := lanResponder(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger)
+		r, e := lanResponder(ctx, mc, disp, key, sid, transportPref, punchPorts, sf, logger)
 		ch <- dr{r, e}
 	}()
 
@@ -516,7 +522,7 @@ func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 
 func lanInitiator(
 	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
-	key []byte, sid, tp string, punchPort int,
+	key []byte, sid, tp string, punchPorts *lanPunchPortSelector,
 	sf *lanSelfFilter, logger *log.Logger,
 	passive bool, roleName string,
 ) (*LANDiscoverResult, error) {
@@ -561,6 +567,10 @@ GotResponse:
 
 	localIP, _ := bestLocalIPForRemote(resp.IP)
 	finalTP := negotiateTransport(tp, resp.Transport)
+	punchPort, err := punchPorts.Get()
+	if err != nil {
+		return nil, err
+	}
 	logger.Printf("%s: got response from %s:%d, localIP=%s\n", roleName, resp.IP, resp.Port, localIP)
 
 	// ── Phase 2: 发 Confirm + 等 Ack ──
@@ -641,7 +651,7 @@ func lanNextBeaconDelay(passive bool, beaconsSent int) time.Duration {
 
 func lanResponder(
 	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
-	key []byte, sid, tp string, punchPort int,
+	key []byte, sid, tp string, punchPorts *lanPunchPortSelector,
 	sf *lanSelfFilter, logger *log.Logger,
 ) (*LANDiscoverResult, error) {
 
@@ -673,6 +683,10 @@ func lanResponder(
 				continue
 			}
 			beaconSrc = pkt.src
+		}
+		punchPort, err := punchPorts.Get()
+		if err != nil {
+			return nil, err
 		}
 
 		logger.Printf("Responder: beacon from %s, bestLocal=%s\n", remoteIP, localIP)

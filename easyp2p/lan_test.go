@@ -161,6 +161,40 @@ func TestLanPunchPortSelectorSharesAllocationError(t *testing.T) {
 	}
 }
 
+func TestLANDiscoverDefersPunchPortSelectionUntilPeer(t *testing.T) {
+	for _, passive := range []bool{false, true} {
+		passive := passive
+		t.Run(fmt.Sprintf("passive=%t", passive), func(t *testing.T) {
+			var calls atomic.Int32
+			var output bytes.Buffer
+			ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+			defer cancel()
+
+			_, err := lanDiscoverWithPortAllocator(
+				ctx,
+				fmt.Sprintf("deferred-port-%t-%d", passive, time.Now().UnixNano()),
+				"",
+				time.Second,
+				passive,
+				&output,
+				func() (int, error) {
+					calls.Add(1)
+					return 42042, nil
+				},
+			)
+			if err == nil {
+				t.Fatal("discovery without a peer unexpectedly succeeded")
+			}
+			if got := calls.Load(); got != 0 {
+				t.Fatalf("allocator called without an authenticated peer: %d", got)
+			}
+			if strings.Contains(output.String(), "punchPort=") {
+				t.Fatalf("initial logs claim a selected punch port: %q", output.String())
+			}
+		})
+	}
+}
+
 func TestBestLocalIP(t *testing.T) {
 	ip, err := bestLocalIPForRemote("192.168.1.1")
 	if err != nil { t.Skipf("no route: %v", err) }
