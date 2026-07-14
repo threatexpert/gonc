@@ -64,6 +64,17 @@ Initiator and responder run concurrently and may both complete valid handshakes 
 
 Sharing one `sync.Once`-protected selector preserves the existing invariant that every handshake path within one LAN discovery invocation advertises the same local punch port.
 
+## Discovery-Round Lifetime
+
+One `lanDiscover` invocation produces at most one connection. It does not concurrently admit multiple clients. The selector therefore belongs to that single discovery round:
+
+- Retransmissions and the concurrent initiator/responder paths within the round reuse its one candidate port.
+- A valid handshake that later times out may resume discovery within the same round and continue using that candidate.
+- After a connection succeeds, `lanDiscover` returns and the selector is discarded.
+- In passive keep-open mode, the application starts a new `lanDiscover` invocation for the next client; that new round creates a new selector and chooses a new candidate after its first authenticated peer message.
+
+Existing established connections may run concurrently at the application layer, but new-client discovery remains one round at a time.
+
 ## Data Flow
 
 ```text
