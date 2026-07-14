@@ -835,8 +835,29 @@ type P2PConnInfo struct {
 	PeerAddress  string
 }
 
+// EasyP2PMPOptions configures optional dependencies and behavior for
+// Easy_P2P_MPWithOptions. Its zero value is valid.
 type EasyP2PMPOptions struct {
+	Bind             string
+	MultipathEnabled bool
+
+	// RelayConn is caller-owned and is not closed by this API.
+	RelayConn *RelayPacketConn
+	// LogWriter receives diagnostics. Nil is normalized to io.Discard.
+	LogWriter io.Writer
+	// Signal is caller-owned when non-nil. A nil value makes this API create
+	// and close an internal signaling session.
+	Signal *MQTTSignalSession
+	// OnAddressExchangeDone runs after address exchange succeeds and before
+	// traversal attempts begin.
 	OnAddressExchangeDone func()
+}
+
+func (options EasyP2PMPOptions) normalized() EasyP2PMPOptions {
+	if options.LogWriter == nil {
+		options.LogWriter = io.Discard
+	}
+	return options
 }
 
 func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter io.Writer) (*P2PConnInfo, error) {
