@@ -246,6 +246,11 @@ type lanMcastIface struct {
 	iface net.Interface
 }
 
+type lanMessenger interface {
+	broadcast([]byte)
+	broadcastAndSendTo([]byte, net.Addr)
+}
+
 func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
 	gip := net.ParseIP(LANMulticastIP)
 	dst := &net.UDPAddr{IP: gip, Port: LANMulticastPort}
@@ -430,6 +435,39 @@ func LANDiscoverPassive(ctx context.Context, sessionKey, transportPref string, t
 	return lanDiscover(ctx, sessionKey, transportPref, timeout, true, logWriter)
 }
 
+type lanDiscoverWorker func() (*LANDiscoverResult, error)
+
+func runLANDiscoverWorkers(ctx context.Context, cancel context.CancelFunc, workers ...lanDiscoverWorker) (*LANDiscoverResult, error) {
+	type workerResult struct {
+		result *LANDiscoverResult
+		err    error
+	}
+	results := make(chan workerResult, len(workers))
+	for _, worker := range workers {
+		worker := worker
+		go func() {
+			result, err := worker()
+			results <- workerResult{result: result, err: err}
+		}()
+	}
+
+	defer cancel()
+	for range workers {
+		select {
+		case outcome := <-results:
+			if outcome.err != nil {
+				return nil, outcome.err
+			}
+			if outcome.result != nil {
+				return outcome.result, nil
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("LAN discovery timeout")
+		}
+	}
+	return nil, fmt.Errorf("LAN discovery failed")
+}
+
 func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*LANDiscoverResult, error) {
 	return lanDiscoverWithPortAllocator(ctx, sessionKey, transportPref, timeout, passive, logWriter, GetFreePort)
 }
@@ -464,13 +502,6 @@ func lanDiscoverWithPortAllocator(
 	disp := newLanDispatcher()
 	go disp.run(ctx, mc, key)
 
-	type dr struct {
-		r   *LANDiscoverResult
-		err error
-	}
-	ch := make(chan dr, 2)
-
-	const workers = 2
 	initiatorRole := "Initiator"
 	if passive {
 		initiatorRole = "Passive"
@@ -479,37 +510,14 @@ func lanDiscoverWithPortAllocator(
 		logger.Printf("Mode: active beacon every %s for %s, then every %s\n",
 			lanActiveBeaconInterval, lanActiveFastBeaconWindow, lanActiveSlowBeaconInterval)
 	}
-	go func() {
-		r, e := lanInitiator(ctx, mc, disp, key, sid, transportPref, punchPorts, sf, logger, passive, initiatorRole)
-		ch <- dr{r, e}
-	}()
-	go func() {
-		r, e := lanResponder(ctx, mc, disp, key, sid, transportPref, punchPorts, sf, logger)
-		ch <- dr{r, e}
-	}()
-
-	var lastErr error
-	for i := 0; i < workers; i++ {
-		select {
-		case d := <-ch:
-			if d.err == nil && d.r != nil {
-				cancel()
-				return d.r, nil
-			}
-			if d.err != nil {
-				lastErr = d.err
-			}
-		case <-ctx.Done():
-			if lastErr != nil {
-				return nil, lastErr
-			}
-			return nil, fmt.Errorf("LAN discovery timeout")
-		}
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("LAN discovery failed")
+	return runLANDiscoverWorkers(ctx, cancel,
+		func() (*LANDiscoverResult, error) {
+			return lanInitiator(ctx, mc, disp, key, sid, transportPref, bestLocalIPForRemote, punchPorts, sf, logger, passive, initiatorRole)
+		},
+		func() (*LANDiscoverResult, error) {
+			return lanResponder(ctx, mc, disp, key, sid, transportPref, bestLocalIPForRemote, punchPorts, sf, logger)
+		},
+	)
 }
 
 // ============================================================================
@@ -521,8 +529,8 @@ func lanDiscoverWithPortAllocator(
 // ============================================================================
 
 func lanInitiator(
-	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
-	key []byte, sid, tp string, punchPorts *lanPunchPortSelector,
+	ctx context.Context, mc lanMessenger, disp *lanDispatcher,
+	key []byte, sid, tp string, selectLocalIP func(string) (string, error), punchPorts *lanPunchPortSelector,
 	sf *lanSelfFilter, logger *log.Logger,
 	passive bool, roleName string,
 ) (*LANDiscoverResult, error) {
@@ -565,7 +573,7 @@ func lanInitiator(
 	}
 GotResponse:
 
-	localIP, _ := bestLocalIPForRemote(resp.IP)
+	localIP, _ := selectLocalIP(resp.IP)
 	finalTP := negotiateTransport(tp, resp.Transport)
 	punchPort, err := punchPorts.Get()
 	if err != nil {
@@ -650,8 +658,8 @@ func lanNextBeaconDelay(passive bool, beaconsSent int) time.Duration {
 // ============================================================================
 
 func lanResponder(
-	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
-	key []byte, sid, tp string, punchPorts *lanPunchPortSelector,
+	ctx context.Context, mc lanMessenger, disp *lanDispatcher,
+	key []byte, sid, tp string, selectLocalIP func(string) (string, error), punchPorts *lanPunchPortSelector,
 	sf *lanSelfFilter, logger *log.Logger,
 ) (*LANDiscoverResult, error) {
 
@@ -678,7 +686,7 @@ func lanResponder(
 				continue
 			}
 			var err error
-			localIP, err = bestLocalIPForRemote(remoteIP)
+			localIP, err = selectLocalIP(remoteIP)
 			if err != nil || localIP == remoteIP {
 				continue
 			}
