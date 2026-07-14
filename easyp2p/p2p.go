@@ -869,10 +869,23 @@ func Easy_P2P(network, sessionUid string, relayConn *RelayPacketConn, logWriter 
 }
 
 func Easy_P2P_MP(ctx context.Context, network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession) (*P2PConnInfo, error) {
-	return Easy_P2P_MPWithOptions(ctx, network, bind, sessionUid, multipathEnabled, relayConn, logWriter, signal, nil)
+	return Easy_P2P_MPWithOptions(ctx, network, sessionUid, EasyP2PMPOptions{
+		Bind:             bind,
+		MultipathEnabled: multipathEnabled,
+		RelayConn:        relayConn,
+		LogWriter:        logWriter,
+		Signal:           signal,
+	})
 }
 
-func Easy_P2P_MPWithOptions(ctx context.Context, network, bind, sessionUid string, multipathEnabled bool, relayConn *RelayPacketConn, logWriter io.Writer, signal *MQTTSignalSession, options *EasyP2PMPOptions) (*P2PConnInfo, error) {
+func Easy_P2P_MPWithOptions(ctx context.Context, network, sessionUid string, options EasyP2PMPOptions) (*P2PConnInfo, error) {
+	options = options.normalized()
+	bind := options.Bind
+	multipathEnabled := options.MultipathEnabled
+	relayConn := options.RelayConn
+	logWriter := options.LogWriter
+	signal := options.Signal
+
 	// --- 1. Determine the ordered list of network protocols to attempt ---
 	networksToTryStun, err := NetworksForStun(network)
 	if err != nil {
@@ -899,7 +912,7 @@ func Easy_P2P_MPWithOptions(ctx context.Context, network, bind, sessionUid strin
 		// If we can't even get the address info, we can't proceed.
 		return nil, fmt.Errorf("failed to exchange address info: %w", err)
 	}
-	if options != nil && options.OnAddressExchangeDone != nil {
+	if options.OnAddressExchangeDone != nil {
 		options.OnAddressExchangeDone()
 	}
 	if cause := context.Cause(ctx); cause != nil {

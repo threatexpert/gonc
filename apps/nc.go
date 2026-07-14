@@ -3429,7 +3429,7 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 	}
 
 	p2pCtx := ncconfig.ctx
-	var p2pOptions *easyp2p.EasyP2PMPOptions
+	p2pOptions := easyp2p.EasyP2PMPOptions{}
 	var candidateToken uint64
 	candidateControlled := candidate != nil && !ncconfig.useLAN
 	extendCandidateWindow := candidateControlled && p2pCandidateHasGuaranteedHandshakeBoundary(ncconfig, cipherSuite)
@@ -3439,10 +3439,8 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 		candidateToken = candidate.arm(cancelCandidate)
 		p2pCtx = candidateCtx
 		if !extendCandidateWindow {
-			p2pOptions = &easyp2p.EasyP2PMPOptions{
-				OnAddressExchangeDone: func() {
-					candidateOwnsPath = candidate.disarm(candidateToken)
-				},
+			p2pOptions.OnAddressExchangeDone = func() {
+				candidateOwnsPath = candidate.disarm(candidateToken)
 			}
 		}
 		defer func() {
@@ -3486,7 +3484,16 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 		}
 
 		//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-		connInfo, err = easyp2p.Easy_P2P_MPWithOptions(p2pCtx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter, mqttSignalSession, p2pOptions)
+		p2pOptions.Bind = ncconfig.localbind
+		p2pOptions.RelayConn = relayConn
+		p2pOptions.LogWriter = ncconfig.LogWriter
+		p2pOptions.Signal = mqttSignalSession
+		connInfo, err = easyp2p.Easy_P2P_MPWithOptions(
+			p2pCtx,
+			ncconfig.network,
+			ncconfig.p2pSessionKey+topicSalt,
+			p2pOptions,
+		)
 		if err != nil {
 			if relayConn != nil {
 				relayConn.Close()
