@@ -437,32 +437,50 @@ func LANDiscoverPassive(ctx context.Context, sessionKey, transportPref string, t
 
 type lanDiscoverWorker func() (*LANDiscoverResult, error)
 
+type lanDiscoverWorkerResult struct {
+	result *LANDiscoverResult
+	err    error
+}
+
 func runLANDiscoverWorkers(ctx context.Context, cancel context.CancelFunc, workers ...lanDiscoverWorker) (*LANDiscoverResult, error) {
-	type workerResult struct {
-		result *LANDiscoverResult
-		err    error
-	}
-	results := make(chan workerResult, len(workers))
+	results := make(chan lanDiscoverWorkerResult, len(workers))
 	for _, worker := range workers {
 		worker := worker
 		go func() {
 			result, err := worker()
-			results <- workerResult{result: result, err: err}
+			results <- lanDiscoverWorkerResult{result: result, err: err}
 		}()
 	}
+	return collectLANDiscoverWorkerResults(ctx, cancel, results, len(workers))
+}
 
+func collectLANDiscoverWorkerResults(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	results <-chan lanDiscoverWorkerResult,
+	workerCount int,
+) (*LANDiscoverResult, error) {
 	defer cancel()
-	for range workers {
+	for i := 0; i < workerCount; i++ {
+		var outcome lanDiscoverWorkerResult
 		select {
-		case outcome := <-results:
-			if outcome.err != nil {
-				return nil, outcome.err
+		case outcome = <-results:
+		default:
+			select {
+			case outcome = <-results:
+			case <-ctx.Done():
+				select {
+				case outcome = <-results:
+				default:
+					return nil, fmt.Errorf("LAN discovery timeout")
+				}
 			}
-			if outcome.result != nil {
-				return outcome.result, nil
-			}
-		case <-ctx.Done():
-			return nil, fmt.Errorf("LAN discovery timeout")
+		}
+		if outcome.err != nil {
+			return nil, outcome.err
+		}
+		if outcome.result != nil {
+			return outcome.result, nil
 		}
 	}
 	return nil, fmt.Errorf("LAN discovery failed")

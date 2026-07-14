@@ -706,6 +706,29 @@ func TestLANDiscoverWorkersReturnAllocationErrorPromptly(t *testing.T) {
 	}
 }
 
+func TestCollectLANDiscoverWorkerResultsPrefersReadyErrorOverCanceledContext(t *testing.T) {
+	sentinel := errors.New("ready worker error")
+	results := make(chan lanDiscoverWorkerResult, 1)
+	results <- lanDiscoverWorkerResult{err: sentinel}
+
+	ctx, cancelContext := context.WithCancel(context.Background())
+	cancelContext()
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+
+	result, err := collectLANDiscoverWorkerResults(ctx, cancelWorkers, results, 1)
+	if result != nil {
+		t.Fatalf("result = %+v, want nil", result)
+	}
+	if err != sentinel {
+		t.Fatalf("error = %v, want exact ready worker error %v", err, sentinel)
+	}
+	select {
+	case <-workerCtx.Done():
+	default:
+		t.Fatal("collector did not cancel workers")
+	}
+}
+
 func TestLANDiscoverDefersPunchPortSelectionUntilPeer(t *testing.T) {
 	for _, passive := range []bool{false, true} {
 		passive := passive
