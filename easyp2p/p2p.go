@@ -841,7 +841,9 @@ type EasyP2PMPOptions struct {
 	Bind             string
 	MultipathEnabled bool
 
-	// RelayConn is caller-owned and is not closed by this API.
+	// RelayConn is an optional caller-provided relay transport. It may back a
+	// returned connection or be closed during traversal cleanup, so callers must
+	// not assume it remains open after this call.
 	RelayConn *RelayPacketConn
 	// LogWriter receives diagnostics. Nil is normalized to io.Discard.
 	LogWriter io.Writer
