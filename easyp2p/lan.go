@@ -198,6 +198,35 @@ func (f *lanSelfFilter) IsSelf(n string) bool {
 	return ok
 }
 
+type lanPunchPortSelector struct {
+	once     sync.Once
+	allocate func() (int, error)
+	logger   *log.Logger
+	port     int
+	err      error
+}
+
+func newLanPunchPortSelector(allocate func() (int, error), logger *log.Logger) *lanPunchPortSelector {
+	if allocate == nil {
+		allocate = GetFreePort
+	}
+	return &lanPunchPortSelector{allocate: allocate, logger: logger}
+}
+
+func (s *lanPunchPortSelector) Get() (int, error) {
+	s.once.Do(func() {
+		s.port, s.err = s.allocate()
+		if s.err != nil {
+			s.err = fmt.Errorf("allocate LAN punch port: %w", s.err)
+			return
+		}
+		if s.logger != nil {
+			s.logger.Printf("Selected punchPort=%d after authenticated peer discovery\n", s.port)
+		}
+	})
+	return s.port, s.err
+}
+
 // ============================================================================
 // 组播网络层
 // ============================================================================

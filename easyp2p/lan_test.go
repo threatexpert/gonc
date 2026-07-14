@@ -1,11 +1,17 @@
 package easyp2p
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -84,6 +90,75 @@ func TestSelfFilter(t *testing.T) {
 	f.Add("a")
 	if !f.IsSelf("a") { t.Fatal("should") }
 	if f.IsSelf("b") { t.Fatal("b") }
+}
+
+func TestLanPunchPortSelectorIsLazyAndShared(t *testing.T) {
+	var calls atomic.Int32
+	var output bytes.Buffer
+	selector := newLanPunchPortSelector(func() (int, error) {
+		calls.Add(1)
+		return 42042, nil
+	}, log.New(&output, "[LAN] ", 0))
+
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("allocator called during construction: %d", got)
+	}
+
+	const workers = 32
+	ports := make(chan int, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			port, err := selector.Get()
+			ports <- port
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(ports)
+	close(errs)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("allocator calls = %d, want 1", got)
+	}
+	for port := range ports {
+		if port != 42042 {
+			t.Fatalf("port = %d, want 42042", port)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Get returned error: %v", err)
+		}
+	}
+	if got := strings.Count(output.String(), "Selected punchPort=42042 after authenticated peer discovery"); got != 1 {
+		t.Fatalf("selection log count = %d, output = %q", got, output.String())
+	}
+}
+
+func TestLanPunchPortSelectorSharesAllocationError(t *testing.T) {
+	sentinel := errors.New("no test port")
+	var calls atomic.Int32
+	selector := newLanPunchPortSelector(func() (int, error) {
+		calls.Add(1)
+		return 0, sentinel
+	}, log.New(&bytes.Buffer{}, "", 0))
+
+	for i := 0; i < 2; i++ {
+		port, err := selector.Get()
+		if port != 0 {
+			t.Fatalf("port = %d, want 0", port)
+		}
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("error = %v, want wrapped sentinel", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("allocator calls = %d, want 1", got)
+	}
 }
 
 func TestBestLocalIP(t *testing.T) {
