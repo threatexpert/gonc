@@ -252,6 +252,10 @@ type lanMessenger interface {
 }
 
 func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
+	return newLanMcastWithInterfaces(net.Interfaces, loggers...)
+}
+
+func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
 	gip := net.ParseIP(LANMulticastIP)
 	dst := &net.UDPAddr{IP: gip, Port: LANMulticastPort}
 	var logger *log.Logger
@@ -265,7 +269,7 @@ func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
 	}
 	p := ipv4.NewPacketConn(c)
 
-	ifaces, enumErr := net.Interfaces()
+	ifaces, enumErr := listInterfaces()
 	var good []lanMcastIface
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
@@ -278,6 +282,15 @@ func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
 			good = append(good, lanMcastIface{iface: iface})
 		} else if logger != nil {
 			logger.Printf("WARN: multicast join on %s failed: %v\n", iface.Name, err)
+		}
+	}
+	if len(good) == 0 {
+		if err := p.JoinGroup(nil, &net.UDPAddr{IP: gip}); err != nil {
+			_ = c.Close()
+			if enumErr != nil {
+				return nil, fmt.Errorf("join multicast group on system interface after interface enumeration failed (%v): %w", enumErr, err)
+			}
+			return nil, fmt.Errorf("join multicast group on system interface: %w", err)
 		}
 	}
 	p.SetMulticastLoopback(true)
@@ -329,11 +342,11 @@ func (mc *lanMcast) broadcastAndSendTo(data []byte, dst net.Addr) {
 
 func (mc *lanMcast) ifaceSummary() string {
 	if len(mc.ifaces) == 0 {
-		summary := "none"
+		summary := "system-default"
 		if mc.enumErr != nil {
 			summary += fmt.Sprintf(" (enumErr=%v)", mc.enumErr)
 		}
-		return summary + " (fallback=239.255.255.250)"
+		return summary
 	}
 	parts := make([]string, 0, len(mc.ifaces))
 	for _, iface := range mc.ifaces {
