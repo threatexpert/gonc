@@ -3168,7 +3168,7 @@ func handleSingleConnection(console net.Conn, ncconfig *AppNetcatConfig, conn ne
 }
 
 func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.NegotiationConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
-	nconn, err := secure.DoNegotiationContext(ncconfig.ctx, cfg, conn, ncconfig.LogWriter)
+	nconn, err := secure.DoNegotiationContext(ncconfig.ctx, cfg, conn, ncconfig.Logger)
 	if err != nil {
 		conn.Close()
 		fmt.Fprintf(ncconfig.LogWriter, "%sError: %v\n", cfg.Label, err)
@@ -3613,7 +3613,7 @@ func p2pSecureNegotiation(ncconfig *AppNetcatConfig, connInfo *easyp2p.P2PConnIn
 		return nil, fmt.Errorf("unsupported cipher suite: %s", cipherSuite)
 	}
 
-	return secure.DoNegotiationContext(ncconfig.ctx, &config, conn, ncconfig.LogWriter)
+	return secure.DoNegotiationContext(ncconfig.ctx, &config, conn, ncconfig.Logger)
 }
 
 func do_P2P_multipath(ncconfig *AppNetcatConfig, enableMP bool) (*secure.NegotiatedConn, error) {

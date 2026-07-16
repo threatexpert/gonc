@@ -64,6 +64,7 @@ type MQTTSignalSession struct {
 	subscribed    map[string]map[int]struct{}
 	loggedSubs    map[string]struct{}
 	waiters       map[string]map[*mqttSignalWaiter]struct{}
+	pending       map[string]mqttSignalRecvPayload
 	closed        bool
 }
 
@@ -95,6 +96,7 @@ func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID,
 		subscribed:    make(map[string]map[int]struct{}),
 		loggedSubs:    make(map[string]struct{}),
 		waiters:       make(map[string]map[*mqttSignalWaiter]struct{}),
+		pending:       make(map[string]mqttSignalRecvPayload),
 	}
 
 	ready := make(chan struct{}, 1)
@@ -348,7 +350,13 @@ func (s *MQTTSignalSession) addWaiter(topic string, waiter *mqttSignalWaiter) fu
 		s.waiters[topic] = make(map[*mqttSignalWaiter]struct{})
 	}
 	s.waiters[topic][waiter] = struct{}{}
+	pending, hasPending := s.pending[topic]
+	delete(s.pending, topic)
 	s.mu.Unlock()
+
+	if hasPending {
+		s.deliverMessage(waiter, topic, pending.index, pending.data)
+	}
 
 	return func() {
 		s.mu.Lock()
@@ -369,29 +377,41 @@ func (s *MQTTSignalSession) dispatchMessage(topic string, index int, data string
 	for waiter := range waitersMap {
 		waiters = append(waiters, waiter)
 	}
+	if len(waiters) == 0 {
+		if s.pending == nil {
+			s.pending = make(map[string]mqttSignalRecvPayload)
+		}
+		s.pending[topic] = mqttSignalRecvPayload{data: data, index: index}
+		s.mu.Unlock()
+		return
+	}
 	s.mu.Unlock()
 
 	for _, waiter := range waiters {
-		if data == waiter.selfPayload {
-			continue
-		}
-		if waiter.handler != nil {
-			ok, err := waiter.handler(data)
-			if err != nil {
-				select {
-				case waiter.errCh <- fmt.Errorf("handling message error from broker %d: %w", index, err):
-				default:
-				}
-				continue
+		s.deliverMessage(waiter, topic, index, data)
+	}
+}
+
+func (s *MQTTSignalSession) deliverMessage(waiter *mqttSignalWaiter, topic string, index int, data string) {
+	if data == waiter.selfPayload {
+		return
+	}
+	if waiter.handler != nil {
+		ok, err := waiter.handler(data)
+		if err != nil {
+			select {
+			case waiter.errCh <- fmt.Errorf("handling message error from broker %d on topic %s: %w", index, topic, err):
+			default:
 			}
-			if !ok {
-				continue
-			}
+			return
 		}
-		select {
-		case waiter.recvCh <- mqttSignalRecvPayload{data: data, index: index}:
-		default:
+		if !ok {
+			return
 		}
+	}
+	select {
+	case waiter.recvCh <- mqttSignalRecvPayload{data: data, index: index}:
+	default:
 	}
 }
 
@@ -481,7 +501,7 @@ func (s *MQTTSignalSession) publishPreferred(topic string, qos byte, payload str
 	return success
 }
 
-func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), preferredBrokerIndex int) (recvData string, recvIndex int, keepAlive bool, err error) {
+func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), preferredBrokerIndex int) (recvData string, recvIndex int, keepAlive bool, err error) {
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	parentCtx := ctx

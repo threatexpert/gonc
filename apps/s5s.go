@@ -259,7 +259,7 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 	}
 
 	// 5. 执行安全协商 (加密握手)
-	nconnR, err := secure.DoNegotiation(ncconfig.connConfig, connR, ncconfig.LogWriter)
+	nconnR, err := secure.DoNegotiationContext(ncconfig.ctx, ncconfig.connConfig, connR, ncconfig.Logger)
 	if err != nil {
 		return 1
 	}

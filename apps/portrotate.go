@@ -163,7 +163,7 @@ func App_PortRotate_main_withconfig(controlConn net.Conn, nconnConfig *secure.Ne
 		secureConfig.SecureLayer = "dtls"
 	}
 
-	secureDataSess, err := secure.DoNegotiation(&secureConfig, bridge.B, ncconfig.LogWriter)
+	secureDataSess, err := secure.DoNegotiationContext(ncconfig.ctx, &secureConfig, bridge.B, config.Logger)
 	if err != nil {
 		config.Logger.Printf("DoNegotiation failed: %v", err)
 		controlConn.Close()

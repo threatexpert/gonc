@@ -5,10 +5,34 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"testing"
 	"time"
 )
+
+func TestDoNegotiationContextUsesProvidedLogger(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	cfg := NewNegotiationConfig()
+	cfg.SecureLayer = "ss"
+	cfg.KeyType = "PSK"
+	cfg.Key = "test-key"
+
+	var output bytes.Buffer
+	logger := log.New(&output, "[SECURE] ", 0)
+	nconn, err := DoNegotiationContext(context.Background(), cfg, local, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nconn.Close()
+
+	want := "[SECURE] Communication(Stream) is encrypted(PSK) with AES.\n"
+	if got := output.String(); got != want {
+		t.Fatalf("negotiation log = %q, want %q", got, want)
+	}
+}
 
 func TestDoNegotiationContextCancelsTLSHandshake(t *testing.T) {
 	local, peer := net.Pipe()
@@ -20,7 +44,7 @@ func TestDoNegotiationContextCancelsTLSHandshake(t *testing.T) {
 		cfg := NewNegotiationConfig()
 		cfg.IsClient = true
 		cfg.SecureLayer = "tls13"
-		_, err := DoNegotiationContext(ctx, cfg, local, io.Discard)
+		_, err := DoNegotiationContext(ctx, cfg, local, nil)
 		result <- err
 	}()
 
@@ -58,7 +82,7 @@ func TestDoNegotiationContextPreservesHandshakeError(t *testing.T) {
 	cfg := NewNegotiationConfig()
 	cfg.IsClient = true
 	cfg.SecureLayer = "tls13"
-	_, err := DoNegotiationContext(context.Background(), cfg, local, io.Discard)
+	_, err := DoNegotiationContext(context.Background(), cfg, local, nil)
 	if err == nil {
 		t.Fatal("expected TLS handshake failure")
 	}
@@ -74,7 +98,7 @@ func TestDoNegotiationContextLeavesEstablishedConnectionOpen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cfg := NewNegotiationConfig()
 
-	nconn, err := DoNegotiationContext(ctx, cfg, local, io.Discard)
+	nconn, err := DoNegotiationContext(ctx, cfg, local, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +196,7 @@ func TestDoNegotiationContextCancelsDTLSHandshake(t *testing.T) {
 		cfg := NewNegotiationConfig()
 		cfg.IsClient = true
 		cfg.SecureLayer = "dtls"
-		_, err := DoNegotiationContext(ctx, cfg, local, io.Discard)
+		_, err := DoNegotiationContext(ctx, cfg, local, nil)
 		result <- err
 	}()
 
@@ -213,7 +237,7 @@ func TestDoNegotiationContextKCPHandshakeUsesFullTimeout(t *testing.T) {
 	cfg.ReadIdleTimeoutSecond = 1
 
 	started := time.Now()
-	_, err = DoNegotiationContext(context.Background(), cfg, local, io.Discard)
+	_, err = DoNegotiationContext(context.Background(), cfg, local, nil)
 	elapsed := time.Since(started)
 	if err == nil {
 		t.Fatal("expected KCP handshake timeout")
@@ -247,7 +271,7 @@ func TestDoNegotiationContextCancelsKCPHandshake(t *testing.T) {
 		cfg := NewNegotiationConfig()
 		cfg.IsClient = true
 		cfg.KcpWithUDP = true
-		_, err := DoNegotiationContext(ctx, cfg, local, io.Discard)
+		_, err := DoNegotiationContext(ctx, cfg, local, nil)
 		result <- err
 	}()
 

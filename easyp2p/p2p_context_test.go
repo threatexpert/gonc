@@ -39,7 +39,7 @@ func TestMQTTSignalExchangePreservesParentCancelCause(t *testing.T) {
 	cancel(want)
 
 	signal := &MQTTSignalSession{}
-	_, _, _, err := signal.exchange(ctx, EXMODE_waitOnly, "", "", "", "", time.Second, nil, mqttNoPreferredBroker)
+	_, _, _, err := signal.exchange(ctx, EXMODE_waitOnly, "", "", "", time.Second, nil, mqttNoPreferredBroker)
 	if !errors.Is(err, want) {
 		t.Fatalf("MQTT exchange error = %v, want cancellation cause", err)
 	}

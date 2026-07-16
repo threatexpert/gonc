@@ -110,6 +110,17 @@ func IsUnRetryable(err error) bool {
 	return err != nil && errors.As(err, &target)
 }
 
+func p2pLogger(logWriter io.Writer) *log.Logger {
+	if logWriter == nil {
+		logWriter = io.Discard
+	}
+	return misc.NewLog(logWriter, "[P2P] ", log.LstdFlags|log.Lmsgprefix)
+}
+
+func p2pLogf(logWriter io.Writer, format string, args ...any) {
+	p2pLogger(logWriter).Printf(format, args...)
+}
+
 func encryptAES(key, plaintext []byte) (*securePayload, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -194,7 +205,7 @@ var (
 	exmodePublishOnly int = 2
 )
 
-func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSignalSession, exmode int, sendData any, topicCID, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
+func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSignalSession, exmode int, sendData any, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
 	var zero T
 	if signal == nil {
 		return zero, -1, fmt.Errorf("nil MQTT signal session")
@@ -234,7 +245,7 @@ func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSign
 		return true, nil
 	}
 
-	remoteInfoRaw, srvIndex, _, err := signal.exchange(ctx, exmode, string(encPayloadBytes), topicCID, topicSalt, sessionUid, timeout, msgHandler, mqttNoPreferredBroker)
+	remoteInfoRaw, srvIndex, _, err := signal.exchange(ctx, exmode, string(encPayloadBytes), topicSalt, sessionUid, timeout, msgHandler, mqttNoPreferredBroker)
 	if err != nil {
 		return zero, srvIndex, err
 	}
@@ -242,7 +253,7 @@ func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSign
 	return remotePayload, srvIndex, err
 }
 
-func mqttSecurePublishWithSession(ctx context.Context, signal *MQTTSignalSession, sendData any, topicCID, topicSalt, sessionUid string, timeout time.Duration, preferredBrokerIndex int) (int, error) {
+func mqttSecurePublishWithSession(ctx context.Context, signal *MQTTSignalSession, sendData any, topicSalt, sessionUid string, timeout time.Duration, preferredBrokerIndex int) (int, error) {
 	if signal == nil {
 		return -1, fmt.Errorf("nil MQTT signal session")
 	}
@@ -251,7 +262,7 @@ func mqttSecurePublishWithSession(ctx context.Context, signal *MQTTSignalSession
 	encPayload, _ := encryptAES(myKey[:], infoBytes)
 	encPayloadBytes, _ := json.Marshal(encPayload)
 
-	_, srvIndex, _, err := signal.exchange(ctx, exmodePublishOnly, string(encPayloadBytes), topicCID, topicSalt, sessionUid, timeout, nil, preferredBrokerIndex)
+	_, srvIndex, _, err := signal.exchange(ctx, exmodePublishOnly, string(encPayloadBytes), topicSalt, sessionUid, timeout, nil, preferredBrokerIndex)
 	return srvIndex, err
 }
 
@@ -307,7 +318,7 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 	var allResults, directResults, relayResults []*STUNResult
 	var err error
 
-	fmt.Fprintf(logWriter, "    Getting local public IP info via %d STUN servers...\n", len(STUNServers))
+	p2pLogf(logWriter, "    Getting local public IP info via %d STUN servers...\n", len(STUNServers))
 
 	if relayConn == nil || !relayConn.FallbackMode {
 		// 单轮 STUN 探测（无 relay 或直接使用 relay）
@@ -318,9 +329,9 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 		}
 		allResults = append(directResults, relayResults...)
 		if err != nil {
-			fmt.Fprintf(logWriter, "    Failed to get public IP info: %v\n", err)
+			p2pLogf(logWriter, "    Failed to get public IP info: %v\n", err)
 		} else {
-			fmt.Fprintf(logWriter, "    Received %d STUN responses\n", succeededSTUNResults(allResults))
+			p2pLogf(logWriter, "    Received %d STUN responses\n", succeededSTUNResults(allResults))
 		}
 	} else {
 		// Fallback 模式，尝试两轮：先直连STUN获取地址信息，再走 relay获取地址信息
@@ -331,9 +342,9 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 		// 合并
 		allResults = append(directResults, relayResults...)
 		if len(allResults) == 0 && err != nil {
-			fmt.Fprintf(logWriter, "    Failed to get public IP info: %v\n", err)
+			p2pLogf(logWriter, "    Failed to get public IP info: %v\n", err)
 		} else {
-			fmt.Fprintf(logWriter, "    Received %d STUN responses\n", succeededSTUNResults(allResults))
+			p2pLogf(logWriter, "    Received %d STUN responses\n", succeededSTUNResults(allResults))
 			err = nil
 		}
 	}
@@ -434,12 +445,11 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		return nil, nil, cause
 	}
 
-	fmt.Fprintf(logWriter, "    Exchanging address info with peer via %d MQTT servers...\n", len(MQTTBrokerServers))
-	topicCID := MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0)
+	p2pLogf(logWriter, "    Exchanging address info with peer via %d MQTT servers...\n", len(MQTTBrokerServers))
 	var remotePayload exchangeAddressPayload
 	var srvIndex int
 	remotePayload, srvIndex, err = MQTT_SecureExchangeWithSession[exchangeAddressPayload](
-		ctx, signal, EXMODE_mutual, myInfoForExchange, topicCID, "gonc-exchange-address", sessionUid, timeout, nil)
+		ctx, signal, EXMODE_mutual, myInfoForExchange, "gonc-exchange-address", sessionUid, timeout, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -449,7 +459,7 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 	}
 
 	brokerServer, _, _ := ParseMQTTServerV3(MQTTBrokerServers[srvIndex])
-	fmt.Fprintf(logWriter, "    Peer address exchanged via %s\n", brokerServer)
+	p2pLogf(logWriter, "    Peer address exchanged via %s\n", brokerServer)
 
 	addressesPrint(logWriter, remotePayload.Addresses)
 
@@ -627,9 +637,9 @@ func addressesPrint(logWriter io.Writer, Addresses []PunchingAddressInfo) {
 		lan := info.Lan
 		nat := info.Nat
 		if lan == nat {
-			fmt.Fprintf(logWriter, "      %-5s: %s (%s)\n", net, nat, nattype)
+			p2pLogf(logWriter, "      %-5s: %s (%s)\n", net, nat, nattype)
 		} else {
-			fmt.Fprintf(logWriter, "      %-5s: LAN=%s | NAT=%s (%s)\n", net, lan, nat, nattype)
+			p2pLogf(logWriter, "      %-5s: LAN=%s | NAT=%s (%s)\n", net, lan, nat, nattype)
 		}
 	}
 }
@@ -771,16 +781,16 @@ func SelectRole(p2pInfo *P2PAddressInfo, sessCtx *P2PSessionContext) bool {
 }
 
 func p2pInfoPrint(logWriter io.Writer, p2pInfo *P2PAddressInfo) {
-	fmt.Fprintf(logWriter, "  - %-14s: %s\n", "Network", p2pInfo.Network)
+	p2pLogf(logWriter, "  - %-14s: %s\n", "Network", p2pInfo.Network)
 	if p2pInfo.LocalLAN == p2pInfo.LocalNAT {
-		fmt.Fprintf(logWriter, "  - %-14s: %s (NAT-%s)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNATType)
+		p2pLogf(logWriter, "  - %-14s: %s (NAT-%s)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNATType)
 	} else {
-		fmt.Fprintf(logWriter, "  - %-14s: %s (LAN) / %s (NAT-%s)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT, p2pInfo.LocalNATType)
+		p2pLogf(logWriter, "  - %-14s: %s (LAN) / %s (NAT-%s)\n", "Local Address", p2pInfo.LocalLAN, p2pInfo.LocalNAT, p2pInfo.LocalNATType)
 	}
 	if p2pInfo.RemoteLAN == p2pInfo.RemoteNAT {
-		fmt.Fprintf(logWriter, "  - %-14s: %s (NAT-%s)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNATType)
+		p2pLogf(logWriter, "  - %-14s: %s (NAT-%s)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNATType)
 	} else {
-		fmt.Fprintf(logWriter, "  - %-14s: %s (LAN) / %s (NAT-%s)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT, p2pInfo.RemoteNATType)
+		p2pLogf(logWriter, "  - %-14s: %s (LAN) / %s (NAT-%s)\n", "Remote Address", p2pInfo.RemoteLAN, p2pInfo.RemoteNAT, p2pInfo.RemoteNATType)
 	}
 }
 
@@ -894,7 +904,7 @@ func Easy_P2P_MPWithOptions(ctx context.Context, network, sessionUid string, opt
 		return nil, err
 	}
 
-	fmt.Fprintf(logWriter, "=== Checking NAT reachability ===\n")
+	p2pLogf(logWriter, "=== Checking NAT reachability ===\n")
 
 	if signal == nil {
 		localBindIP := ""
@@ -991,7 +1001,7 @@ func Easy_P2P_MPWithOptions(ctx context.Context, network, sessionUid string, opt
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		fmt.Fprintf(logWriter, "ERROR: %v\n", err)
+		p2pLogf(logWriter, "ERROR: %v\n", err)
 		if IsUnRetryable(err) || round >= maxRounds {
 			break
 		}
@@ -1052,7 +1062,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	)
 	punchPayload := []byte(deriveKeyForPayload(sessionUid, true))
 
-	fmt.Fprintf(logWriter, "=== Trying P2P Connection ===\n")
+	p2pLogf(logWriter, "=== Trying P2P Connection ===\n")
 
 	isClient = SelectRole(p2pInfo, sessCtx)
 
@@ -1160,16 +1170,16 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	// 打印详细连接信息
 	p2pInfoPrint(logWriter, p2pInfo)
-	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
+	p2pLogf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 	if isClient {
-		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start immediately)\n", "Client Mode")
+		p2pLogf(logWriter, "  - %-14s: sending PING every 1s (start immediately)\n", "Client Mode")
 	} else {
-		fmt.Fprintf(logWriter, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
+		p2pLogf(logWriter, "  - %-14s: sending PING every 1s (start after 2s)\n", "Server Mode")
 	}
 	if udpLANProbeAddr != "" {
-		fmt.Fprintf(logWriter, "  - %-14s: enabled (target: %s)\n", "LAN Probe", udpLANProbeAddr)
+		p2pLogf(logWriter, "  - %-14s: enabled (target: %s)\n", "LAN Probe", udpLANProbeAddr)
 	}
-	fmt.Fprintf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
+	p2pLogf(logWriter, "  - %-14s: %ds\n", "Timeout", count)
 
 	ctxRound, cancel := context.WithTimeout(ctx, time.Duration(count)*time.Second)
 	ctxStopPunching, stopPunching := context.WithCancel(ctxRound)
@@ -1235,7 +1245,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					if _, ok := uconn.(*net.UDPConn); ok {
 						//ErrPermission可能是对方先发过来打洞包被macos防火墙拦住了，现在防火墙限制这个udp socket主动向对端这个地址发包了。
 						var uconnR net.PacketConn
-						fmt.Fprintf(logWriter, "UDP sendto permission denied; try rebinding...\n")
+						p2pLogf(logWriter, "UDP sendto permission denied; try rebinding...\n")
 						uconnR, err = buconn.Rebuild() //尝试关闭socket，重新创建，并立刻主动发包打通防火墙
 						if err != nil {
 							//无法重建socket，标志forceRebind，后续用dial+reuseport，本地地址用全零的方式重建
@@ -1284,7 +1294,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			if udpLANProbeAddr != "" {
 				addrCount++
 			}
-			fmt.Fprintf(logWriter, "  ↑ Sent PING(TTL=%d) to %d IP (%d)\n", ttl, addrCount, i+1)
+			p2pLogf(logWriter, "  ↑ Sent PING(TTL=%d) to %d IP (%d)\n", ttl, addrCount, i+1)
 			return true
 		}
 
@@ -1308,7 +1318,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 					randDstPorts := generateRandomPorts(PunchingRandomPortCount)
 					netx.SetUDPTTL(uconn, ttl)
 					totalSent := PunchingRandomPortCount * len(remoteNatIPs)
-					fmt.Fprintf(logWriter, "  ↑ Sending Random Dst Ports hole-punching packets to %d IP. TTL=%d; total=%d\n", len(remoteNatIPs), ttl, totalSent)
+					p2pLogf(logWriter, "  ↑ Sending Random Dst Ports hole-punching packets to %d IP. TTL=%d; total=%d\n", len(remoteNatIPs), ttl, totalSent)
 					for _, rIP := range remoteNatIPs {
 						for i := 0; i < PunchingRandomPortCount; i++ {
 							addrStr := net.JoinHostPort(rIP, strconv.Itoa(randDstPorts[i]))
@@ -1329,7 +1339,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			var wg sync.WaitGroup
 
 			totalSent := PunchingRandomPortCount * (1 + len(p2pInfo.RemoteUDP4NATAlternative))
-			fmt.Fprintf(logWriter, "  ↑ Sending Random Src Ports hole-punching packets to %d IP. TTL=%d; total=%d\n", 1+len(p2pInfo.RemoteUDP4NATAlternative), ttl, totalSent)
+			p2pLogf(logWriter, "  ↑ Sending Random Src Ports hole-punching packets to %d IP. TTL=%d; total=%d\n", 1+len(p2pInfo.RemoteUDP4NATAlternative), ttl, totalSent)
 
 			randSrcPorts := generateRandomPorts(PunchingRandomPortCount + 50)
 
@@ -1460,7 +1470,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 				// 向远端主地址发包
 				newConn.WriteToUDP(punchPayload, remoteUDPAddr)
 
-				fmt.Fprintf(logWriter, "  ↑ Sent PING to relay using new fresh src port: %s (%d)\n", newConn.LocalAddr(), i+1)
+				p2pLogf(logWriter, "  ↑ Sent PING to relay using new fresh src port: %s (%d)\n", newConn.LocalAddr(), i+1)
 
 				// 开启监听，独立运行，不阻塞当前的循环
 				go func(c *net.UDPConn) {
@@ -1524,7 +1534,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			}()
 
 			// relay是在公网，可直接接收punchPayload，不主动给对方NAT发包（避免触发对方NAT防火墙规则）
-			fmt.Fprintf(logWriter, "  Receiving punch packets from relay server...\n")
+			p2pLogf(logWriter, "  Receiving punch packets from relay server...\n")
 			return
 		}
 
@@ -1588,9 +1598,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			break
 		}
 		if relayMode {
-			fmt.Fprintf(logWriter, "UDP relay connection established (RSP)!\n")
+			p2pLogf(logWriter, "UDP relay connection established (RSP)!\n")
 		} else {
-			fmt.Fprintf(logWriter, "P2P(UDP) connection established (RSP)!\n")
+			p2pLogf(logWriter, "P2P(UDP) connection established (RSP)!\n")
 		}
 		buconn.Close()
 		if isSharedUDPConn {
@@ -1611,9 +1621,9 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			break
 		}
 		if relayMode {
-			fmt.Fprintf(logWriter, "UDP relay connection established!\n")
+			p2pLogf(logWriter, "UDP relay connection established!\n")
 		} else {
-			fmt.Fprintf(logWriter, "P2P(UDP) connection established!\n")
+			p2pLogf(logWriter, "P2P(UDP) connection established!\n")
 		}
 		laddr := uconn.LocalAddr()
 		raddr := buconn.RemoteAddr()
@@ -1709,13 +1719,12 @@ func Mqtt_P2P_Round_Sync(ctx context.Context, sessionUid string, sessCtx *P2PSes
 		return msg == msgNeed, nil
 	}
 
-	fmt.Fprintf(logWriter, "    Exchanging sync message for P2P round %d ...\n", round)
-	topicCID := MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0)
+	p2pLogf(logWriter, "    Exchanging sync message for P2P round %d ...\n", round)
 	if sessCtx == nil || sessCtx.MQTTSignal == nil {
 		return fmt.Errorf("missing MQTT signal session")
 	}
 	msgRecv, _, err := MQTT_SecureExchangeWithSession(
-		ctx, sessCtx.MQTTSignal, EXMODE_mutual, msgSend, topicCID, "gonc-exchange-sync", sessionUid, timeout, filter)
+		ctx, sessCtx.MQTTSignal, EXMODE_mutual, msgSend, "gonc-exchange-sync", sessionUid, timeout, filter)
 	if err != nil {
 		return fmt.Errorf("failed to exchange sync message: %v", err)
 	}
@@ -1733,7 +1742,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		MaxWorkers = 800 // 控制并发量，避免过多文件描述符
 	)
 
-	fmt.Fprintf(logWriter, "=== Trying P2P Connection ===\n")
+	p2pLogf(logWriter, "=== Trying P2P Connection ===\n")
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -1873,19 +1882,19 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	// [新增] 日志显示 LAN 探测状态
 	if lanProbeEnabled {
 		if p2pInfo.LANProbeOnly {
-			fmt.Fprintf(logWriter, "  - %-14s: enabled (LAN probe only mode)\n", "LAN Probe")
+			p2pLogf(logWriter, "  - %-14s: enabled (LAN probe only mode)\n", "LAN Probe")
 		} else {
-			fmt.Fprintf(logWriter, "  - %-14s: enabled\n", "LAN Probe")
+			p2pLogf(logWriter, "  - %-14s: enabled\n", "LAN Probe")
 		}
 	}
-	fmt.Fprintf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
+	p2pLogf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 	if isClient {
-		fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
+		p2pLogf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
 	} else {
 		if p2pInfo.LANProbeOnly {
-			fmt.Fprintf(logWriter, "  - %-14s: connect start immediately\n", "Passive Mode")
+			p2pLogf(logWriter, "  - %-14s: connect start immediately\n", "Passive Mode")
 		} else {
-			fmt.Fprintf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
+			p2pLogf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
 		}
 	}
 
@@ -2058,13 +2067,13 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			default:
 			}
 			remoteLANAddr := p2pInfo.RemoteLAN
-			fmt.Fprintf(logWriter, "  ↑ LAN probe: trying direct connect to peer LAN address %s ...\n", remoteLANAddr)
+			p2pLogf(logWriter, "  ↑ LAN probe: trying direct connect to peer LAN address %s ...\n", remoteLANAddr)
 			workerChan <- struct{}{} // Acquire worker slot
 			wg.Add(1)
 			go func() {
 				success := tryConnect(remoteLANAddr, localAddr, true, 3, isClient, "lan-probe")
 				if success {
-					fmt.Fprintf(logWriter, "  ✓ LAN probe: direct LAN connection succeeded!\n")
+					p2pLogf(logWriter, "  ✓ LAN probe: direct LAN connection succeeded!\n")
 				}
 			}()
 
@@ -2091,7 +2100,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			}
 			workerChan <- struct{}{}
 			wg.Add(1)
-			fmt.Fprintf(logWriter, "  ↑ Trying direct dial to peer...\n")
+			p2pLogf(logWriter, "  ↑ Trying direct dial to peer...\n")
 			if tryConnect(remoteAddr, localAddr, true, timeoutPerconn, isClient, "dial") {
 				return
 			}
@@ -2119,7 +2128,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			// Try random destination ports if needed
 			if randomDstPort {
 				randDstPorts := generateRandomPorts(PunchingRandomPortCount)
-				fmt.Fprintf(logWriter, "  ↑ Trying %d Random Destination Ports concurrently...\n", len(randDstPorts))
+				p2pLogf(logWriter, "  ↑ Trying %d Random Destination Ports concurrently...\n", len(randDstPorts))
 				for _, port := range randDstPorts {
 					if port == origRemotePortInt {
 						//避开原来与STUN通讯的端口
@@ -2139,7 +2148,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			// Try random source ports if needed
 			if randomSrcPort {
 				randSrcPorts := generateRandomPorts(PunchingRandomPortCount)
-				fmt.Fprintf(logWriter, "  ↑ Trying %d Random Source Ports concurrently...\n", PunchingRandomPortCount)
+				p2pLogf(logWriter, "  ↑ Trying %d Random Source Ports concurrently...\n", PunchingRandomPortCount)
 				for _, port := range randSrcPorts {
 					if port == origLocalPort {
 						//避开原来与STUN通讯的端口
@@ -2206,7 +2215,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 		conn := connInfo.Conn    // 获取实际的连接对象
 		connType := connInfo.Tag // 获取连接类型描述
-		fmt.Fprintf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
+		p2pLogf(logWriter, "P2P(TCP) connection established (%s)!\n", connType)
 		return conn, isClient, nil
 	case errCh := <-errChan:
 		if err := parentCtx.Err(); err != nil {
@@ -2235,11 +2244,11 @@ func MqttWaitSession(ctx context.Context, sessionUid, localIP string, timeout ti
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
-	topicCID := MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0)
+	clientID := MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0)
 	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
 	logger.Printf("Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
 
-	signal, err := NewMQTTSignalSession(ctx, topicCID, localIP, logWriter)
+	signal, err := NewMQTTSignalSession(ctx, clientID, localIP, logWriter)
 	if err != nil {
 		return "", nil, err
 	}
@@ -2252,7 +2261,7 @@ func MqttWaitSession(ctx context.Context, sessionUid, localIP string, timeout ti
 		return true, nil
 	}
 
-	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(ctx, signal, EXMODE_waitOnly, "", topicCID, topicSalt, sessionUid, timeout, filterSYN)
+	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(ctx, signal, EXMODE_waitOnly, "", topicSalt, sessionUid, timeout, filterSYN)
 	if err != nil {
 		signal.Close()
 		return "", nil, err
@@ -2267,7 +2276,7 @@ func MqttWaitSession(ctx context.Context, sessionUid, localIP string, timeout ti
 	msgACK := "ACK@" + tid
 
 	logger.Printf("Publishing ACK for message(%s) on topic: %s across %d servers\n", recvData, topic, len(MQTTBrokerServers))
-	_, err = mqttSecurePublishWithSession(ctx, signal, msgACK, topicCID, topicSalt, sessionUid, 15*time.Second, srvIndex)
+	_, err = mqttSecurePublishWithSession(ctx, signal, msgACK, topicSalt, sessionUid, 15*time.Second, srvIndex)
 	if err != nil {
 		signal.Close()
 		return "", nil, err
@@ -2402,11 +2411,11 @@ func MQTTHelloSession(ctx context.Context, sessionUid, localIP string, helloPayl
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
-	topicCID := MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0)
+	clientID := MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0)
 	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
 	logger.Printf("Pushing Hello to topic %s across %d servers\n", topic, len(MQTTBrokerServers))
 
-	signal, err := NewMQTTSignalSession(ctx, topicCID, localIP, logWriter)
+	signal, err := NewMQTTSignalSession(ctx, clientID, localIP, logWriter)
 	if err != nil {
 		return "", nil, err
 	}
@@ -2427,7 +2436,7 @@ func MQTTHelloSession(ctx context.Context, sessionUid, localIP string, helloPayl
 		return true, nil
 	}
 
-	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(ctx, signal, EXMODE_mutual, msgSYN, topicCID, topicSalt, sessionUid, timeout, filterACK)
+	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(ctx, signal, EXMODE_mutual, msgSYN, topicSalt, sessionUid, timeout, filterACK)
 	if err != nil {
 		signal.Close()
 		return "", nil, err
