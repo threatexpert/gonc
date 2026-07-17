@@ -8,6 +8,10 @@
 
 **Tech Stack:** Go 1.25, standard `testing` package, existing `netx.WaitContext` cancellation helper.
 
+## Final Review Amendment
+
+The original delayed-listener test in Steps 5, 6, and 8 observed a log emitted before `DialContext`, so its fixed 100-millisecond sleep did not causally prove that a failed first dial occurred. Those test instructions are superseded by two deterministic real-TCP regressions: one listener resets the first outbound candidate and completes the second to prove retry and its 250-millisecond interval; a separate test resets the first inbound candidate and completes the second to prove Accept remains active. Final review also requires same-LAN candidate failures not to override another committing candidate, validates an accepted peer before its handshake can consume selection, and replaces the Server-side `sync.Once` selector with commit-after-success selection so a failed ACK write does not poison later retries.
+
 ## Global Constraints
 
 - Apply the behavior only to TCP traversal; do not change the UDP server's two-second PING stagger.
@@ -38,7 +42,7 @@ Task 1 previously completed and recorded the first RED/GREEN cycle before the sy
 - Modify `easyp2p/p2p_tcp_delay_test.go` to retain the active-delay table and add the total-timeout policy table.
 - Modify `easyp2p/p2p.go` to add `tcpTraversalTimeout`, apply duration-based deadlines, and retry only unsynchronized same-LAN direct dials.
 - Modify only the timing comment in `easyp2p/lan.go` so it no longer claims the multicast handshake synchronizes listeners.
-- Extend `easyp2p/p2p_context_test.go` with a focused delayed-listener case that can succeed only through outbound retry; retain its existing early-start cancellation and later-peer ownership regressions.
+- Extend `easyp2p/p2p_context_test.go` with deterministic rejected-outbound and rejected-inbound candidate cases; retain its existing early-start cancellation and later-peer ownership regressions.
 
 ### Task 1: Complete Unsynchronized Same-LAN TCP Retry Handling
 
@@ -158,7 +162,7 @@ go test ./easyp2p -run '^(TestTCPActiveDialDelay|TestTCPTraversalTimeout)$' -cou
 
 Expected: `ok github.com/threatexpert/gonc/v2/easyp2p`.
 
-- [ ] **Step 5: Add a focused failing delayed-listener retry test**
+- [ ] **Step 5 (superseded): Add a focused failing delayed-listener retry test**
 
 First extend the existing test log writer so the test can observe when the first direct dial begins without using a long scheduling sleep:
 
@@ -265,7 +269,7 @@ func TestAutoP2PTCPTraversalRetriesUntilPeerListenerStarts(t *testing.T) {
 }
 ```
 
-- [ ] **Step 6: Reconfirm the behavioral RED state before adding retries**
+- [ ] **Step 6 (historical RED evidence): Reconfirm the behavioral RED state before adding retries**
 
 Run:
 
@@ -324,7 +328,7 @@ if !inSameLAN {
 
 For `unsynchronizedSameLAN`, the loop exits only after commit or cancellation, so control never reaches the final `reportErr("all connection attempts failed")` while Accept remains viable. For all other routes, the loop executes once and preserves the existing terminal path.
 
-- [ ] **Step 8: Verify retry, Accept lifetime, cancellation, and ownership transfer**
+- [ ] **Step 8 (superseded verification set): Verify retry, Accept lifetime, cancellation, and ownership transfer**
 
 Run the two behavioral regressions repeatedly together with the policy tests:
 

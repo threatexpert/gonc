@@ -1744,6 +1744,44 @@ func tcpActiveDialDelay(isClient, inSameLAN, lanProbeOnly bool) time.Duration {
 
 const tcpUnsynchronizedSameLANRetryInterval = 250 * time.Millisecond
 
+type tcpPunchAckSelector struct {
+	mu       sync.Mutex
+	selected bool
+}
+
+func (s *tcpPunchAckSelector) trySelect(confirm func() error) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.selected {
+		return false, nil
+	}
+	if confirm != nil {
+		if err := confirm(); err != nil {
+			return false, err
+		}
+	}
+	s.selected = true
+	return true, nil
+}
+
+func tcpPunchAckWriteError(written, expected int, writeErr error) error {
+	if written == expected {
+		return nil
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	return io.ErrShortWrite
+}
+
+func tcpValidateThenHandshake(validate, handshake func() error) error {
+	if err := validate(); err != nil {
+		return err
+	}
+	return handshake()
+}
+
 func tcpTraversalTimeout(round int, inSameLAN, lanProbeOnly bool) time.Duration {
 	if lanProbeOnly {
 		return 5 * time.Second
@@ -1874,7 +1912,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 	}
 	punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
-	var punchAckOnce sync.Once
+	var punchAckSelector tcpPunchAckSelector
 	var commitOnce sync.Once
 
 	// Start listener
@@ -1937,7 +1975,6 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			handshakeTimeout      = 5 * time.Second
 			handshakePollInterval = 250 * time.Millisecond
 		)
-		var success bool
 		buf := make([]byte, len(punchAckPayload))
 		if isClient {
 			//所有C主动发送Ack
@@ -1956,17 +1993,13 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 				return fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
 			}
 
-			//正常来说，只有一个S会回复，这里用punchAckOnce只允许一个C成功。
-			punchAckOnce.Do(func() {
-				success = true
-			})
-			if !success {
+			// 正常来说，只有一个S会回复；只允许一个收到回复的C成功。
+			selected, _ := punchAckSelector.trySelect(nil)
+			if !selected {
 				return fmt.Errorf("connection(%s) not selected", tag)
 			}
 		} else {
 			// S端尝试接收C, 然后从收到ACK的连接里只挑选一个回复ACK。确保只有一个C收到ACK，其他C都会关闭连接。
-			errS := fmt.Errorf("connection(%s) not selected", tag)
-
 			n, readErr := netx.ReadFullWithContext(attemptCtx, conn, buf, handshakeTimeout, handshakePollInterval)
 			if readErr != nil {
 				return fmt.Errorf("connection(%s) failed to read: %w", tag, readErr)
@@ -1975,16 +2008,18 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 				return fmt.Errorf("connection(%s) got invalid punchAckPayload", tag)
 			}
 
-			punchAckOnce.Do(func() {
-				_, writeErr := netx.WriteFullWithContext(attemptCtx, conn, punchAckPayload, handshakeTimeout, handshakePollInterval)
-				if writeErr != nil {
-					errS = fmt.Errorf("connection(%s) failed to write: %w", tag, writeErr)
-					return
+			selected, selectErr := punchAckSelector.trySelect(func() error {
+				written, writeErr := netx.WriteFullWithContext(attemptCtx, conn, punchAckPayload, handshakeTimeout, handshakePollInterval)
+				if confirmErr := tcpPunchAckWriteError(written, len(punchAckPayload), writeErr); confirmErr != nil {
+					return fmt.Errorf("connection(%s) failed to write: %w", tag, confirmErr)
 				}
-				success = true
+				return nil
 			})
-			if !success {
-				return errS
+			if selectErr != nil {
+				return selectErr
+			}
+			if !selected {
+				return fmt.Errorf("connection(%s) not selected", tag)
 			}
 		}
 
@@ -1995,33 +2030,49 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	doAccept := func() {
 		deadline := time.Now().Add(timeoutMax)
 		listener.(*net.TCPListener).SetDeadline(deadline)
-		conn, err := listener.Accept()
-		if err != nil {
-			reportErr(err)
-			return
-		}
-
-		err = doHandshake(conn, isClient, "accept")
-		if err != nil {
-			conn.Close()
-			reportErr(err)
-			return
-		}
-
-		// Verify the connection is from expected peer
-		peerIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		remoteLANIP := extractIP(p2pInfo.RemoteLAN)
-		if err == nil && (peerIP == remoteIP ||
-			(sameNAT && similarLAN && IsSameLAN(peerIP, remoteIP)) ||
-			(sameNAT && remoteLANIP != "" && peerIP == remoteLANIP) ||
-			(lanProbeEnabled && (peerIP == remoteLANIP || IsSameLAN(peerIP, localAddr.IP.String())))) {
-			tryCommit(conn, "accept")
-		} else {
-			conn.Close()
-			if err == nil {
-				err = fmt.Errorf("unexpected peer connection from %s", peerIP)
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				if attemptCtx.Err() != nil {
+					return
+				}
+				if netErr, ok := acceptErr.(net.Error); ok && netErr.Timeout() {
+					return
+				}
+				reportErr(acceptErr)
+				return
 			}
-			reportErr(err)
+
+			candidateErr := tcpValidateThenHandshake(
+				func() error {
+					peerIP, _, splitErr := net.SplitHostPort(conn.RemoteAddr().String())
+					if splitErr != nil {
+						return splitErr
+					}
+					remoteLANIP := extractIP(p2pInfo.RemoteLAN)
+					if peerIP == remoteIP ||
+						(sameNAT && similarLAN && IsSameLAN(peerIP, remoteIP)) ||
+						(sameNAT && remoteLANIP != "" && peerIP == remoteLANIP) ||
+						(lanProbeEnabled && (peerIP == remoteLANIP || IsSameLAN(peerIP, localAddr.IP.String()))) {
+						return nil
+					}
+					return fmt.Errorf("unexpected peer connection from %s", peerIP)
+				},
+				func() error {
+					return doHandshake(conn, isClient, "accept")
+				},
+			)
+			if candidateErr == nil {
+				tryCommit(conn, "accept")
+				return
+			}
+
+			conn.Close()
+			if inSameLAN {
+				continue
+			}
+			reportErr(candidateErr)
+			return
 		}
 	}
 

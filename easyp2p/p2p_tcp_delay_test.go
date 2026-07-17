@@ -1,6 +1,8 @@
 package easyp2p
 
 import (
+	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -82,5 +84,86 @@ func TestTCPTraversalTimeout(t *testing.T) {
 				t.Fatalf("tcpTraversalTimeout() = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTCPUnsynchronizedSameLANRetryInterval(t *testing.T) {
+	if tcpUnsynchronizedSameLANRetryInterval != 250*time.Millisecond {
+		t.Fatalf("retry interval = %s, want 250ms", tcpUnsynchronizedSameLANRetryInterval)
+	}
+}
+
+func TestTCPPunchAckSelectorCommitsOnlyAfterConfirmationSucceeds(t *testing.T) {
+	var selector tcpPunchAckSelector
+	wantErr := errors.New("confirmation failed")
+
+	selected, err := selector.trySelect(func() error {
+		return wantErr
+	})
+	if selected {
+		t.Fatal("failed confirmation selected the candidate")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("failed confirmation error = %v, want %v", err, wantErr)
+	}
+
+	selected, err = selector.trySelect(func() error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selected {
+		t.Fatal("next candidate was not selected after the first confirmation failed")
+	}
+
+	confirmationCalled := false
+	selected, err = selector.trySelect(func() error {
+		confirmationCalled = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected {
+		t.Fatal("selector selected more than one candidate")
+	}
+	if confirmationCalled {
+		t.Fatal("selector confirmed a candidate after selection was committed")
+	}
+}
+
+func TestTCPPunchAckWriteErrorTreatsCompleteWriteAsCommitted(t *testing.T) {
+	wantErr := errors.New("write reported an error")
+
+	if err := tcpPunchAckWriteError(16, 16, wantErr); err != nil {
+		t.Fatalf("complete write error = %v, want nil", err)
+	}
+	if err := tcpPunchAckWriteError(8, 16, wantErr); !errors.Is(err, wantErr) {
+		t.Fatalf("partial write error = %v, want %v", err, wantErr)
+	}
+	if err := tcpPunchAckWriteError(8, 16, nil); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short write error = %v, want %v", err, io.ErrShortWrite)
+	}
+}
+
+func TestTCPValidateThenHandshakeRejectsBeforeHandshake(t *testing.T) {
+	wantErr := errors.New("unexpected peer")
+	handshakeCalled := false
+
+	err := tcpValidateThenHandshake(
+		func() error {
+			return wantErr
+		},
+		func() error {
+			handshakeCalled = true
+			return nil
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("validation error = %v, want %v", err, wantErr)
+	}
+	if handshakeCalled {
+		t.Fatal("handshake ran before peer validation succeeded")
 	}
 }

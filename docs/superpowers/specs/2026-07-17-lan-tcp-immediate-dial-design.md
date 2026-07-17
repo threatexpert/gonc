@@ -41,7 +41,7 @@ No new mode flag or `P2PAddressInfo` field is introduced. This is intentional: t
 
 Treat `round == 0 && inSameLAN` as an unsynchronized same-LAN traversal. It starts its first direct dial immediately, retains the concurrent accept path, and retries failed direct dials every 250 milliseconds. A failed individual dial is not terminal in this mode. Retrying continues until a connection commits, the parent context is canceled, or the mode's eight-second total traversal timeout expires.
 
-Same-LAN attempts with `round > 0` retain the normal single direct-dial sequence and error convergence because MQTT round synchronization has already established peer readiness. `LANProbeOnly` retains its existing dedicated behavior and five-second timeout.
+Same-LAN attempts with `round > 0` retain the normal single direct-dial sequence and 25-second timeout because MQTT round synchronization has already established peer readiness. Because every same-LAN role now dials immediately, an individual failed inbound candidate is local to that candidate and must not override another authenticated candidate that is still committing. `LANProbeOnly` retains its existing dedicated behavior and five-second timeout.
 
 ## Delay Policy
 
@@ -99,9 +99,9 @@ The change does not close or delay the listener. In unsynchronized same-LAN mode
 
 ## Concurrent-Connection Behavior
 
-Without the stagger, both same-LAN peers can establish crossed TCP connections at nearly the same time. This is an accepted consequence of the selected approach.
+Without the stagger, accept and dial candidates can complete at nearly the same time. A normal fixed-port TCP simultaneous open may converge on one connection, while probe or multi-port paths can still produce multiple candidates.
 
-The traversal already arbitrates concurrent accept and dial results through its single-commit path. The first connection successfully committed is returned, attempt cancellation stops remaining work, and connections that lose the race are closed. This existing ownership behavior is not redesigned by this change.
+The traversal arbitrates those candidates through its single-commit path. The first connection successfully committed is returned, attempt cancellation stops remaining work, and connections that lose the race are closed. Accept validates the remote address before running the authenticated handshake, so a rejected source cannot consume selection. A same-LAN Accept loop treats handshake and peer-validation failures as candidate-local and continues while the traversal attempt remains active; in unsynchronized same-LAN mode, outbound retry keeps that attempt viable until success, cancellation, or the eight-second timeout. Server-side ACK selection is committed only after the full ACK payload is written, so a failed partial write does not permanently prevent a later retry from being selected, while an acknowledged complete write cannot lead to double selection.
 
 ## Logging
 
@@ -119,9 +119,9 @@ Representative same-LAN server output:
 
 The initial zero-delay path performs no wait. The two-second public-path stagger and the 250-millisecond same-LAN retry interval both use `netx.WaitContext`, so cancellation interrupts either wait promptly.
 
-For `round == 0 && inSameLAN`, connection refusal, handshake failure, or another failed outbound attempt returns to the retry loop. These failures do not enter `errChan` while the accept path is still viable. Success cancels the retry loop through the existing commit path. Parent cancellation returns its existing cause. If neither direction succeeds, the existing timeout result is returned after eight seconds.
+For `round == 0 && inSameLAN`, connection refusal, handshake failure, or another failed outbound attempt returns to the retry loop. These failures do not enter `errChan` while the accept path is still viable. On every same-LAN route, an individual inbound candidate's handshake or peer-validation failure closes that candidate without directly terminating traversal; this prevents a losing candidate from overriding another authenticated connection. Success cancels the retry loop through the existing commit path. Parent cancellation returns its existing cause. If neither direction succeeds, the existing timeout result is returned after eight seconds.
 
-All other routes retain their existing `all connection attempts failed` reporting, accept behavior, cleanup, and timeout values.
+Non-same-LAN routes retain their existing `all connection attempts failed` reporting, candidate-failure behavior, cleanup, and timeout values.
 
 ## Testing
 
@@ -138,7 +138,7 @@ Add timeout-policy cases covering:
 2. `LANProbeOnly`: five seconds.
 3. Every other TCP traversal: twenty-five seconds.
 
-Use the existing TCP cancellation regression to prove an unsynchronized same-LAN traversal survives initial connection refusal and returns the parent cancellation instead of `all connection attempts failed`. Use the existing paired ownership regression to prove the first peer remains alive until the later peer starts, after which one authenticated connection wins. Run the focused tests repeatedly, the `easyp2p` package tests, and the full repository suite.
+Use a real TCP listener that resets the first outbound connection and completes the second handshake to prove retry causally, including a tolerant lower-bound check around the 250-millisecond interval. Use a separate inbound test that resets the first accepted candidate and completes a second candidate to prove Accept remains active. Test the ACK selector directly to prove failed confirmation does not consume selection. Retain cancellation and paired-ownership regressions, then run the focused tests repeatedly, the `easyp2p` package tests, and the full repository suite.
 
 ## Non-Goals
 
