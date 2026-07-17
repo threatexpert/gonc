@@ -130,12 +130,6 @@ func tcpTraversalTimeout(round int, inSameLAN, lanProbeOnly bool) time.Duration 
 }
 ```
 
-After `lanProbeEnabled` and `activeDialDelay` are calculated, add:
-
-```go
-unsynchronizedSameLAN := round == 0 && inSameLAN
-```
-
 Replace the integer timeout initialization with:
 
 ```go
@@ -282,6 +276,12 @@ go test ./easyp2p -run '^(TestAutoP2PTCPTraversalRetriesUntilPeerListenerStarts|
 Expected before the retry loop is implemented: all three tests fail because traversal returns `P2P TCP hole punching failed: all connection attempts failed` before the delayed peer listener, cancellation, or second traversal can act. The two existing failures were already reproduced deterministically, including five consecutive ownership-test failures.
 
 - [ ] **Step 7: Retry direct dialing only for unsynchronized same-LAN traversal**
+
+After `lanProbeEnabled` and `activeDialDelay` are calculated, add the retry-mode predicate:
+
+```go
+unsynchronizedSameLAN := round == 0 && inSameLAN
+```
 
 Replace the current single direct-dial attempt inside the `inSameLAN || easy/easy` block with this loop. Keep the existing non-LAN fallback immediately after it:
 
