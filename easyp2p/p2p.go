@@ -314,6 +314,13 @@ func hasCap(caps []string, cap string) bool {
 }
 
 func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacketConn, logWriter io.Writer) ([]PunchingAddressInfo, []*STUNResult, error) {
+	return DetectNATAddressInfoContext(context.Background(), networks, bind, relayConn, logWriter)
+}
+
+func DetectNATAddressInfoContext(ctx context.Context, networks []string, bind string, relayConn *RelayPacketConn, logWriter io.Writer) ([]PunchingAddressInfo, []*STUNResult, error) {
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, cause
+	}
 	Addresses := []PunchingAddressInfo{}
 	var allResults, directResults, relayResults []*STUNResult
 	var err error
@@ -323,11 +330,14 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 	if relayConn == nil || !relayConn.FallbackMode {
 		// 单轮 STUN 探测（无 relay 或直接使用 relay）
 		if relayConn == nil {
-			directResults, err = GetNetworksPublicIPs(networks, bind, 2828*time.Millisecond, nil)
+			directResults, err = GetNetworksPublicIPsContext(ctx, networks, bind, 2828*time.Millisecond, nil)
 		} else {
-			relayResults, err = GetNetworksPublicIPs(networks, bind, 2828*time.Millisecond, relayConn)
+			relayResults, err = GetNetworksPublicIPsContext(ctx, networks, bind, 2828*time.Millisecond, relayConn)
 		}
 		allResults = append(directResults, relayResults...)
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, allResults, cause
+		}
 		if err != nil {
 			p2pLogf(logWriter, "    Failed to get public IP info: %v\n", err)
 		} else {
@@ -336,9 +346,12 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 	} else {
 		// Fallback 模式，尝试两轮：先直连STUN获取地址信息，再走 relay获取地址信息
 		// 第一轮（直连）
-		directResults, _ = GetNetworksPublicIPs(networks, bind, 2828*time.Millisecond, nil)
+		directResults, _ = GetNetworksPublicIPsContext(ctx, networks, bind, 2828*time.Millisecond, nil)
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, directResults, cause
+		}
 		// 第二轮（使用中继）
-		relayResults, err = GetNetworksPublicIPs(networks, bind, 2828*time.Millisecond, relayConn)
+		relayResults, err = GetNetworksPublicIPsContext(ctx, networks, bind, 2828*time.Millisecond, relayConn)
 		// 合并
 		allResults = append(directResults, relayResults...)
 		if len(allResults) == 0 && err != nil {
@@ -347,6 +360,9 @@ func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacket
 			p2pLogf(logWriter, "    Received %d STUN responses\n", succeededSTUNResults(allResults))
 			err = nil
 		}
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, allResults, cause
 	}
 
 	if len(allResults) > 0 {
@@ -402,17 +418,17 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		defer signal.Close()
 	}
 
-	if err := signal.prepareTopic("gonc-exchange-address", sessionUid); err != nil {
+	if err := signal.prepareTopic(ctx, "gonc-exchange-address", sessionUid); err != nil {
 		return nil, nil, fmt.Errorf("failed to prepare MQTT address topic: %w", err)
 	}
-	if err := signal.prepareTopic("gonc-exchange-sync", sessionUid); err != nil {
+	if err := signal.prepareTopic(ctx, "gonc-exchange-sync", sessionUid); err != nil {
 		return nil, nil, fmt.Errorf("failed to prepare MQTT sync topic: %w", err)
 	}
 	if cause := context.Cause(ctx); cause != nil {
 		return nil, nil, cause
 	}
 
-	myInfoForExchange.Addresses, _, _ = DetectNATAddressInfo(networks, bind, relayConn, logWriter)
+	myInfoForExchange.Addresses, _, _ = DetectNATAddressInfoContext(ctx, networks, bind, relayConn, logWriter)
 	if cause := context.Cause(ctx); cause != nil {
 		return nil, nil, cause
 	}

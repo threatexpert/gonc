@@ -1,14 +1,193 @@
 package easyp2p
 
 import (
+	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	pionstun "github.com/pion/stun/v3"
 )
+
+func TestGetPublicIPContextClosesSuccessfulTCPConnection(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for fake STUN server: %v", err)
+	}
+	defer listener.Close()
+
+	originalServers := STUNServers
+	STUNServers = []string{"tcp://" + listener.Addr().String()}
+	t.Cleanup(func() { STUNServers = originalServers })
+
+	peerClosed := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			peerClosed <- acceptErr
+			return
+		}
+		defer conn.Close()
+
+		header := make([]byte, 20)
+		if _, readErr := io.ReadFull(conn, header); readErr != nil {
+			peerClosed <- readErr
+			return
+		}
+		body := make([]byte, int(binary.BigEndian.Uint16(header[2:4])))
+		if _, readErr := io.ReadFull(conn, body); readErr != nil {
+			peerClosed <- readErr
+			return
+		}
+		request := &pionstun.Message{Raw: append(header, body...)}
+		if decodeErr := request.Decode(); decodeErr != nil {
+			peerClosed <- decodeErr
+			return
+		}
+		response := pionstun.MustBuild(
+			pionstun.NewTransactionIDSetter(request.TransactionID),
+			pionstun.BindingSuccess,
+			&pionstun.XORMappedAddress{IP: net.ParseIP("203.0.113.10"), Port: 45678},
+		)
+		if _, writeErr := conn.Write(response.Raw); writeErr != nil {
+			peerClosed <- writeErr
+			return
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, readErr := conn.Read(make([]byte, 1))
+		peerClosed <- readErr
+	}()
+
+	_, _, natAddr, err := GetPublicIPContext(context.Background(), "tcp4", ":0", 2*time.Second)
+	if err != nil {
+		t.Fatalf("GetPublicIPContext: %v", err)
+	}
+	if natAddr != "203.0.113.10:45678" {
+		t.Fatalf("NAT address = %q, want %q", natAddr, "203.0.113.10:45678")
+	}
+
+	select {
+	case readErr := <-peerClosed:
+		if readErr == nil {
+			t.Fatal("STUN connection remained open after successful query")
+		}
+		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+			t.Fatal("STUN connection was retained after successful query")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake STUN server did not observe connection closure")
+	}
+}
+
+func TestGetPublicIPsContextCancellationClosesTCPConnection(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for fake STUN server: %v", err)
+	}
+	defer listener.Close()
+
+	originalServers := STUNServers
+	STUNServers = []string{"tcp://" + listener.Addr().String()}
+	t.Cleanup(func() { STUNServers = originalServers })
+
+	requestReceived := make(chan struct{})
+	peerClosed := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			peerClosed <- acceptErr
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		if _, readErr := conn.Read(buf); readErr != nil {
+			peerClosed <- readErr
+			return
+		}
+		close(requestReceived)
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, readErr := conn.Read(buf)
+		peerClosed <- readErr
+	}()
+
+	cancelCause := errors.New("LAN path won")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := GetPublicIPsContext(ctx, "tcp4", ":0", 30*time.Second, false, nil)
+		result <- callErr
+	}()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		t.Fatal("fake STUN server did not receive a request")
+	}
+	cancel(cancelCause)
+
+	select {
+	case callErr := <-result:
+		if !errors.Is(callErr, cancelCause) {
+			t.Fatalf("GetPublicIPsContext error = %v, want %v", callErr, cancelCause)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GetPublicIPsContext did not return after cancellation")
+	}
+
+	select {
+	case readErr := <-peerClosed:
+		if readErr == nil {
+			t.Fatal("fake STUN connection remained readable after cancellation")
+		}
+		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+			t.Fatal("fake STUN connection was not closed after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fake STUN server did not observe connection closure")
+	}
+}
+
+func TestNATDiscoveryContextCancellationPropagates(t *testing.T) {
+	cancelCause := errors.New("superseded by LAN")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cancelCause)
+
+	t.Run("single public IP", func(t *testing.T) {
+		_, _, _, err := GetPublicIPContext(ctx, "tcp4", ":0", 30*time.Second)
+		if !errors.Is(err, cancelCause) {
+			t.Fatalf("GetPublicIPContext error = %v, want %v", err, cancelCause)
+		}
+	})
+
+	t.Run("all public IPs", func(t *testing.T) {
+		_, err := GetPublicIPsContext(ctx, "tcp4", ":0", 30*time.Second, false, nil)
+		if !errors.Is(err, cancelCause) {
+			t.Fatalf("GetPublicIPsContext error = %v, want %v", err, cancelCause)
+		}
+	})
+
+	t.Run("multiple networks", func(t *testing.T) {
+		_, err := GetNetworksPublicIPsContext(ctx, []string{"tcp4"}, ":0", 30*time.Second, nil)
+		if !errors.Is(err, cancelCause) {
+			t.Fatalf("GetNetworksPublicIPsContext error = %v, want %v", err, cancelCause)
+		}
+	})
+
+	t.Run("address analysis", func(t *testing.T) {
+		_, _, err := DetectNATAddressInfoContext(ctx, []string{"tcp4"}, ":0", nil, nil)
+		if !errors.Is(err, cancelCause) {
+			t.Fatalf("DetectNATAddressInfoContext error = %v, want %v", err, cancelCause)
+		}
+	})
+}
 
 func TestStunOne(t *testing.T) {
 	timeout := 3 * time.Second
