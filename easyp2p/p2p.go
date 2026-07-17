@@ -1735,6 +1735,25 @@ func Mqtt_P2P_Round_Sync(ctx context.Context, sessionUid string, sessCtx *P2PSes
 	return nil
 }
 
+func tcpActiveDialDelay(isClient, inSameLAN, lanProbeOnly bool) time.Duration {
+	if isClient || inSameLAN || lanProbeOnly {
+		return 0
+	}
+	return 2 * time.Second
+}
+
+const tcpUnsynchronizedSameLANRetryInterval = 250 * time.Millisecond
+
+func tcpTraversalTimeout(round int, inSameLAN, lanProbeOnly bool) time.Duration {
+	if lanProbeOnly {
+		return 5 * time.Second
+	}
+	if round == 0 && inSameLAN {
+		return 8 * time.Second
+	}
+	return 25 * time.Second
+}
+
 func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string, p2pInfo *P2PAddressInfo, sessCtx *P2PSessionContext, round int, logWriter io.Writer) (net.Conn, bool, error) {
 	var isClient bool
 	var err error
@@ -1762,6 +1781,8 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	// [新增] 判断是否启用 LAN 直连探测
 	lanProbeEnabled := shouldTryLANProbe(inSameLAN, round, p2pInfo) || p2pInfo.LANProbeOnly
+	activeDialDelay := tcpActiveDialDelay(isClient, inSameLAN, p2pInfo.LANProbeOnly)
+	unsynchronizedSameLAN := round == 0 && inSameLAN
 
 	randomSrcPort := false
 	randomDstPort := false
@@ -1831,7 +1852,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		p2pInfo.RemoteNAT = remoteAddr
 	}
 
-	timeoutMax := 25
+	timeoutMax := tcpTraversalTimeout(round, inSameLAN, p2pInfo.LANProbeOnly)
 	timeoutPerconn := 6
 	// Setup context and channels
 	parentCtx := ctx
@@ -1872,11 +1893,6 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 	}
 
-	// [新增] LANProbeOnly 模式下缩短超时
-	if lanProbeEnabled && p2pInfo.LANProbeOnly {
-		timeoutMax = 5
-	}
-
 	// Print connection info
 	p2pInfoPrint(logWriter, p2pInfo)
 	// [新增] 日志显示 LAN 探测状态
@@ -1890,12 +1906,10 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	p2pLogf(logWriter, "  - %-14s: %s (reason: %s)\n", "Best Route", remoteAddr, routeReason)
 	if isClient {
 		p2pLogf(logWriter, "  - %-14s: connect start immediately\n", "Active Mode")
+	} else if activeDialDelay == 0 {
+		p2pLogf(logWriter, "  - %-14s: connect start immediately\n", "Passive Mode")
 	} else {
-		if p2pInfo.LANProbeOnly {
-			p2pLogf(logWriter, "  - %-14s: connect start immediately\n", "Passive Mode")
-		} else {
-			p2pLogf(logWriter, "  - %-14s: connect start after 2s\n", "Passive Mode")
-		}
+		p2pLogf(logWriter, "  - %-14s: connect start after %s\n", "Passive Mode", activeDialDelay)
 	}
 
 	tryCommit := func(conn net.Conn, tag string) bool {
@@ -1979,7 +1993,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	// Start accepting connections in goroutine
 	doAccept := func() {
-		deadline := time.Now().Add(time.Duration(timeoutMax) * time.Second)
+		deadline := time.Now().Add(timeoutMax)
 		listener.(*net.TCPListener).SetDeadline(deadline)
 		conn, err := listener.Accept()
 		if err != nil {
@@ -2013,8 +2027,8 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	// Start concurrent dialing
 	doPunching := func() {
-		if !isClient && !p2pInfo.LANProbeOnly {
-			if err := netx.WaitContext(attemptCtx, 2*time.Second); err != nil {
+		if activeDialDelay > 0 {
+			if err := netx.WaitContext(attemptCtx, activeDialDelay); err != nil {
 				return
 			}
 		}
@@ -2093,18 +2107,25 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		//相同子网的，以及easy对easy的，就尝试一下直接连接
 		triedDirectDial := false
 		if inSameLAN || (p2pInfo.LocalNATType == "easy" && p2pInfo.RemoteNATType == "easy") {
-			select {
-			case <-attemptCtx.Done():
-				return
-			default:
-			}
-			workerChan <- struct{}{}
-			wg.Add(1)
 			p2pLogf(logWriter, "  ↑ Trying direct dial to peer...\n")
-			if tryConnect(remoteAddr, localAddr, true, timeoutPerconn, isClient, "dial") {
-				return
+			for {
+				select {
+				case <-attemptCtx.Done():
+					return
+				case workerChan <- struct{}{}:
+				}
+				wg.Add(1)
+				if tryConnect(remoteAddr, localAddr, true, timeoutPerconn, isClient, "dial") {
+					return
+				}
+				triedDirectDial = true
+				if !unsynchronizedSameLAN {
+					break
+				}
+				if err := netx.WaitContext(attemptCtx, tcpUnsynchronizedSameLANRetryInterval); err != nil {
+					return
+				}
 			}
-			triedDirectDial = true
 			if !inSameLAN {
 				if isClient {
 					//easy - easy 失败，可能对方的洞口没开是不可以先碰的
@@ -2204,7 +2225,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	go doPunching()
 
 	// Wait for results
-	timer := time.NewTimer(time.Duration(timeoutMax) * time.Second)
+	timer := time.NewTimer(timeoutMax)
 	defer timer.Stop()
 	select {
 	case connInfo := <-connChan:

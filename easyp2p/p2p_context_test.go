@@ -18,8 +18,10 @@ type traversalResult struct {
 }
 
 type readyLogWriter struct {
-	once  sync.Once
-	ready chan struct{}
+	once     sync.Once
+	ready    chan struct{}
+	dialOnce sync.Once
+	dialing  chan struct{}
 }
 
 func TestDoAutoP2PEx2PreservesCancelCause(t *testing.T) {
@@ -46,13 +48,21 @@ func TestMQTTSignalExchangePreservesParentCancelCause(t *testing.T) {
 }
 
 func newReadyLogWriter() *readyLogWriter {
-	return &readyLogWriter{ready: make(chan struct{})}
+	return &readyLogWriter{
+		ready:   make(chan struct{}),
+		dialing: make(chan struct{}),
+	}
 }
 
 func (w *readyLogWriter) Write(p []byte) (int, error) {
 	if bytes.Contains(p, []byte("Best Route")) {
 		w.once.Do(func() {
 			close(w.ready)
+		})
+	}
+	if bytes.Contains(p, []byte("Trying direct dial")) {
+		w.dialOnce.Do(func() {
+			close(w.dialing)
 		})
 	}
 	return len(p), nil
@@ -385,5 +395,74 @@ func TestAutoP2PTCPTraversalSuccessfulOwnershipTransfer(t *testing.T) {
 
 	for _, got := range results {
 		_ = got.conn.Close()
+	}
+}
+
+func TestAutoP2PTCPTraversalRetriesUntilPeerListenerStarts(t *testing.T) {
+	t.Setenv("ROLE_DEBUG", "C")
+
+	localAddr, remoteAddr := reserveTCPAddrPair(t)
+	info := loopbackP2PInfo(localAddr, remoteAddr)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	result := make(chan traversalResult, 1)
+	ready := newReadyLogWriter()
+	go runTCPTraversal(ctx, info, ready, result)
+
+	select {
+	case <-ready.dialing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TCP traversal did not start its first direct dial")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case got := <-result:
+		if got.conn != nil {
+			_ = got.conn.Close()
+		}
+		t.Fatalf("traversal returned before peer listener started: %v", got.err)
+	default:
+	}
+
+	peerListener, err := net.Listen("tcp4", remoteAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerListener.Close()
+	if err := peerListener.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	peer, err := peerListener.Accept()
+	if err != nil {
+		t.Fatalf("retry did not reach delayed peer listener: %v", err)
+	}
+	defer peer.Close()
+
+	payload := []byte(deriveKeyForPayload("tcp-context-test", false))
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(peer, buf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, payload) {
+		t.Fatal("retry connection sent an invalid handshake payload")
+	}
+	if _, err := peer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("retried traversal failed: %v", got.err)
+		}
+		if got.conn == nil {
+			t.Fatal("retried traversal returned a nil connection")
+		}
+		_ = got.conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("retried traversal did not return its connection")
 	}
 }

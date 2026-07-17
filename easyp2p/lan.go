@@ -805,13 +805,11 @@ func lanResponder(
 //
 // 流程: 组播发现(四步握手) → 构造 P2PAddressInfo → Auto_P2P_*(round=0)
 //
-// round=0 使打洞函数跳过 Mqtt_P2P_Round_Sync:
-//   if round > 0 {
-//       err = Mqtt_P2P_Round_Sync(...)  // round=0 不进这里
-//   }
-//
-// 时机同步由四步握手保证: 双方都收到并确认了对方地址后才返回,
-// 之后几乎同时进入打洞阶段。
+// round=0 makes traversal skip Mqtt_P2P_Round_Sync because explicit LAN mode
+// has no MQTT signal session. The multicast handshake authenticates and
+// exchanges addresses, but it finishes before traversal binds TCP listeners.
+// TCP traversal therefore retries round-0 same-LAN direct dials while keeping
+// its accept path active.
 // ============================================================================
 
 func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
