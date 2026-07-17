@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	VERSION = "v2.6.5"
+	VERSION = "v2.6.6"
 )
 
 type AppNetcatConfig struct {
@@ -1337,7 +1337,10 @@ func establishP2PAndLANActiveConnection(
 	retry bool,
 	connect p2pConnectFunc,
 ) (p2pAndLanActiveWinner, error) {
-	publicCtx, cancelPublic := context.WithCancel(ncconfig.ctx)
+	publicCtx, cancelPublicCause := context.WithCancelCause(ncconfig.ctx)
+	cancelPublic := func() {
+		cancelPublicCause(nil)
+	}
 	lanCtx, cancelLAN := context.WithCancel(ncconfig.ctx)
 	publicPath, lanPath := newP2PAndLanActivePaths(publicCtx, lanCtx, ncconfig)
 
@@ -1380,7 +1383,7 @@ func establishP2PAndLANActiveConnection(
 			if result.path.id == p2pAndLanActivePublicPath {
 				cancelLAN()
 			} else {
-				cancelPublic()
+				cancelPublicCause(errP2PCandidateSuperseded)
 				winnerCancel = cancelLAN
 			}
 			workers.Wait()
@@ -3384,14 +3387,31 @@ func p2pCandidateHasGuaranteedHandshakeBoundary(ncconfig *AppNetcatConfig, ciphe
 	}
 }
 
+func reportP2PPathError(ncconfig *AppNetcatConfig, ctx context.Context, reportSessionID string, err error) error {
+	if errors.Is(err, errP2PCandidateSuperseded) || errors.Is(context.Cause(ctx), errP2PCandidateSuperseded) {
+		return errP2PCandidateSuperseded
+	}
+	ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+	return err
+}
+
+func rejectSupersededP2PConnection(ctx context.Context, nconn *secure.NegotiatedConn) error {
+	if !errors.Is(context.Cause(ctx), errP2PCandidateSuperseded) {
+		return nil
+	}
+	if nconn != nil {
+		_ = nconn.Close()
+	}
+	return errP2PCandidateSuperseded
+}
+
 func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PCandidate) (*secure.NegotiatedConn, error) {
 	reportSessionID := newP2PReportSessionID()
 	//使用其他客户端push过来的salt，构建一个仅和对端单独共享的topic，避免P2P交换地址时有多个端点在一起错乱发生
 
 	topicSalt, mqttSignalSession, err := Mqtt_ensure_ready(ncconfig, reportSessionID)
 	if err != nil {
-		ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
-		return nil, err
+		return nil, reportP2PPathError(ncconfig, ncconfig.ctx, reportSessionID, err)
 	}
 	if mqttSignalSession != nil {
 		defer mqttSignalSession.Close()
@@ -3498,11 +3518,7 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 			if relayConn != nil {
 				relayConn.Close()
 			}
-			if errors.Is(err, errP2PCandidateSuperseded) || errors.Is(context.Cause(p2pCtx), errP2PCandidateSuperseded) {
-				return nil, errP2PCandidateSuperseded
-			}
-			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
-			return nil, err
+			return nil, reportP2PPathError(ncconfig, p2pCtx, reportSessionID, err)
 		}
 		if extendCandidateWindow {
 			candidateOwnsPath = candidate.disarm(candidateToken)
@@ -3534,7 +3550,9 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 	nconn, err := p2pSecureNegotiation(ncconfig, connInfo, cipherSuite, ncconfig.useLAN)
 	if err != nil {
 		rawconn.Close()
-		ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+		return nil, reportP2PPathError(ncconfig, ncconfig.ctx, reportSessionID, err)
+	}
+	if err := rejectSupersededP2PConnection(ncconfig.ctx, nconn); err != nil {
 		return nil, err
 	}
 	if nconn.IsUDP {

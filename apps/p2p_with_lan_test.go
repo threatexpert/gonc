@@ -2,10 +2,13 @@ package apps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -292,6 +295,116 @@ func TestP2PAndLANActiveRaceClosesLateLoser(t *testing.T) {
 	}
 	if err := expectPeerOpen(lanPeer); err != nil {
 		t.Fatalf("LAN winner was closed with the loser: %v", err)
+	}
+}
+
+func TestP2PAndLANActiveRaceMarksPublicLoserSuperseded(t *testing.T) {
+	lanConn, lanPeer := negotiatedPipe(t)
+	defer lanPeer.Close()
+
+	publicStarted := make(chan struct{})
+	publicCause := make(chan error, 1)
+	config := &AppNetcatConfig{
+		ctx:       context.Background(),
+		LogWriter: io.Discard,
+		Logger:    log.New(io.Discard, "", 0),
+	}
+	connect := func(pathConfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
+		if pathConfig.useLAN {
+			<-publicStarted
+			return lanConn, nil
+		}
+		close(publicStarted)
+		<-pathConfig.ctx.Done()
+		publicCause <- context.Cause(pathConfig.ctx)
+		return nil, pathConfig.ctx.Err()
+	}
+
+	winner, err := establishP2PAndLANActiveConnection(config, false, connect)
+	if err != nil {
+		t.Fatalf("establishP2PAndLANActiveConnection: %v", err)
+	}
+	defer winner.cancel()
+	defer winner.conn.Close()
+	if winner.path.id != p2pAndLanActiveLANPath {
+		t.Fatal("LAN connection did not win the controlled race")
+	}
+	if cause := <-publicCause; !errors.Is(cause, errP2PCandidateSuperseded) {
+		t.Fatalf("public cancellation cause = %v, want errP2PCandidateSuperseded", cause)
+	}
+}
+
+func TestReportP2PPathError(t *testing.T) {
+	reports := make(chan P2PStatusReport, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var report P2PStatusReport
+		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+			t.Errorf("decode report: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		reports <- report
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	t.Run("suppresses superseded candidate", func(t *testing.T) {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		cancel(errP2PCandidateSuperseded)
+		config := &AppNetcatConfig{
+			ctx:          ctx,
+			p2pReportURL: server.URL,
+			Logger:       log.New(io.Discard, "", 0),
+		}
+
+		got := reportP2PPathError(config, ctx, "superseded-session", context.Canceled)
+		if !errors.Is(got, errP2PCandidateSuperseded) {
+			t.Fatalf("error = %v, want errP2PCandidateSuperseded", got)
+		}
+		select {
+		case report := <-reports:
+			t.Fatalf("superseded candidate emitted report: %+v", report)
+		default:
+		}
+	})
+
+	t.Run("reports ordinary failure", func(t *testing.T) {
+		config := &AppNetcatConfig{
+			ctx:          context.Background(),
+			p2pReportURL: server.URL,
+			Logger:       log.New(io.Discard, "", 0),
+			network:      "tcp",
+		}
+		ordinaryErr := errors.New("mqtt timeout")
+
+		got := reportP2PPathError(config, config.ctx, "ordinary-session", ordinaryErr)
+		if !errors.Is(got, ordinaryErr) {
+			t.Fatalf("error = %v, want ordinary failure", got)
+		}
+		select {
+		case report := <-reports:
+			if report.Status != "error:mqtt timeout" {
+				t.Fatalf("status = %q, want %q", report.Status, "error:mqtt timeout")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("ordinary failure was not reported")
+		}
+	})
+}
+
+func TestRejectSupersededP2PConnectionClosesConnection(t *testing.T) {
+	nconn, peer := negotiatedPipe(t)
+	defer peer.Close()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errP2PCandidateSuperseded)
+
+	err := rejectSupersededP2PConnection(ctx, nconn)
+	if !errors.Is(err, errP2PCandidateSuperseded) {
+		t.Fatalf("error = %v, want errP2PCandidateSuperseded", err)
+	}
+	if err := expectPeerClosed(peer); err != nil {
+		t.Fatalf("superseded connection remained open: %v", err)
 	}
 }
 
