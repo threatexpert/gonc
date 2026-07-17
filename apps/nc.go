@@ -3335,13 +3335,43 @@ func isKCPEnabled(ncconfig *AppNetcatConfig) bool {
 	return ncconfig.udpProtocol && (ncconfig.kcpEnabled || ncconfig.kcpSEnabled)
 }
 
+func firstSuccessfulSTUNResult(results []*easyp2p.STUNResult) (*easyp2p.STUNResult, error) {
+	var failures []error
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		if result.Err != nil {
+			failures = append(failures, result.Err)
+			continue
+		}
+		if result.Nat == "" {
+			failures = append(failures, fmt.Errorf("STUN server %d returned an empty public address", result.Index))
+			continue
+		}
+		if result.Index < 0 || result.Index >= len(easyp2p.STUNServers) {
+			return nil, fmt.Errorf("STUN result server index %d is out of range", result.Index)
+		}
+		return result, nil
+	}
+	if len(failures) > 0 {
+		return nil, fmt.Errorf("all STUN servers failed: %w", errors.Join(failures...))
+	}
+	return nil, fmt.Errorf("no STUN results returned")
+}
+
 func ShowPublicIP(ncconfig *AppNetcatConfig, network, bind string) error {
-	index, _, nata, err := easyp2p.GetPublicIP(network, bind, 7*time.Second)
-	if err == nil {
-		ncconfig.Logger.Printf("Public Address: %s (via %s)\n", nata, easyp2p.STUNServers[index])
+	results, err := easyp2p.GetPublicIPs(network, bind, 3500*time.Millisecond, false, nil)
+	if err != nil {
+		return err
+	}
+	result, err := firstSuccessfulSTUNResult(results)
+	if err != nil {
+		return err
 	}
 
-	return err
+	ncconfig.Logger.Printf("Public Address: %s (via %s)\n", result.Nat, easyp2p.STUNServers[result.Index])
+	return nil
 }
 
 func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (string, *easyp2p.MQTTSignalSession, error) {

@@ -16,7 +16,7 @@ import (
 	pionstun "github.com/pion/stun/v3"
 )
 
-func TestGetPublicIPContextClosesSuccessfulTCPConnection(t *testing.T) {
+func TestGetPublicIPsClosesSuccessfulTCPConnection(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen for fake STUN server: %v", err)
@@ -66,12 +66,18 @@ func TestGetPublicIPContextClosesSuccessfulTCPConnection(t *testing.T) {
 		peerClosed <- readErr
 	}()
 
-	_, _, natAddr, err := GetPublicIPContext(context.Background(), "tcp4", ":0", 2*time.Second)
+	results, err := GetPublicIPs("tcp4", ":0", 2*time.Second, false, nil)
 	if err != nil {
-		t.Fatalf("GetPublicIPContext: %v", err)
+		t.Fatalf("GetPublicIPs returned error: %v", err)
 	}
-	if natAddr != "203.0.113.10:45678" {
-		t.Fatalf("NAT address = %q, want %q", natAddr, "203.0.113.10:45678")
+	if len(results) != 1 {
+		t.Fatalf("GetPublicIPs returned %d results, want 1", len(results))
+	}
+	if results[0].Err != nil {
+		t.Fatalf("GetPublicIPs result error: %v", results[0].Err)
+	}
+	if results[0].Nat != "203.0.113.10:45678" {
+		t.Fatalf("GetPublicIPs returned NAT address %q", results[0].Nat)
 	}
 
 	select {
@@ -159,13 +165,6 @@ func TestNATDiscoveryContextCancellationPropagates(t *testing.T) {
 	cancelCause := errors.New("superseded by LAN")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(cancelCause)
-
-	t.Run("single public IP", func(t *testing.T) {
-		_, _, _, err := GetPublicIPContext(ctx, "tcp4", ":0", 30*time.Second)
-		if !errors.Is(err, cancelCause) {
-			t.Fatalf("GetPublicIPContext error = %v, want %v", err, cancelCause)
-		}
-	})
 
 	t.Run("all public IPs", func(t *testing.T) {
 		_, err := GetPublicIPsContext(ctx, "tcp4", ":0", 30*time.Second, false, nil)
