@@ -41,6 +41,7 @@ type NegotiationConfig struct {
 	KcpUpdateInterval         int
 	UDPIdleTimeoutSecond      int
 	ReadIdleTimeoutSecond     int
+	DisableGracefulClose      bool
 }
 
 const DefaultKCPIdleTimeoutSecond = 41
@@ -323,7 +324,11 @@ func DoNegotiationContext(parent context.Context, cfg *NegotiationConfig, rawcon
 		}
 	} else {
 		if cfg.FramedTCP {
-			framedConn := netx.NewFramedConn(nconn.ConnLayers[0], nconn.ConnLayers[0])
+			framedConn := netx.NewFramedConnWithOptions(
+				nconn.ConnLayers[0],
+				nconn.ConnLayers[0],
+				netx.FramedConnOptions{DisableGracefulClose: cfg.DisableGracefulClose},
+			)
 			nconn.ConnLayers = append([]net.Conn{framedConn}, nconn.ConnLayers...)
 			connStack = append(connStack, "framed")
 			nconn.IsFramed = true
@@ -676,7 +681,11 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	mtu -= 2         //KCPStreamConn: len header
 	sess.SetMtu(mtu) //如果用户-udp-size设置的值比较大，超过KCP内部限制的1500，会设置失败。
 
-	return netx.NewFramedConn(sess, sess), nil
+	return netx.NewFramedConnWithOptions(
+		sess,
+		sess,
+		netx.FramedConnOptions{DisableGracefulClose: config.DisableGracefulClose},
+	), nil
 }
 
 func configTCPKeepalive(conn net.Conn, keepAlive int) {

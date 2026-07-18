@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	VERSION = "v2.6.6"
+	VERSION = "v2.6.7"
 )
 
 type AppNetcatConfig struct {
@@ -84,6 +84,7 @@ type AppNetcatConfig struct {
 	auth                 string
 	sendfile             string
 	sendsize             int64
+	speedTestDuration    time.Duration
 	writefile            string
 	tlsEnabled           bool
 	tlsServerMode        bool
@@ -199,6 +200,72 @@ func AppExitCode(err error) (int, bool) {
 	return 0, false
 }
 
+func parseBinarySize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("size cannot be empty")
+	}
+
+	digitEnd := 0
+	for digitEnd < len(value) && value[digitEnd] >= '0' && value[digitEnd] <= '9' {
+		digitEnd++
+	}
+	if digitEnd == 0 {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+
+	units := map[string]uint64{
+		"":    1,
+		"B":   1,
+		"K":   1 << 10,
+		"KB":  1 << 10,
+		"KIB": 1 << 10,
+		"M":   1 << 20,
+		"MB":  1 << 20,
+		"MIB": 1 << 20,
+		"G":   1 << 30,
+		"GB":  1 << 30,
+		"GIB": 1 << 30,
+		"T":   1 << 40,
+		"TB":  1 << 40,
+		"TIB": 1 << 40,
+	}
+	multiplier, ok := units[strings.ToUpper(value[digitEnd:])]
+	if !ok {
+		return 0, fmt.Errorf("invalid size unit in %q", value)
+	}
+
+	amount, err := strconv.ParseUint(value[:digitEnd], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", value, err)
+	}
+	const maxInt64 = uint64(^uint64(0) >> 1)
+	if amount > maxInt64/multiplier {
+		return 0, fmt.Errorf("size %q overflows int64", value)
+	}
+	return int64(amount * multiplier), nil
+}
+
+type binarySizeValue struct {
+	target *int64
+}
+
+func (v binarySizeValue) String() string {
+	if v.target == nil {
+		return "0"
+	}
+	return strconv.FormatInt(*v.target, 10)
+}
+
+func (v binarySizeValue) Set(value string) error {
+	size, err := parseBinarySize(value)
+	if err != nil {
+		return err
+	}
+	*v.target = size
+	return nil
+}
+
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
 func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*AppNetcatConfig, error) {
 	var swriter *misc.SwitchableWriter
@@ -226,7 +293,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.proxyAddr2, "x2", "", "Proxy address (same format as -x). Only used if P2P connection fails.")
 	fs.StringVar(&config.auth, "auth", "", "user:password for proxy")
 	fs.StringVar(&config.sendfile, "send", "", "path to file to send (optional)")
-	fs.Int64Var(&config.sendsize, "sendsize", 0, "size of file to send (optional, default is full file size)")
+	fs.Var(binarySizeValue{target: &config.sendsize}, "sendsize", "size of file to send; supports binary units such as 100M or 1GiB")
+	fs.DurationVar(&config.speedTestDuration, "speedtest", 0, "run throughput test for a duration such as 10s, 5m, or 1h (0 disables speed test)")
 	fs.StringVar(&config.writefile, "write", "", "write to file")
 	fs.BoolVar(&config.tlsEnabled, "tls", false, "Enable TLS connection")
 	fs.BoolVar(&config.tlsServerMode, "tlsserver", false, "force as TLS server while connecting")
@@ -341,6 +409,18 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	err := fs.Parse(args)
 	if err != nil {
 		return nil, err // 解析错误直接返回
+	}
+	if config.speedTestDuration < 0 {
+		return nil, fmt.Errorf("-speedtest cannot be negative")
+	}
+	if config.speedTestDuration > 0 {
+		config.progressEnabled = true
+		if config.sendfile == "" {
+			config.sendfile = "/dev/urandom"
+		}
+		if config.writefile == "" {
+			config.writefile = "/dev/null"
+		}
 	}
 	config.Args = fs.Args()
 	if config.verbose {
@@ -2433,6 +2513,10 @@ func usage_less(logWriter io.Writer, argv0 string) {
 }
 
 func conflictCheck(ncconfig *AppNetcatConfig) int {
+	if ncconfig.useMQTTWait && ncconfig.useMQTTHello {
+		ncconfig.Logger.Printf("-mqtt-wait and -mqtt-hello cannot be used together\n")
+		return 1
+	}
 	if ncconfig.sendfile != "" && ncconfig.runCmd != "" {
 		ncconfig.Logger.Printf("-send and -exec cannot be used together\n")
 		return 1
@@ -2707,6 +2791,7 @@ func copyCharDeviceWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io
 
 func preinitNegotiationConfig(ncconfig *AppNetcatConfig) (*secure.NegotiationConfig, error) {
 	config := secure.NewNegotiationConfig()
+	config.DisableGracefulClose = ncconfig.speedTestDuration > 0
 
 	config.InsecureSkipVerify = !ncconfig.tlsVerifyCert
 	config.KeepAlive = ncconfig.keepAlive
@@ -3072,6 +3157,12 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	inExited := make(chan struct{})  //
 	outExited := make(chan struct{}) //
 	wg.Add(2)
+	var speedTestTimer *time.Timer
+	var speedTestTimeout <-chan time.Time
+	if ncconfig.speedTestDuration > 0 {
+		speedTestTimer = time.NewTimer(ncconfig.speedTestDuration)
+		speedTestTimeout = speedTestTimer.C
+	}
 
 	go func() {
 		defer wg.Done()
@@ -3121,12 +3212,19 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		close(done)
 	}()
 
-	// 等第一个 goroutine 退出
+	speedTestExpired := false
+	// 等第一个 goroutine 退出，或等待测速时间到达。
 	select {
 	case <-inExited:
 		close(abort)
 	case <-outExited:
 		//
+	case <-speedTestTimeout:
+		speedTestExpired = true
+		nconn.Close()
+	}
+	if speedTestTimer != nil {
+		speedTestTimer.Stop()
 	}
 	select {
 	case <-abort:
@@ -3148,6 +3246,9 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		//ncconfig.Logger.Printf("PID:%d killing cmd process...\n", os.Getpid())
 		cmd.Process.Kill()
 		cmd.Wait()
+	}
+	if speedTestExpired {
+		ncconfig.Logger.Printf("Speed test completed after %s\n", ncconfig.speedTestDuration)
 	}
 	//ncconfig.Logger.Printf("PID:%d (%s) connection done.\n", os.Getpid(), nconn.RemoteAddr().String())
 	return 0

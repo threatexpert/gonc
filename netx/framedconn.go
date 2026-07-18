@@ -12,16 +12,21 @@ import (
 const maxFrameSize = 65535
 
 type FramedConn struct {
-	sessR          io.ReadCloser
-	sessW          io.WriteCloser
-	writeMu        sync.Mutex
-	readMu         sync.Mutex
-	readBuf        []byte // 用于存储上一次Read调用未读完的帧数据，这是结构体自身拥有的缓冲区
-	readEOF        bool   // 是否收到 CloseWrite 帧
-	writeClosed    bool   // 是否已发送过 CloseWrite
-	writeCloseTime time.Time
-	closeOnce      sync.Once
-	closeErr       error
+	sessR                io.ReadCloser
+	sessW                io.WriteCloser
+	disableGracefulClose bool
+	writeMu              sync.Mutex
+	readMu               sync.Mutex
+	readBuf              []byte // 用于存储上一次Read调用未读完的帧数据，这是结构体自身拥有的缓冲区
+	readEOF              bool   // 是否收到 CloseWrite 帧
+	writeClosed          bool   // 是否已发送过 CloseWrite
+	writeCloseTime       time.Time
+	closeOnce            sync.Once
+	closeErr             error
+}
+
+type FramedConnOptions struct {
+	DisableGracefulClose bool
 }
 
 // 帧缓冲池（用于 write 和 read）
@@ -35,7 +40,15 @@ var framePool = sync.Pool{
 
 // NewFramedConn 将一个会话包装成一个带帧的全双工流
 func NewFramedConn(r io.ReadCloser, w io.WriteCloser) *FramedConn {
-	return &FramedConn{sessR: r, sessW: w}
+	return NewFramedConnWithOptions(r, w, FramedConnOptions{})
+}
+
+func NewFramedConnWithOptions(r io.ReadCloser, w io.WriteCloser, options FramedConnOptions) *FramedConn {
+	return &FramedConn{
+		sessR:                r,
+		sessW:                w,
+		disableGracefulClose: options.DisableGracefulClose,
+	}
 }
 
 // Write 将 p 的内容分块写入帧中，并重用缓冲区
@@ -175,6 +188,10 @@ func (c *FramedConn) CloseWrite() error {
 // Close 关闭双向连接
 func (c *FramedConn) Close() error {
 	c.closeOnce.Do(func() {
+		if c.disableGracefulClose {
+			c.closeErr = c.sessW.Close()
+			return
+		}
 		_ = c.CloseWrite()
 		const minWait = 1500 * time.Millisecond
 		waited := time.Since(c.writeCloseTime)
