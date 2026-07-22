@@ -222,6 +222,10 @@ h1 {
     font-weight: 750;
 }
 
+.version-badge[hidden] {
+    display: none;
+}
+
 .lead {
     max-width: 680px;
     margin: 24px 0 0;
@@ -338,6 +342,12 @@ h1 {
 
 .section-kicker-row .section-kicker {
     margin: 0;
+}
+
+.section-kicker-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .section-kicker-row .button {
@@ -618,7 +628,10 @@ h1 {
             <div class="download-head">
                 <div class="download-copy">
                     <div class="section-kicker-row">
-                        <p class="section-kicker">GONC-GUI</p>
+                        <div class="section-kicker-title">
+                            <p class="section-kicker">GONC-GUI</p>
+                            <span class="version-badge" id="gui-version" aria-live="polite" hidden></span>
+                        </div>
                         <a class="button" href="https://github.com/threatexpert/gonc-gui">Github</a>
                     </div>
                     <h2 class="lang-zh">多平台图形界面应用，更方便地连接、传输文件和组网。</h2>
@@ -654,6 +667,42 @@ h1 {
         </section>
     </main>
 </div>
+<script>
+(function () {
+    var versionBadge = document.getElementById("gui-version");
+
+    function fetchJson(url) {
+        return fetch(url).then(function (response) {
+            if (!response.ok) {
+                throw new Error("Unable to load gonc-gui manifest");
+            }
+            return response.json();
+        });
+    }
+
+    fetchJson("/gui/manifest.json")
+        .catch(function () {
+            return fetchJson("https://api.github.com/repos/threatexpert/gonc-gui/releases/latest")
+                .then(function (release) {
+                    return { tag: release.tag_name };
+                });
+        })
+        .then(function (manifest) {
+            var tag = manifest && typeof manifest.tag === "string"
+                ? manifest.tag.trim()
+                : "";
+            if (!/^v\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.-]+)?$/.test(tag)) {
+                return;
+            }
+
+            versionBadge.textContent = tag;
+            versionBadge.hidden = false;
+        })
+        .catch(function () {
+            /* Version information is optional; keep the badge hidden on failure. */
+        });
+})();
+</script>
 </body>
 </html>
 """
