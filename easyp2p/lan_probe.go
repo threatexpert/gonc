@@ -22,6 +22,8 @@ import "net"
 const (
 	// CapLANProbe 能力标识，用于 exchangeAddressPayload.Caps 版本协商
 	CapLANProbe = "lan-probe"
+	// CapCanonicalLANProbe 表示支持以方向无关的方式选择 LANProbeOnly 候选。
+	CapCanonicalLANProbe = "lan-probe-canonical-v2"
 )
 
 // bothPrivateLAN 检查两个地址（host:port 格式）是否都是私有 IP

@@ -1,6 +1,7 @@
 package easyp2p
 
 import (
+	"context"
 	"errors"
 	"io"
 	"testing"
@@ -90,6 +91,89 @@ func TestTCPTraversalTimeout(t *testing.T) {
 func TestTCPUnsynchronizedSameLANRetryInterval(t *testing.T) {
 	if tcpUnsynchronizedSameLANRetryInterval != 250*time.Millisecond {
 		t.Fatalf("retry interval = %s, want 250ms", tcpUnsynchronizedSameLANRetryInterval)
+	}
+}
+
+func TestLANProbeErrorGracePeriod(t *testing.T) {
+	if lanProbeErrorGracePeriod != time.Second {
+		t.Fatalf("LAN probe error grace = %s, want 1s", lanProbeErrorGracePeriod)
+	}
+}
+
+func TestReportTraversalErrorWaitsForGrace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wantErr := errors.New("candidate failed")
+	errCh := make(chan error, 1)
+	started := time.Now()
+	go reportTraversalError(ctx, errCh, wantErr, 100*time.Millisecond)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("error reported before grace elapsed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("reported error = %v, want %v", err, wantErr)
+		}
+		if elapsed := time.Since(started); elapsed < 80*time.Millisecond {
+			t.Fatalf("error reported after %s, want at least 80ms", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("error was not reported after grace elapsed")
+	}
+}
+
+func TestReportTraversalErrorCancellationSuppressesPendingError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reportTraversalError(ctx, errCh, errors.New("candidate failed"), 200*time.Millisecond)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("error reporter did not stop after cancellation")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("canceled error reporter delivered %v", err)
+	default:
+	}
+}
+
+func TestReportTraversalErrorHonorsShorterAttemptDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		defer close(done)
+		reportTraversalError(ctx, errCh, errors.New("candidate failed"), 200*time.Millisecond)
+	}()
+
+	select {
+	case <-done:
+		if elapsed := time.Since(started); elapsed >= 150*time.Millisecond {
+			t.Fatalf("error reporter exceeded attempt deadline: %s", elapsed)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("error reporter ignored attempt deadline")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("deadline-canceled error reporter delivered %v", err)
+	default:
 	}
 }
 

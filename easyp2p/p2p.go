@@ -313,6 +313,118 @@ func hasCap(caps []string, cap string) bool {
 	return false
 }
 
+type lanProbeCandidate struct {
+	info        *P2PAddressInfo
+	localOrder  int
+	remoteOrder int
+}
+
+func buildBaseP2PCandidates(localAddresses, remoteAddresses []PunchingAddressInfo, peerSupportsLANProbe bool) (
+	finalResults []*P2PAddressInfo,
+	lanProbeCandidates []lanProbeCandidate,
+	haveCommonNetwork bool,
+) {
+	for localOrder, myNetInfo := range localAddresses {
+		network := myNetInfo.Network
+		myNATType := myNetInfo.NatType
+		myLAN := myNetInfo.Lan
+		myNAT := myNetInfo.Nat
+
+		for remoteOrder, remoteNetInfo := range remoteAddresses {
+			if remoteNetInfo.Network != network {
+				continue
+			}
+			haveCommonNetwork = true
+			remoteNATType := remoteNetInfo.NatType
+			remoteLAN := remoteNetInfo.Lan
+			remoteNAT := remoteNetInfo.Nat
+
+			item := &P2PAddressInfo{
+				Network:       network,
+				LocalLAN:      myLAN,
+				LocalNAT:      myNAT,
+				LocalNATType:  myNATType,
+				RemoteLAN:     remoteLAN,
+				RemoteNAT:     remoteNAT,
+				RemoteNATType: remoteNATType,
+			}
+
+			if getNATTypePriority(myNATType) == 0 || getNATTypePriority(remoteNATType) == 0 {
+				continue
+			}
+
+			sameNAT, similarLAN := CompareP2PAddresses(item)
+
+			if myNATType == "symm" && remoteNATType == "symm" {
+				if !sameNAT || !similarLAN {
+					if peerSupportsLANProbe && strings.HasPrefix(network, "tcp") && bothPrivateLAN(myLAN, remoteLAN) {
+						item.LANProbeOnly = true
+						lanProbeCandidates = append(lanProbeCandidates, lanProbeCandidate{
+							info:        item,
+							localOrder:  localOrder,
+							remoteOrder: remoteOrder,
+						})
+					}
+					continue
+				}
+			}
+
+			if strings.HasPrefix(network, "tcp") && (!sameNAT || !similarLAN) {
+				if myNATType != "easy" && remoteNATType != "easy" {
+					if peerSupportsLANProbe && bothPrivateLAN(myLAN, remoteLAN) {
+						item.LANProbeOnly = true
+						lanProbeCandidates = append(lanProbeCandidates, lanProbeCandidate{
+							info:        item,
+							localOrder:  localOrder,
+							remoteOrder: remoteOrder,
+						})
+					}
+					continue
+				}
+			}
+
+			finalResults = append(finalResults, item)
+		}
+	}
+	return finalResults, lanProbeCandidates, haveCommonNetwork
+}
+
+func canonicalLANProbeCandidateKey(info *P2PAddressInfo) string {
+	localEndpoint := info.LocalNATType + "\x00" + info.LocalLAN + "\x00" + info.LocalNAT
+	remoteEndpoint := info.RemoteNATType + "\x00" + info.RemoteLAN + "\x00" + info.RemoteNAT
+	if localEndpoint > remoteEndpoint {
+		localEndpoint, remoteEndpoint = remoteEndpoint, localEndpoint
+	}
+	return info.Network + "\x00" + localEndpoint + "\x00" + remoteEndpoint
+}
+
+func selectLANProbeCandidate(candidates []lanProbeCandidate, peerSupportsCanonical bool) *P2PAddressInfo {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if !peerSupportsCanonical {
+		selected := candidates[0]
+		for _, candidate := range candidates[1:] {
+			if candidate.remoteOrder < selected.remoteOrder ||
+				(candidate.remoteOrder == selected.remoteOrder && candidate.localOrder < selected.localOrder) {
+				selected = candidate
+			}
+		}
+		return selected.info
+	}
+
+	selected := candidates[0].info
+	selectedKey := canonicalLANProbeCandidateKey(selected)
+	for _, candidate := range candidates[1:] {
+		key := canonicalLANProbeCandidateKey(candidate.info)
+		if key < selectedKey {
+			selected = candidate.info
+			selectedKey = key
+		}
+	}
+	return selected
+}
+
 func DetectNATAddressInfo(networks []string, bind string, relayConn *RelayPacketConn, logWriter io.Writer) ([]PunchingAddressInfo, []*STUNResult, error) {
 	return DetectNATAddressInfoContext(context.Background(), networks, bind, relayConn, logWriter)
 }
@@ -436,6 +548,7 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 	// 声明本端支持的特性（能力列表），用于和对端协商打洞策略等。老版本不发送这个字段，默认对方不支持这些能力。
 	myInfoForExchange.Caps = []string{
 		CapLANProbe,          // LAN 直连探测能力
+		CapCanonicalLANProbe, // 方向无关的 LANProbeOnly 候选选择
 		CapMultiExitUDPPunch, // 多出口并行UDP打洞能力
 	}
 
@@ -496,82 +609,23 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		sharedKey = sha256.Sum256(sharedX.Bytes())
 	}
 
-	var finalResults []*P2PAddressInfo
-	haveCommonNetwork := false
 	localSupportsMultiExitUDPPunch := hasCap(myInfoForExchange.Caps, CapMultiExitUDPPunch)
 	peerSupportsMultiExitUDPPunch := hasCap(remotePayload.Caps, CapMultiExitUDPPunch)
-	peerSupportsLANProbe := hasCap(remotePayload.Caps, CapLANProbe) // [新增]
-	lanProbeAdded := false                                          // [新增]
+	peerSupportsLANProbe := hasCap(remotePayload.Caps, CapLANProbe)
+	peerSupportsCanonicalLANProbe := hasCap(remotePayload.Caps, CapCanonicalLANProbe)
 	LocalPublicIPv4Count := countUniquePublicIPs(myInfoForExchange.Addresses, "4")
 	LocalPublicIPv6Count := countUniquePublicIPs(myInfoForExchange.Addresses, "6")
 	RemotePublicIPv4Count := countUniquePublicIPs(remotePayload.Addresses, "4")
 	RemotePublicIPv6Count := countUniquePublicIPs(remotePayload.Addresses, "6")
 	relayAvailable := countRelayIPv4(myInfoForExchange.Addresses) > 0 || countRelayIPv4(remotePayload.Addresses) > 0
 
-	for _, myNetInfo := range myInfoForExchange.Addresses {
-		// 获取我们自己的地址组，支持多个地址
-		net := myNetInfo.Network
-		myNATType := myNetInfo.NatType
-		myLAN := myNetInfo.Lan
-		myNAT := myNetInfo.Nat
-
-		// 检查对方是否也返回了相同网络类型的信息
-		for _, remoteNetInfo := range remotePayload.Addresses {
-			if remoteNetInfo.Network != net {
-				continue
-			}
-			haveCommonNetwork = true
-			rNATType := remoteNetInfo.NatType
-			remoteLAN := remoteNetInfo.Lan
-			remoteNAT := remoteNetInfo.Nat
-
-			item := &P2PAddressInfo{
-				Network:       net,
-				LocalLAN:      myLAN,
-				LocalNAT:      myNAT,
-				LocalNATType:  myNATType,
-				RemoteLAN:     remoteLAN,
-				RemoteNAT:     remoteNAT,
-				RemoteNATType: rNATType,
-			}
-
-			//Priority == 0 means invalid type
-			if getNATTypePriority(myNATType) == 0 || getNATTypePriority(rNATType) == 0 {
-				continue
-			}
-
-			sameNAT, similarLAN := CompareP2PAddresses(item)
-
-			if myNATType == "symm" && rNATType == "symm" {
-				if !sameNAT || !similarLAN {
-					// [修改] 新版对新版：双方都有私有LAN地址，保留一对tcp地址做LAN探测
-					if peerSupportsLANProbe && !lanProbeAdded && strings.HasPrefix(net, "tcp") && bothPrivateLAN(myLAN, remoteLAN) {
-						item.LANProbeOnly = true
-						lanProbeAdded = true
-						finalResults = append(finalResults, item)
-					}
-					continue
-				}
-				//对称型，但在相同内网，可以p2p
-			}
-
-			if strings.HasPrefix(net, "tcp") {
-				if !sameNAT || !similarLAN {
-					//TCP，如果不在相同内网，必须至少一端是easy的
-					if myNATType != "easy" && rNATType != "easy" {
-						// [修改] 新版对新版：双方都有私有LAN地址，保留一对做LAN探测
-						if peerSupportsLANProbe && !lanProbeAdded && bothPrivateLAN(myLAN, remoteLAN) {
-							item.LANProbeOnly = true
-							lanProbeAdded = true
-							finalResults = append(finalResults, item)
-						}
-						continue
-					}
-				}
-			}
-
-			finalResults = append(finalResults, item)
-		}
+	finalResults, lanProbeCandidates, haveCommonNetwork := buildBaseP2PCandidates(
+		myInfoForExchange.Addresses,
+		remotePayload.Addresses,
+		peerSupportsLANProbe,
+	)
+	if selected := selectLANProbeCandidate(lanProbeCandidates, peerSupportsCanonicalLANProbe); selected != nil {
+		finalResults = append(finalResults, selected)
 	}
 	if len(finalResults) == 0 {
 		if !haveCommonNetwork {
@@ -1760,6 +1814,27 @@ func tcpActiveDialDelay(isClient, inSameLAN, lanProbeOnly bool) time.Duration {
 
 const tcpUnsynchronizedSameLANRetryInterval = 250 * time.Millisecond
 
+const lanProbeErrorGracePeriod = time.Second
+
+func reportTraversalError(ctx context.Context, errCh chan<- error, err error, grace time.Duration) {
+	if err == nil {
+		return
+	}
+	if grace > 0 {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+	select {
+	case errCh <- err:
+	case <-ctx.Done():
+	}
+}
+
 type tcpPunchAckSelector struct {
 	mu       sync.Mutex
 	selected bool
@@ -1918,14 +1993,12 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 	connChan := make(chan ConnWithTag)
 	errChan := make(chan error, 1)
+	errorGrace := time.Duration(0)
+	if p2pInfo.LANProbeOnly {
+		errorGrace = lanProbeErrorGracePeriod
+	}
 	reportErr := func(err error) {
-		if err == nil {
-			return
-		}
-		select {
-		case errChan <- err:
-		case <-attemptCtx.Done():
-		}
+		reportTraversalError(attemptCtx, errChan, err, errorGrace)
 	}
 	punchAckPayload := []byte(deriveKeyForPayload(sessionUid, false))
 	var punchAckSelector tcpPunchAckSelector

@@ -388,6 +388,76 @@ func TestAutoP2PTCPTraversalSuccessfulOwnershipTransfer(t *testing.T) {
 	}
 }
 
+func TestAutoP2PTCPLANProbeOnlyAllowsInboundDuringErrorGrace(t *testing.T) {
+	t.Setenv("ROLE_DEBUG", "C")
+
+	localAddr, unreachableAddr := reserveTCPAddrPair(t)
+	info := loopbackP2PInfo(localAddr, unreachableAddr)
+	info.LANProbeOnly = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	result := make(chan traversalResult, 1)
+	ready := newReadyLogWriter()
+	go runTCPTraversal(ctx, info, ready, result)
+
+	select {
+	case <-ready.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("LAN probe listener was not prepared")
+	}
+
+	peerResult := make(chan error, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+
+		peer, err := net.DialTimeout("tcp4", localAddr, time.Second)
+		if err != nil {
+			peerResult <- err
+			return
+		}
+		defer peer.Close()
+		if err := peer.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			peerResult <- err
+			return
+		}
+
+		payload := []byte(deriveKeyForPayload("tcp-context-test", false))
+		buf := make([]byte, len(payload))
+		if _, err := io.ReadFull(peer, buf); err != nil {
+			peerResult <- err
+			return
+		}
+		if !bytes.Equal(buf, payload) {
+			peerResult <- errors.New("inbound peer received invalid punch ACK")
+			return
+		}
+		if _, err := peer.Write(payload); err != nil {
+			peerResult <- err
+			return
+		}
+		peerResult <- nil
+	}()
+
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("LAN probe rejected a valid inbound connection after outbound failure: %v", got.err)
+		}
+		if got.conn == nil {
+			t.Fatal("LAN probe returned a nil inbound connection")
+		}
+		_ = got.conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("LAN probe did not return the inbound connection")
+	}
+
+	if err := <-peerResult; err != nil {
+		t.Fatalf("inbound peer handshake failed: %v", err)
+	}
+}
+
 func TestAutoP2PTCPTraversalRetriesRejectedSameLANDial(t *testing.T) {
 	t.Setenv("ROLE_DEBUG", "C")
 
