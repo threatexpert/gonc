@@ -41,7 +41,7 @@ gonc -l [端口]
 | --- | --- | --- |
 | **`-l`** | **监听模式 (Listen)** | 开启服务端，绑定本地端口等待连接。 |
 | **`-local`** | **绑定本地地址** | 格式为 `ip:port`。如果只指定端口 (如 `-l 8080`)，默认绑定 `0.0.0.0`。使用 `-local 127.0.0.1:8080` 可限制只允许本机访问。 |
-| **`-k`, `-keep-open`** | **保持监听** | 传统netcat客户端断开后服务端会退出。开启此选项后，服务端会保持运行，等待下一个客户端连接（类似守护进程）。 |
+| **`-k`, `-keep-open`** | **保持服务** | 监听模式下持续接受客户端；P2P 和持久 MUX 隧道（如 `link`）断开后重新建立。普通主动 netcat 连接仍然只执行一次。 |
 | **`-U`** | **Unix Domain Socket** | 监听或连接 Unix Socket 文件而非 TCP/UDP 端口。 |
 | **`-pp`** | **PROXY 协议接收** | 严格模式：每个入连接前必须有 HAProxy PROXY protocol v1 或 v2 头部（自动识别）。gonc 读取并剥离头部，把真实客户端地址透传到 `c.RemoteAddr()` / `c.LocalAddr()`，下游所有逻辑（ACL、`-e :mux ...`、`:httpserver`、shell 等）都自动感知到真实源 IP。需要上游（nginx `proxy_protocol on;` / HAProxy `send-proxy-v2` / AWS NLB / 另一台开了 `pp=v2` 的 gonc）配合。10 秒内未发头或头部非法的连接会被关掉。 |
 

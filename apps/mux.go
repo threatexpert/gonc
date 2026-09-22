@@ -418,15 +418,19 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 	rawScheme := u.Scheme
 	baseScheme := rawScheme
 	useTLS := false
+	requireTLSPSK := false
 
 	// 支持 x+tls / f+tls / raw+tls
 	if strings.Contains(rawScheme, "+") {
 		parts := strings.Split(rawScheme, "+")
 		baseScheme = parts[0]
 		for _, p := range parts[1:] {
-			if p == "tls" {
+			switch p {
+			case "tls":
 				useTLS = true
-			} else {
+			case "psk":
+				requireTLSPSK = true
+			default:
 				return "", "", nil, fmt.Errorf("unknown scheme modifier '+%s'", p)
 			}
 		}
@@ -444,6 +448,15 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 	pass, _ := u.User.Password()
 
 	q := u.Query()
+	if requireTLSPSK {
+		if !useTLS {
+			return "", "", nil, fmt.Errorf("scheme modifier '+psk' requires '+tls'")
+		}
+		if q.Get("psk") == "" {
+			return "", "", nil, fmt.Errorf("scheme modifier '+psk' requires a non-empty psk parameter")
+		}
+		q.Set("_require_tls_psk", "1")
+	}
 	q.Set("_user", user)
 	q.Set("_password", pass)
 
@@ -454,11 +467,45 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 	return baseScheme, u.Host, q, nil
 }
 
+// requireLinkSchemeModifier adds a fail-closed protocol marker to a link URL.
+// An older peer rejects the unknown modifier before binding a listener instead
+// of silently ignoring a security-sensitive query parameter.
+func requireLinkSchemeModifier(conf, modifier string) string {
+	marker := "://"
+	idx := strings.Index(conf, marker)
+	if idx <= 0 {
+		return conf
+	}
+	scheme := conf[:idx]
+	for _, part := range strings.Split(scheme, "+") {
+		if part == modifier {
+			return conf
+		}
+	}
+	return scheme + "+" + modifier + conf[idx:]
+}
+
+func redactLinkConfigForLog(conf string) string {
+	trimmed := strings.TrimSpace(conf)
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	q := u.Query()
+	if q.Get("psk") == "" {
+		return trimmed
+	}
+	q.Set("psk", "REDACTED")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // linkRuntimeConfig 保存预处理后的运行参数
 // 这里的字段是从 url.Values 解析出来的，用于 runLinkListener 直接使用
 type linkRuntimeConfig struct {
 	UseTLS              bool
 	NtConfig            *secure.NegotiationConfig
+	TLSCertSNI          string
 	UseTProxy           bool
 	TProxyAllowPublicIP bool
 	Username            string
@@ -488,17 +535,52 @@ func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.
 		cfg.NtConfig.IsClient = false
 		cfg.NtConfig.SecureLayer = "tls"
 		cfg.NtConfig.KeepAlive = 0
+		cfg.TLSCertSNI = params.Get("sni")
+		if cfg.TLSCertSNI == "" {
+			cfg.TLSCertSNI = "localhost"
+		}
+
+		psk := params.Get("psk")
+		if psk != "" {
+			if scheme != "x" {
+				return nil, fmt.Errorf("psk is only supported for x+tls link listeners")
+			}
+			psk, err = secure.ReadPSKFile(psk)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read link TLS PSK: %v", err)
+			}
+			if psk == "" {
+				return nil, fmt.Errorf("link TLS PSK cannot be empty")
+			}
+			cfg.NtConfig.KeyType = "PSK"
+			cfg.NtConfig.Key = psk
+			cfg.NtConfig.ErrorOnFailKeyingMaterial = true
+		}
+
 		sslCertFile := params.Get("cert")
 		sslKeyFile := params.Get("key")
+		if (sslCertFile == "") != (sslKeyFile == "") {
+			return nil, fmt.Errorf("cert and key must be specified together")
+		}
+		if psk != "" && sslCertFile != "" {
+			return nil, fmt.Errorf("psk cannot be combined with cert/key; the TLS certificate must be derived from the PSK")
+		}
 		if len(sslCertFile) > 0 && len(sslKeyFile) > 0 {
 			cert, err = secure.LoadCertificate(sslCertFile, sslKeyFile)
 		} else {
-			cert, err = secure.GenerateECDSACertificate("link-tls", "")
+			cert, err = secure.GenerateECDSACertificate(cfg.TLSCertSNI, psk)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to load/generate TLS certificate: %v", err)
 		}
 		cfg.NtConfig.Certs = []tls.Certificate{*cert}
+	} else {
+		if params.Get("psk") != "" {
+			return nil, fmt.Errorf("psk requires an x+tls link listener")
+		}
+		if params.Get("sni") != "" {
+			return nil, fmt.Errorf("sni requires a +tls link listener")
+		}
 	}
 
 	// 通用参数：PROXY protocol 注入开关。仅支持 "v2"
@@ -715,6 +797,9 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 
 	sendConf := rConf
+	if rParams.Get("psk") != "" {
+		sendConf = requireLinkSchemeModifier(sendConf, "psk")
+	}
 	separator := "?"
 	if strings.Contains(sendConf, "?") {
 		separator = "&"
@@ -735,7 +820,7 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	sendConf += "\n"
 	// -------------------------------------------------------------
 
-	cfg.Logger.Printf("[link] Sending R-Config: %s", strings.TrimSpace(sendConf))
+	cfg.Logger.Printf("[link] Sending R-Config: %s", redactLinkConfigForLog(sendConf))
 	if _, err := cfg.SessionConn.Write([]byte(sendConf)); err != nil {
 		return fmt.Errorf("failed to send remote config: %v", err)
 	}
@@ -749,6 +834,9 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 	ack = strings.TrimSpace(ack)
 	if !strings.HasPrefix(ack, "OK") {
+		if rParams.Get("psk") != "" {
+			return fmt.Errorf("remote link failed: %s (TLS-PSK link listeners require a peer with link_tls_psk support)", ack)
+		}
 		return fmt.Errorf("remote link failed: %s", ack)
 	}
 	cfg.Logger.Printf("[link] Remote ready (%s).", ack)
@@ -759,6 +847,9 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	// 任一侧配置了 pp=v2，对端必须支持 pp_v2 能力位，否则握手失败
 	if (lParams.Get("pp") == "v2" || rParams.Get("pp") == "v2") && !caps["pp_v2"] {
 		return fmt.Errorf("remote does not support pp_v2 capability (ACK=%q). please upgrade the peer", ack)
+	}
+	if rParams.Get("psk") != "" && !caps["link_tls_psk"] {
+		return fmt.Errorf("remote does not support link_tls_psk capability (ACK=%q). please upgrade the peer", ack)
 	}
 
 	cfg.SessionConn.SetDeadline(time.Time{})
@@ -1247,7 +1338,7 @@ func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 }
 
 // supportedCaps 本进程对外宣告的能力位（写进 R 端的 ACK）。新增能力时追加到这里即可。
-var supportedCaps = []string{"pp_v2"}
+var supportedCaps = []string{"pp_v2", "link_tls_psk"}
 
 // buildAckCaps 返回形如 "caps=pp_v2,xxx" 的片段。
 func buildAckCaps() string {

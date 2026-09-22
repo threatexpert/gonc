@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	VERSION = "v2.6.9"
+	VERSION = "v2.6.10"
 )
 
 type AppNetcatConfig struct {
@@ -323,7 +323,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.progressEnabled, "progress", false, "show transfer progress")
 	fs.StringVar(&config.runCmd, "exec", "", "runs a command for each connection")
 	fs.StringVar(&config.remoteCall, "call", "", "send a string with LF for each connection")
-	fs.BoolVar(&config.keepOpen, "keep-open", false, "keep listening after client disconnects")
+	fs.BoolVar(&config.keepOpen, "keep-open", false, "keep listening after disconnects; reconnect persistent client tunnels")
 	fs.BoolVar(&config.enablePty, "pty", false, "put the terminal into raw mode")
 	fs.BoolVar(&config.useSTUN, "stun", false, "use STUN to discover public IP")
 	fs.StringVar(&config.autoP2P, "p2p", "", "P2P session key (or @file). Auto try UDP/TCP via NAT traversal")
@@ -1874,8 +1874,55 @@ func runScanMode(console net.Conn, ncconfig *AppNetcatConfig, start, end, limit 
 	return 0
 }
 
+const persistentDialRetryDelay = 10 * time.Second
+
+// shouldRetryPersistentDial limits client-side -k reconnects to long-lived
+// tunnel services. Plain netcat, downloads, scans and other one-shot commands
+// retain their historical single-dial behavior.
+func shouldRetryPersistentDial(ncconfig *AppNetcatConfig) bool {
+	if ncconfig == nil || !ncconfig.keepOpen {
+		return false
+	}
+	if isEnabledMuxMode(ncconfig) {
+		return true
+	}
+	if ncconfig.app_mux_Config == nil {
+		return false
+	}
+	switch ncconfig.app_mux_Config.AppMode {
+	case "link", "linkagent", "listen", "socks5", "httpserver":
+		return true
+	default:
+		return false
+	}
+}
+
+func runPersistentDialLoop(ctx context.Context, retryDelay time.Duration, logger *log.Logger, dialOnce func() int) int {
+	for {
+		dialOnce()
+		if ctx.Err() != nil {
+			return 0
+		}
+		if logger != nil {
+			logger.Printf("Persistent tunnel disconnected; retrying in %s...\n", retryDelay)
+		}
+		if err := netx.WaitContext(ctx, retryDelay); err != nil {
+			return 0
+		}
+	}
+}
+
 // runDialMode 在主动连接模式下启动客户端
 func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
+	if shouldRetryPersistentDial(ncconfig) {
+		return runPersistentDialLoop(ncconfig.ctx, persistentDialRetryDelay, ncconfig.Logger, func() int {
+			return runDialModeOnce(console, ncconfig, network, host, port)
+		})
+	}
+	return runDialModeOnce(console, ncconfig, network, host, port)
+}
+
+func runDialModeOnce(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
 	var conn net.Conn
 	var err error
 

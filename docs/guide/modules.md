@@ -328,6 +328,8 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | --- | --- | --- |
 | **`cert`** | `cert=server.pem` | 指定 TLS 证书文件路径。 |
 | **`key`** | `key=server.key` | 指定 TLS 私钥文件路径。 |
+| **`sni`** | `sni=proxy.example.com` | 自动证书的 CN/SAN，默认为 `localhost`。 |
+| **`psk`** | `psk=secret` 或 `psk=@/path/key` | 为 `x+tls` 启用 gonc TLS-PSK 双向认证。SOCKS5 UDP 使用 TLS 导出的会话密钥加密。不能与 `cert/key` 同时使用。发送给对端时会自动增加 `+psk` 能力标记，使不支持该功能的旧版 linkagent 在绑定端口前拒绝，防止静默降级。 |
 
 ---
 
@@ -363,6 +365,8 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 
 用-link参数会自动添加-k -mqtt-hello -e 调用":mux"
 
+使用 `-remote host:port -link "..."` 建立固定地址隧道时，`-link` 同样会自动启用 `-k`。首次拨号失败或 MUX 隧道断开后会持续重连；普通的一次性 netcat 主动连接不受该行为影响。
+
 === "透明代理与多 IP"
 家里开启透明代理，公司不监听端口，公司转发流量时使用指定IP：192.168.1.5。透明代理只支持绑定在0.0.0.0，但只允许来自loopback地址访问。
 ```bash
@@ -395,6 +399,16 @@ server {
 本地监听加密的 SOCKS5 端口（需要客户端用 TLS 连入）。
 ```bash
 gonc -p2p mysecret123 -link "x+tls://0.0.0.0:8443?cert=ca.pem&key=key.pem;none"
+```
+
+=== "TLS-PSK 安全监听"
+在 linkagent 一端监听 3180，并使用 gonc TLS-PSK 保护 SOCKS5 TCP 及 UDP：
+```bash
+gonc -p2p mysecret123 -link "none;x+tls://0.0.0.0:3180?sni=proxy.example.com&psk=another-secret"
+```
+客户端使用相同 PSK：
+```bash
+gonc -x "socks5s://server.example.com:3180?psk=another-secret" target.example.com 443
 ```
 
 
