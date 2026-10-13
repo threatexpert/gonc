@@ -1352,7 +1352,18 @@ func ServeProxyOnTunnel(config *Socks5uConfig, conn net.Conn, keyingMaterial [32
 	}
 }
 
-// handleSocks5ClientOnMuxStream 处理每个通过 MuxSession 传入的 Stream
+// ServeTunnelConn serves one TCP or UDP proxy session on conn, which may be
+// a dedicated TCP/TLS connection or a mux stream. It handles the tunnel protocol
+// emitted by ServeProxyOnTunnel, not a raw SOCKS5 client handshake.
+//
+// The caller must complete any transport authentication before calling this
+// function and provide a non-nil config with a non-nil Logger. ServeTunnelConn
+// blocks until the session ends and closes conn before returning.
+func ServeTunnelConn(config *Socks5uConfig, conn net.Conn) {
+	handleSocks5ClientOnStream(config, conn)
+}
+
+// handleSocks5ClientOnStream 处理单条隧道连接上的代理请求。
 func handleSocks5ClientOnStream(config *Socks5uConfig, tunnelStream net.Conn) {
 	defer tunnelStream.Close()
 
