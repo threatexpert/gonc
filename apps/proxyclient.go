@@ -395,7 +395,7 @@ func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error create proxy client: %v", err)
 	}
-	conn, err := proxyClient.DialTimeout("udp", ":0", 20*time.Second)
+	conn, err := proxyClient.DialTimeout("udp", "0.0.0.0:0", 20*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect proxy server: %v", err)
 	}
