@@ -3529,8 +3529,12 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (strin
 
 	if ncconfig.useMQTTWait {
 		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
-		// Keep the idle listener and its broker failure state until a peer wakes it.
-		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 0, ncconfig.LogWriter)
+		waitTimeout := 30 * time.Minute
+		if ncconfig.keepOpen {
+			// Keep persistent listeners and their broker failure state alive while idle.
+			waitTimeout = 0
+		}
+		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, waitTimeout, ncconfig.LogWriter)
 		if err != nil {
 			return "", nil, fmt.Errorf("mqtt-wait: %v", err)
 		}
