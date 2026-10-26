@@ -3673,10 +3673,24 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 		// ─── STUN/NAT 打洞 ───
 		ReportP2PStatus(ncconfig, reportSessionID, "connecting", ncconfig.network, "", "")
 		var relayConn *easyp2p.RelayPacketConn
-		socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
+		proxyTimeout := 20 * time.Second
+		proxyLabel := "SOCKS5 relay (-x)"
+		if ncconfig.fallbackRelayMode {
+			proxyTimeout = 15 * time.Second
+			proxyLabel = "fallback relay (-x2)"
+		}
+		if proxyConfig := ncconfig.arg_proxyc_Config; proxyConfig != nil && proxyConfig.Prot != "" && proxyConfig.ServerHost != "" {
+			ncconfig.Logger.Printf("Initializing %s connection to %s (timeout: %s)...\n",
+				proxyLabel, net.JoinHostPort(proxyConfig.ServerHost, proxyConfig.ServerPort), proxyTimeout)
+		}
+		socks5UDPClient, err := createSocks5UDPClientWithTimeout(ncconfig.arg_proxyc_Config, proxyTimeout)
 		if err != nil {
-			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
-			return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
+			if !ncconfig.fallbackRelayMode {
+				ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
+				return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
+			}
+			// An unavailable optional relay must not prevent direct P2P attempts.
+			ncconfig.Logger.Printf("Fallback relay unavailable (-x2): %v; continuing with direct P2P\n", err)
 		} else if socks5UDPClient != nil {
 			relayConn = &easyp2p.RelayPacketConn{
 				PacketConn: socks5UDPClient,

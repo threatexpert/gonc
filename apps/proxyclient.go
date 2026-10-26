@@ -382,6 +382,10 @@ func Proxy_usage_flagSet(fs *flag.FlagSet) {
 }
 
 func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {
+	return createSocks5UDPClientWithTimeout(config, 20*time.Second)
+}
+
+func createSocks5UDPClientWithTimeout(config *ProxyClientConfig, timeout time.Duration) (net.PacketConn, error) {
 	if config == nil {
 		return nil, nil
 	}
@@ -395,7 +399,7 @@ func CreateSocks5UDPClient(config *ProxyClientConfig) (net.PacketConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error create proxy client: %v", err)
 	}
-	conn, err := proxyClient.DialTimeout("udp", "0.0.0.0:0", 20*time.Second)
+	conn, err := proxyClient.DialTimeout("udp", "0.0.0.0:0", timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect proxy server: %v", err)
 	}
