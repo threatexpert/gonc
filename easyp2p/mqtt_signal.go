@@ -110,8 +110,25 @@ func NewMQTTSignalSession(ctx context.Context, clientID, localIP string, logWrit
 }
 
 func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID, localIP string, logWriter io.Writer) (*MQTTSignalSession, error) {
+	s, ready, fail, err := startMQTTSignalSession(ctx, brokerServers, clientID, localIP, logWriter)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.waitForFirstConnection(ready, fail); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// startMQTTSignalSession starts reconnecting without requiring an available
+// broker at startup. Passive listeners can wait for subscriptions on this same
+// session indefinitely, retaining failure/recovery log state during outages.
+func startMQTTSignalSession(ctx context.Context, brokerServers []string, clientID, localIP string, logWriter io.Writer) (*MQTTSignalSession, <-chan struct{}, <-chan struct{}, error) {
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, nil, cause
+	}
 	if len(brokerServers) == 0 {
-		return nil, fmt.Errorf("no MQTT broker servers configured")
+		return nil, nil, nil, fmt.Errorf("no MQTT broker servers configured")
 	}
 	if clientID == "" {
 		clientID = MQTT_GenerateClientID(TopicDesc_Signal, "mqtt-signal-session", 0)
@@ -153,10 +170,7 @@ func newMQTTSignalSession(ctx context.Context, brokerServers []string, clientID,
 		go s.connectBroker(serverURL, q, i, dialer, ready, fail)
 	}
 
-	if err := s.waitForFirstConnection(ready, fail); err != nil {
-		return nil, err
-	}
-	return s, nil
+	return s, ready, fail, nil
 }
 
 func (s *MQTTSignalSession) waitForFirstConnection(ready, fail <-chan struct{}) (err error) {
@@ -888,7 +902,15 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 		return "", -1, false, cause
 	}
 
-	exchangeCtx, cancel := context.WithTimeout(parentCtx, timeout)
+	// A zero timeout is unlimited only for passive waiting. Active exchanges
+	// retain their existing deadlines, and parent cancellation always applies.
+	exchangeCtx := parentCtx
+	var cancel context.CancelFunc
+	if exmode == EXMODE_waitOnly && timeout == 0 {
+		exchangeCtx, cancel = context.WithCancel(parentCtx)
+	} else {
+		exchangeCtx, cancel = context.WithTimeout(parentCtx, timeout)
+	}
 	defer cancel()
 
 	if exmode != exmodePublishOnly {

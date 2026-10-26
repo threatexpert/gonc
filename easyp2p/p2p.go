@@ -2395,6 +2395,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 }
 
+// MqttWait waits for a peer wakeup. A zero timeout waits until ctx is canceled.
 func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Duration, logWriter io.Writer) (string, error) {
 	tid, signal, err := MqttWaitSession(ctx, sessionUid, localIP, timeout, logWriter)
 	if signal != nil {
@@ -2406,6 +2407,9 @@ func MqttWait(ctx context.Context, sessionUid, localIP string, timeout time.Dura
 	return tid, err
 }
 
+// MqttWaitSession waits for a peer wakeup and returns its signaling session.
+// A zero timeout keeps waiting and reconnecting, including during startup
+// outages, until a wakeup arrives or ctx is canceled.
 func MqttWaitSession(ctx context.Context, sessionUid, localIP string, timeout time.Duration, logWriter io.Writer) (string, *MQTTSignalSession, error) {
 	uid := deriveKeyForTopic("mqtt-topic-gonc-wait", sessionUid)
 	topicSalt := "nat-exchange-wait/" + uid
@@ -2414,7 +2418,13 @@ func MqttWaitSession(ctx context.Context, sessionUid, localIP string, timeout ti
 	logger := misc.NewLog(logWriter, "[MQTT] ", log.LstdFlags|log.Lmsgprefix)
 	logger.Printf("Waiting for event on topic: %s across %d servers\n", topic, len(MQTTBrokerServers))
 
-	signal, err := NewMQTTSignalSession(ctx, clientID, localIP, logWriter)
+	var signal *MQTTSignalSession
+	var err error
+	if timeout == 0 {
+		signal, _, _, err = startMQTTSignalSession(ctx, MQTTBrokerServers, clientID, localIP, logWriter)
+	} else {
+		signal, err = NewMQTTSignalSession(ctx, clientID, localIP, logWriter)
+	}
 	if err != nil {
 		return "", nil, err
 	}
