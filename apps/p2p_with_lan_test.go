@@ -112,6 +112,62 @@ func TestPrepareNetcatConfigEnablesEmbeddedActiveP2PWithLAN(t *testing.T) {
 	}
 }
 
+func TestPrepareNetcatConfigPreservesP2PWithLANFlagForEmbeddedVPN(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		wantMQTTHello bool
+		wantMQTTWait  bool
+	}{
+		{
+			name: "active link client",
+			args: []string{
+				"-p2p", "A9f#K2m!Q7x@L4v$R8p%T6z",
+				"-link", "x://127.0.0.1:0",
+				"-p2p-with-lan",
+			},
+			wantMQTTHello: true,
+		},
+		{
+			name: "passive linkagent server",
+			args: []string{
+				"-p2p", "A9f#K2m!Q7x@L4v$R8p%T6z",
+				"-k", "-W", "-P",
+				"-e", ":mux linkagent",
+				"-p2p-with-lan",
+			},
+			wantMQTTWait: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config, err := PrepareNetcatConfigWithOptions(
+				context.Background(),
+				io.Discard,
+				tt.args,
+				RunOptions{},
+			)
+			if err != nil {
+				t.Fatalf("PrepareNetcatConfigWithOptions: %v", err)
+			}
+			if !config.p2pWithLanMode {
+				t.Fatal("embedded preparation discarded the explicit -p2p-with-lan flag")
+			}
+			if config.useMQTTHello != tt.wantMQTTHello || config.useMQTTWait != tt.wantMQTTWait || !config.keepOpen {
+				t.Fatalf(
+					"application role = hello:%t wait:%t keepOpen:%t, want hello:%t wait:%t keepOpen:true",
+					config.useMQTTHello,
+					config.useMQTTWait,
+					config.keepOpen,
+					tt.wantMQTTHello,
+					tt.wantMQTTWait,
+				)
+			}
+		})
+	}
+}
+
 func TestP2PWithLANPassiveCLIRequiresKeepOpen(t *testing.T) {
 	_, err := AppNetcatConfigByArgs(io.Discard, "gonc", []string{
 		"-p2p", "A9f#K2m!Q7x@L4v$R8p%T6z",

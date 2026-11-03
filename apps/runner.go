@@ -90,7 +90,7 @@ func PrepareNetcatConfigWithOptions(ctx context.Context, logWriter io.Writer, ar
 	if options.P2PWithLANMode && config.useLAN {
 		return nil, fmt.Errorf("error preparing P2P with LAN mode: -lan selects LAN-only mode")
 	}
-	config.p2pWithLanMode = options.P2PWithLANMode
+	config.p2pWithLanMode = config.p2pWithLanMode || options.P2PWithLANMode
 	if options.HTTPFileSource != nil {
 		if config.app_mux_Config == nil || config.app_mux_Config.AppMode != "httpserver" {
 			return nil, fmt.Errorf("error preparing P2P HTTP file source: P2P httpserver mode is required")
