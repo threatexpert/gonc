@@ -2551,12 +2551,24 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 }
 
 func usage_less(logWriter io.Writer, argv0 string) {
-	fmt.Fprintln(logWriter, "go-netcat "+VERSION)
-	fmt.Fprintln(logWriter, "Usage:")
-	fmt.Fprintln(logWriter, "   ", argv0, "[-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
-	fmt.Fprintln(logWriter, "         [-p2p sessionKey]")
-	fmt.Fprintln(logWriter, "         [-e \":builtin-command [args]\" or \"external-command [args]\"]")
-	fmt.Fprintln(logWriter, "         [-h] for full help")
+	fmt.Fprintf(logWriter, `go-netcat %s
+
+Usage:
+  %s [options] <host> <port>             Connect to a host
+  %s -l [options] <port>                 Listen for connections
+  %s -p2p <passphrase> [options]         Establish a secure P2P connection
+
+Run "%s -psk . -qr" to generate a secure passphrase and display its QR code.
+
+Examples:
+  %s example.com 80
+  %s -l 8080
+  %s -x socks5://127.0.0.1:1080 example.com 80
+  %s -p2p <passphrase> -linkagent
+  %s -p2p <passphrase> -link 1080
+
+Run "%s -h" for all options.
+`, VERSION, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0)
 }
 
 func conflictCheck(ncconfig *AppNetcatConfig) int {
