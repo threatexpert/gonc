@@ -34,6 +34,14 @@ var (
 //     (adoptFd/close) after this function returns, clearing any remaining
 //     fdsan state and giving bionic a chance to properly update its tables.
 func StartTun2Socks(fd int, proxyURL string, deviceName string, mtu int, logLevel string) (err error) {
+	return StartTun2SocksWithPolicy(fd, proxyURL, deviceName, mtu, logLevel, false, false)
+}
+
+// StartTun2SocksWithPolicy optionally waits for remote TCP connection success
+// before completing the local handshake, and/or locally rejects IPv6 TCP/UDP.
+// Flags apply to this engine lifetime; stop/restart after a new exit probe.
+// FD ownership follows StartTun2Socks: the caller must close the original fd.
+func StartTun2SocksWithPolicy(fd int, proxyURL string, deviceName string, mtu int, logLevel string, deferredTCP bool, rejectIPv6 bool) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic starting tun2socks: %v", r)
@@ -74,16 +82,15 @@ func StartTun2Socks(fd int, proxyURL string, deviceName string, mtu int, logLeve
 	tun2socksMu.Lock()
 	defer tun2socksMu.Unlock()
 	if tun2socksStarted {
-		engine.Stop()
+		if err = engine.Stop(); err != nil {
+			return fmt.Errorf("stop tun2socks: %w", err)
+		}
 		tun2socksStarted = false
 	}
-	engine.Insert(&engine.Key{
-		Device:   fmt.Sprintf("fd://%d", highFd),
-		Proxy:    proxyURL,
-		LogLevel: logLevel,
-		MTU:      mtu,
-	})
-	engine.Start()
+	engine.Insert(tun2SocksKey(fmt.Sprintf("fd://%d", highFd), proxyURL, mtu, logLevel, deferredTCP, rejectIPv6))
+	if err = engine.Start(); err != nil {
+		return fmt.Errorf("start tun2socks: %w", err)
+	}
 	tun2socksStarted = true
 	return nil
 }
