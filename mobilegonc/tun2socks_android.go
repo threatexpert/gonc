@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xjasonlyu/tun2socks/v2/engine"
+	"github.com/threatexpert/gonc/v2/tunengine"
 	"golang.org/x/sys/unix"
 )
 
@@ -82,13 +82,12 @@ func StartTun2SocksWithPolicy(fd int, proxyURL string, deviceName string, mtu in
 	tun2socksMu.Lock()
 	defer tun2socksMu.Unlock()
 	if tun2socksStarted {
-		if err = engine.Stop(); err != nil {
+		if err = tunengine.Stop(); err != nil {
 			return fmt.Errorf("stop tun2socks: %w", err)
 		}
 		tun2socksStarted = false
 	}
-	engine.Insert(tun2SocksKey(fmt.Sprintf("fd://%d", highFd), proxyURL, mtu, logLevel, deferredTCP, rejectIPv6))
-	if err = engine.Start(); err != nil {
+	if err = tunengine.Start(tun2SocksConfig(fmt.Sprintf("fd://%d", highFd), proxyURL, mtu, logLevel, deferredTCP, rejectIPv6)); err != nil {
 		return fmt.Errorf("start tun2socks: %w", err)
 	}
 	tun2socksStarted = true
@@ -102,6 +101,6 @@ func StopTun2Socks() {
 	if !tun2socksStarted {
 		return
 	}
-	engine.Stop()
+	_ = tunengine.Stop()
 	tun2socksStarted = false
 }
