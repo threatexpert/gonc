@@ -18,7 +18,7 @@ func TestTun2SocksPolicyModes(t *testing.T) {
 			if (key.DeferredTCP != nil) != deferred || key.RejectIPv6 != reject {
 				t.Fatalf("policy flags not independent: %+v", key)
 			}
-			if deferred && (key.DeferredTCP.SOCKSHandshakeTimeout != 0 || key.DeferredTCP.FailureCacheTTL != 0 || key.DeferredTCP.FailureCacheCapacity != 0) {
+			if deferred && (key.DeferredTCP.ProxyHandshakeTimeout != 0 || key.DeferredTCP.FailureCacheTTL != 0 || key.DeferredTCP.FailureCacheCapacity != 0) {
 				t.Fatalf("mobile should use shared defaults: %+v", key)
 			}
 		}

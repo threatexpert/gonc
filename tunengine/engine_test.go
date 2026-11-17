@@ -29,13 +29,13 @@ func TestConfigModesAndDefaults(t *testing.T) {
 				t.Fatalf("wrong configuration: %+v", key)
 			}
 			if deferred {
-				if key.TCPSOCKSHandshakeTimeout != 30*time.Second || key.TCPFailureCacheTTL != 30*time.Second || key.TCPFailureCacheCapacity != 4096 {
+				if key.TCPProxyHandshakeTimeout != 21*time.Second || key.TCPFailureCacheTTL != 30*time.Second || key.TCPFailureCacheCapacity != 4096 {
 					t.Fatalf("wrong defaults: %+v", key)
 				}
 				if *cfg.DeferredTCP != (DeferredTCPConfig{}) {
 					t.Fatal("mutated caller config")
 				}
-			} else if key.TCPSOCKSHandshakeTimeout != 0 || key.TCPFailureCacheTTL != 0 || key.TCPFailureCacheCapacity != 0 {
+			} else if key.TCPProxyHandshakeTimeout != 0 || key.TCPFailureCacheTTL != 0 || key.TCPFailureCacheCapacity != 0 {
 				t.Fatal("legacy policy changed")
 			}
 		}
@@ -50,12 +50,12 @@ func TestCustomAndInvalidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if key.MTU != 1500 || key.LogLevel != "debug" || key.TCPSOCKSHandshakeTimeout != time.Minute || key.TCPFailureCacheTTL != 10*time.Second || key.TCPFailureCacheCapacity != 128 {
+	if key.MTU != 1500 || key.LogLevel != "debug" || key.TCPProxyHandshakeTimeout != time.Minute || key.TCPFailureCacheTTL != 10*time.Second || key.TCPFailureCacheCapacity != 128 {
 		t.Fatalf("custom settings lost: %+v", key)
 	}
 	for _, change := range []func(*Config){
 		func(c *Config) { c.Device = " " }, func(c *Config) { c.Proxy = "" }, func(c *Config) { c.MTU = -1 },
-		func(c *Config) { c.DeferredTCP = &DeferredTCPConfig{SOCKSHandshakeTimeout: -1} },
+		func(c *Config) { c.DeferredTCP = &DeferredTCPConfig{ProxyHandshakeTimeout: -1} },
 		func(c *Config) { c.DeferredTCP = &DeferredTCPConfig{FailureCacheTTL: -1} },
 		func(c *Config) { c.DeferredTCP = &DeferredTCPConfig{FailureCacheCapacity: -1} },
 	} {

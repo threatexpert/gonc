@@ -58,4 +58,4 @@ require (
 
 tool golang.org/x/mobile/cmd/gobind
 
-replace github.com/xjasonlyu/tun2socks/v2 => github.com/threatexpert/tun2socks/v2 v2.0.0-20261116123949-4b0120a38bf2
+replace github.com/xjasonlyu/tun2socks/v2 => github.com/threatexpert/tun2socks/v2 v2.0.0-20261117070555-91168c1220db
