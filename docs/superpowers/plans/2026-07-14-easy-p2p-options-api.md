@@ -320,7 +320,7 @@ Confirm from the output that:
 - every optional value reaches the same existing local variable;
 - the callback remains after successful address exchange and before the context-cause/traversal checks;
 - the only direct `Easy_P2P_MPWithOptions` caller uses the new signature;
-- `apps/portrotate.go` still uses the compatible released wrapper.
+- the released compatibility wrapper remains available to external callers (the former port-rotation caller has since been removed).
 
 - [ ] **Step 8: Commit the API migration**
 

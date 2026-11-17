@@ -111,39 +111,31 @@ gonc -P -send bigfile.iso -write /dev/null <target_ip> <port>
 
 ---
 
-## 🔄 端口轮换 (Port Rotate)
+## 已移除的桥接与端口轮换功能
 
-**参数**：
-**`-port-rotate`**
+`:br`（P2P 桥接续接）与 `:pr`（端口轮换）已移除。旧命令行需要删除以下配置：
 
-**原理**：
-在 P2P 模式下，开启此功能, `gonc` 可以按需切换本地源端口。
+| 类别 | 已移除的入口或参数 |
+| --- | --- |
+| 主程序开关 | `-kcpbr`、`-port-rotate` |
+| 动态服务配置 | `-:br`、`-:pr` |
+| 内置应用 | `-e ":br ..."`、`-e ":pr ..."`，以及本端对这两个服务的调用处理 |
+| `:pr` 专用选项 | `-period`、`-rotate-bytes`、`-http`（仅指 `:pr` 内部的管理接口选项） |
+| 环境变量 | `BR_DEBUG` |
 
-**场景**：
+桥接调试页面、轮换状态页面和手动轮换 HTTP 接口也已移除。主程序不再接受上述开关，执行这两个内置应用会返回未知命令错误。
 
-* 绕过某些基于 "五元组" (源IP, 源端口, 目的IP, 目的端口, 协议) 进行限速或阻断的防火墙策略。
-
-**示例**:
-
-在公司和家庭建立点对点的代理隧道:
-
-公司先运行
+普通 P2P、KCP（`-kcp` / `-kcps`）、MQTT Hello/Wait、`:mux` 和其他应用的同名选项仍可使用。例如，原来通过 `-linkagent` / `-link` 配合上述开关建立代理的配置，可改为：
 
 ```bash
-gonc -p2p mysecret123 -linkagent -port-rotate
+# 远端先运行，两端替换为同一个口令
+gonc -p2p "your-shared-passphrase" -linkagent
+
+# 本地建立隧道，3380 为本地 SOCKS5 入口
+gonc -p2p "your-shared-passphrase" -link 3380
 ```
 
-家里任何时候想建立隧道时，用约定的相同口令:
-
-```bash
-gonc -p2p mysecret123 -link 3380 -port-rotate -:pr “-http 8180 -period 600 -rotate-bytes 1G”
-```
-
-这样建立的隧道，3380 端口是本地 socks5 协议，可代理访问远程网络。而隧道会自动 10 分钟或传输达到 1G 就切换低层通讯的端口，切换过程平滑不会对已在通讯的应用产生卡顿。
-
-8180 端口可以通过这样手动可触发切换底层协议和端口(随机)： curl http://127.0.0.1:8181/rotate?network=udp
-
-network 还可以明确指定例如几种 udp4 udp6 tcp4 tcp6
+此配置使用普通 P2P 隧道，不再提供按时间/流量轮换底层通道或桥接会话续接能力。
 
 ---
 
@@ -154,5 +146,4 @@ network 还可以明确指定例如几种 udp4 udp6 tcp4 tcp6
 | **`-v`** | **详细日志 (Verbose)**。默认开启。打印连接状态、P2P 打洞过程、错误信息等。在编写自动化脚本时，建议关闭它或将 stderr 重定向。 |
 | **`BIPA_DEBUG`** | **环境变量**。BIPA_DEBUG=1时，打洞时总是使用碰撞端口的方式。 |
 | **`ROLE_DEBUG`** | **环境变量**。ROLE_DEBUG=C或ROLE_DEBUG=S时，限定P2P时C/S角色，否则gonc会根据算法自动分配两端的C/S角色。 |
-| **`BR_DEBUG`** | **环境变量**。BR_DEBUG=1，开启-kcpbr模式的http接口，方便模拟网络异常触发自动重新保活连接。 |
 

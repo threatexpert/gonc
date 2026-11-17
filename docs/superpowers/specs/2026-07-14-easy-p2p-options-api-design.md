@@ -63,7 +63,7 @@ The callback remains a direct field. A nested hooks structure would add ceremony
 
 The P2P path in `apps/nc.go` replaces its optional `*EasyP2PMPOptions` variable with a value. It assigns `OnAddressExchangeDone` only when candidate coordination requires it, then supplies `Bind`, `RelayConn`, `LogWriter`, and `Signal` as named fields when calling the new signature.
 
-The port-rotation path continues to call the released `Easy_P2P_MP` compatibility entry point and needs no migration.
+The released `Easy_P2P_MP` compatibility entry point remains available to external callers. The former port-rotation caller has since been removed along with that feature.
 
 ## Data Flow
 

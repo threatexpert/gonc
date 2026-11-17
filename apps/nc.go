@@ -46,8 +46,7 @@ type AppNetcatConfig struct {
 	ProgressSink               func(ProgressSnapshot)
 	goroutineConnectionCounter int32
 
-	ctx                          context.Context
-	callback_OnConnectionDestroy func(localAddrStr, remoteAddrStr string)
+	ctx context.Context
 
 	network, host, port, p2pSessionKey string
 	connConfig                         *secure.NegotiationConfig
@@ -68,10 +67,6 @@ type AppNetcatConfig struct {
 	app_nc_args           string
 	app_nc_Config         *AppNetcatConfig
 	app_tp_Config         *AppTPConfig
-	app_pr_args           string
-	app_pr_Config         *AppPortRotateConfig
-	app_br_args           string
-	app_br_Config         *AppBridgeConfig
 	app_httpserver_args   string
 	app_httpserver_Config *AppHttpServerConfig
 
@@ -147,8 +142,6 @@ type AppNetcatConfig struct {
 	Args                 []string
 	natchecker           bool
 	httpdownload         bool
-	portRotate           bool
-	kcpBridgeMode        bool
 	verbose              bool
 	verboseWithTime      bool
 	muxEnabled           bool
@@ -347,8 +340,6 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "(mux tunnel mode)socks5 server")
 	fs.BoolVar(&config.appMuxLinkAgent, "linkagent", false, "(mux tunnel mode)dual proxy service")
 	fs.StringVar(&config.runAppLink, "link", "", "(mux tunnel mode)\"<L-Config>;<R-Config>\" (e.g. mux link \"1080;1080\")")
-	fs.BoolVar(&config.portRotate, "port-rotate", false, "enable port rotation feature")
-	fs.BoolVar(&config.kcpBridgeMode, "kcpbr", false, "kcp bridge mode")
 	fs.StringVar(&config.fileACL, "acl", "", "ACL file for inbound/outbound connections")
 	fs.BoolVar(&config.plainTransport, "plain", false, "use plain TCP/UDP without TLS/KCP/Encryption for P2P")
 	fs.BoolVar(&config.framedStdio, "framed", false, "stdin/stdout is framed stream (2 bytes length prefix for each frame)")
@@ -373,8 +364,6 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.app_s5s_args, ":s5s", "-", "enable and config :s5s for dynamic service")
 	fs.StringVar(&config.app_sh_args, ":sh", "-", "enable and config :sh for dynamic service")
 	fs.StringVar(&config.app_nc_args, ":nc", "-", "enable and config :nc for dynamic service")
-	fs.StringVar(&config.app_pr_args, ":pr", "-", "enable and config :pr for dynamic service")
-	fs.StringVar(&config.app_br_args, ":br", "-", "enable and config :br for dynamic service")
 	fs.StringVar(&config.app_httpserver_args, ":httpserver", "-", "enable and config :httpserver for dynamic service")
 	fs.BoolVar(&config.natchecker, "nat-checker", false, "detect NAT type and public IP")
 	fs.BoolVar(&config.httpdownload, "http-download", false, "<localDir> <urlPath>; download from gonc's (-httplocal-port) HTTP service")
@@ -786,25 +775,6 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 		return fmt.Errorf("app modes (-httpserver, -linkagent, etc.) cannot be used with -e")
 	}
 
-	if ncconfig.portRotate {
-		if strings.HasPrefix(ncconfig.runCmd, ":mux ") {
-			ncconfig.remoteCall = ":pr"
-			if ncconfig.app_pr_args == "-" {
-				ncconfig.app_pr_args = ""
-			}
-			ncconfig.app_mux_args = strings.TrimPrefix(ncconfig.runCmd, ":mux ")
-			ncconfig.runCmd = ":service"
-		} else {
-			ncconfig.Logger.Printf("-portrate and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
-			return fmt.Errorf("-portrate and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together")
-		}
-	} else if ncconfig.kcpBridgeMode {
-		if !strings.HasPrefix(ncconfig.runCmd, ":mux ") {
-			ncconfig.Logger.Printf("-kcpbr and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
-			return fmt.Errorf("-kcpbr and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together")
-		}
-	}
-
 	var err error
 	if ncconfig.runCmd != "" && ncconfig.runCmd != ":service" {
 		err = preinitBuiltinAppConfig(ncconfig, ncconfig.runCmd)
@@ -820,12 +790,6 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 		}
 		if err == nil && ncconfig.app_nc_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":nc "+ncconfig.app_nc_args)
-		}
-		if err == nil && ncconfig.app_pr_args != "-" {
-			err = preinitBuiltinAppConfig(ncconfig, ":pr "+ncconfig.app_pr_args)
-		}
-		if err == nil && ncconfig.app_br_args != "-" {
-			err = preinitBuiltinAppConfig(ncconfig, ":br "+ncconfig.app_br_args)
 		}
 		if err == nil && ncconfig.app_httpserver_args != "-" {
 			err = preinitBuiltinAppConfig(ncconfig, ":httpserver "+ncconfig.app_httpserver_args)
@@ -884,9 +848,6 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 	}
 	if ncconfig.httpdownload {
 		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "http-download")
-	}
-	if ncconfig.kcpBridgeMode {
-		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "kcp-bridge")
 	}
 	return nil
 }
@@ -2037,11 +1998,6 @@ func runFeatureModules(console net.Conn, ncconfig *AppNetcatConfig) int {
 			if ret != 0 {
 				return ret
 			}
-		case "kcp-bridge":
-			ret = runKCPBridge(console, ncconfig)
-			if ret != 0 {
-				return ret
-			}
 		default:
 			ncconfig.Logger.Printf("Unknown feature module: %s\n", module)
 			return 1
@@ -2162,231 +2118,6 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 	}
 
 	return 1
-}
-
-func getUDPFreePort(network, localip string) (string, string, error) {
-	udpAddr, _ := net.ResolveUDPAddr(network, net.JoinHostPort(localip, "0"))
-	udpConn, err := net.ListenUDP(network, udpAddr)
-	if err != nil {
-		return "", "", err
-	}
-	host, port, err := net.SplitHostPort(udpConn.LocalAddr().String())
-	defer udpConn.Close()
-	return host, port, err
-}
-
-func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
-
-	if ncconfig.p2pSessionKey == "" {
-		ncconfig.Logger.Printf("-kcpbr must be used with -p2p <sessionkey>\n")
-		return 1
-	}
-
-	MUX_timeout := 120
-	KCP_timeout := 120
-	UDP_timeout := 41
-	TCP_timeout := 30
-
-	if VarMuxKeepAliveTimeout == DefaultVarMuxKeepAliveTimeout {
-		VarMuxKeepAliveTimeout = MUX_timeout
-	}
-	if secure.KCPIdleTimeoutSecond == secure.DefaultKCPIdleTimeoutSecond {
-		secure.KCPIdleTimeoutSecond = KCP_timeout
-	}
-	if secure.UDPIdleTimeoutSecond == secure.DefaultUDPIdleTimeoutSecond {
-		secure.UDPIdleTimeoutSecond = UDP_timeout
-	}
-	if ncconfig.keepAlive == 0 {
-		ncconfig.keepAlive = TCP_timeout
-	}
-
-	ctx, cancel := context.WithCancel(ncconfig.ctx)
-	defer cancel()
-	done := make(chan int, 2)
-
-	if ncconfig.useMQTTWait {
-		//server(remote) side:
-		//       gonc -p2p xxxxxxxx -linkagent -kcpbr  ( -e ":mux linkagent" -mqtt-wait )
-		//nc1. runListenMode -kcp -e "{ncconfig.runCmd}" -l 127.0.0.1 port1
-		//nc2. runP2PMode -e ":br -u -framed local port1" -plain -tls -mqtt-wait -framed -framed-tcp
-		var err error
-		nc1 := *ncconfig
-		nc1.ctx = ctx
-		//nc1.runCmd 一样
-		nc1.listenMode = true
-		nc1.p2pSessionKey = ""
-		nc1.featureModulesRun = nil
-		nc1.kcpBridgeMode = false
-		nc1.kcpEnabled = true
-		nc1.kcpSEnabled = true
-		nc1.udpProtocol = true
-		nc1.framedStdio = false
-		nc1.framedTCP = false
-		nc1.keepAlive = 0
-		nc1.Args = nil
-		nc1.network = "udp4"
-		nc1.host, nc1.port, err = getUDPFreePort(nc1.network, "127.0.0.1")
-		if err != nil {
-			ncconfig.Logger.Printf("Error getting free udp port: %v\n", err)
-			return 1
-		}
-		disableTLS(&nc1)
-		nc1.presharedKey = ""
-		nc1.connConfig, err = preinitNegotiationConfig(&nc1)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-
-		nc1.callback_OnConnectionDestroy = func(localAddrStr, remoteAddrStr string) {
-			found := brDialSessKickByConnAddr(
-				remoteAddrStr, // 注意：反过来
-				localAddrStr,
-			)
-			ncconfig.Logger.Printf("Connection Destroying(%s-%s)..., kick bridge result=%v\n", localAddrStr, remoteAddrStr, found)
-		}
-
-		go func() {
-			done <- runListenMode(console, &nc1, nc1.network, nc1.host, nc1.port)
-		}()
-
-		time.Sleep(1 * time.Second)
-
-		nc2 := *ncconfig
-		nc2.ctx = ctx
-		nc2.listenMode = false
-		nc2.kcpBridgeMode = false
-		nc2.featureModulesRun = nil
-		nc2.runCmd = fmt.Sprintf(":br -u -framed 127.0.0.1 %s", nc1.port)
-		nc2.plainTransport = true
-		nc2.kcpEnabled = false
-		nc2.kcpSEnabled = false
-		nc2.framedStdio = true
-		nc2.framedTCP = true
-		nc2.keepAlive = ncconfig.keepAlive
-		err = preinitBuiltinAppConfig(&nc2, nc2.runCmd)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-		nc2.connConfig, err = preinitNegotiationConfig(&nc2)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-		nc2.connConfig.UDPIdleTimeoutSecond = 41
-		nc2.progressEnabled = false
-
-		go func() {
-			done <- runP2PMode(console, &nc2)
-		}()
-
-		ret := <-done
-		cancel()
-		return ret
-	} else if ncconfig.useMQTTHello {
-		//Local side:
-		//       gonc -p2p xxxxxxxx -link 1080,1081 -kcpbr  ( -e ":mux link 1080,1081" -mqtt-hello )
-		//nc2. runListenMode -e ":br -p2p xxxxx -mqtt-hello -keepalive 30 -framed -framed-tcp -plain -tls" -k -framed -u -l 127.0.0.1 port2
-		//nc1. runDialMode -kcp -e "{ncconfig.runCmd}" 127.0.0.1 port2
-
-		var err error
-		nc2 := *ncconfig
-		nc2.ctx = ctx
-		nc2.kcpBridgeMode = false
-		nc2.featureModulesRun = nil
-		nc2.runCmd = fmt.Sprintf(":br -p2p \"%s\" -mqtt-hello -keepalive %d -framed -framed-tcp -plain",
-			ncconfig.p2pSessionKey, ncconfig.keepAlive)
-		if isTLSEnabled(ncconfig) {
-			nc2.runCmd += " -tls"
-		}
-		if ncconfig.udpProtocol {
-			nc2.runCmd += " -u"
-		}
-		nc2.listenMode = true
-		nc2.udpProtocol = true
-		nc2.framedStdio = true
-		nc2.kcpEnabled = false
-		nc2.kcpSEnabled = false
-		nc2.autoP2P = ""
-		nc2.p2pSessionKey = ""
-		nc2.network = "udp4"
-		nc2.host, nc2.port, err = getUDPFreePort(nc2.network, "127.0.0.1")
-		if err != nil {
-			ncconfig.Logger.Printf("Error getting free udp port: %v\n", err)
-			return 1
-		}
-		disableTLS(&nc2)
-		nc2.presharedKey = ""
-		nc2.keepAlive = ncconfig.keepAlive
-		nc2.connConfig, err = preinitNegotiationConfig(&nc2)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-		err = preinitBuiltinAppConfig(&nc2, nc2.runCmd)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-		nc2.progressEnabled = false
-
-		go func() {
-			done <- runListenMode(console, &nc2, nc2.network, nc2.host, nc2.port)
-		}()
-		time.Sleep(1 * time.Second)
-
-		nc1 := nc2
-		nc1.listenMode = false
-		nc1.framedStdio = false
-		nc1.kcpEnabled = true
-		nc1.kcpSEnabled = false
-		nc1.keepAlive = ncconfig.keepAlive
-		nc1.connConfig, err = preinitNegotiationConfig(&nc1)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-		nc1.runCmd = ncconfig.runCmd
-		err = preinitBuiltinAppConfig(&nc2, nc1.runCmd)
-		if err != nil {
-			ncconfig.Logger.Printf("%v\n", err)
-			return 1
-		}
-		nc1.callback_OnConnectionDestroy = func(localAddrStr, remoteAddrStr string) {
-			brAcceptSessKickByConnAddr(
-				remoteAddrStr, // 注意：反过来
-				localAddrStr,
-			)
-		}
-		nc1.progressEnabled = ncconfig.progressEnabled
-
-		go func() {
-			for {
-				ret := runDialMode(console, &nc1, nc1.network, nc1.host, nc1.port)
-				if !nc1.keepOpen {
-					done <- ret
-					return
-				}
-
-				ncconfig.Logger.Printf("Will retry in 10 seconds...\n")
-				select {
-				case <-time.After(10 * time.Second):
-					// sleep 完成
-				case <-ctx.Done():
-					// 被提前取消
-					done <- 1
-				}
-			}
-		}()
-
-		ret := <-done
-		cancel()
-		return ret
-	} else {
-		ncconfig.Logger.Printf("-kcpbr must be used with -mqtt-hello or -mqtt-wait\n")
-		return 1
-	}
 }
 
 func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) ([]tls.Certificate, error) {
@@ -2636,14 +2367,6 @@ func conflictCheck(ncconfig *AppNetcatConfig) int {
 		ncconfig.Logger.Printf("(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together\n")
 		return 1
 	}
-	if ncconfig.kcpBridgeMode && ncconfig.portRotate {
-		ncconfig.Logger.Printf("-kcpbr and -port-rotate cannot be used together\n")
-		return 1
-	}
-	if ncconfig.kcpBridgeMode && ncconfig.autoP2P == "" {
-		ncconfig.Logger.Printf("-kcpbr and -p2p must be used together\n")
-		return 1
-	}
 	if ncconfig.autoPSK && ncconfig.autoP2P == "" {
 		ncconfig.Logger.Printf("-auto-psk and -p2p must be used together\n")
 		return 1
@@ -2702,10 +2425,6 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		ncconfig.app_sh_Config, err = PtyShellConfigByArgs(ncconfig.LogWriter, args[1:])
 	case ":tp":
 		ncconfig.app_tp_Config, err = AppTPConfigByArgs(ncconfig.LogWriter, args[1:])
-	case ":pr":
-		ncconfig.app_pr_Config, err = AppPortRotateConfigByArgs(ncconfig.LogWriter, args[1:])
-	case ":br":
-		ncconfig.app_br_Config, err = AppBridgeConfigByArgs(ncconfig.LogWriter, args[1:])
 	case ":httpserver":
 		ncconfig.app_httpserver_Config, err = AppHttpServerConfigByArgs(ncconfig.LogWriter, args[1:])
 	case ":service":
@@ -2943,14 +2662,6 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		}
 	}
 
-	localAddrStr := nconn.LocalAddr().String()
-	remoteAddrStr := nconn.RemoteAddr().String()
-	defer func() {
-		if ncconfig.callback_OnConnectionDestroy != nil {
-			ncconfig.callback_OnConnectionDestroy(localAddrStr, remoteAddrStr)
-		}
-	}()
-
 	if !ncconfig.sessionReady {
 		stats_in.ResetStart()
 		stats_out.ResetStart()
@@ -3120,26 +2831,6 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_tp_main_withconfig(pipeConn, ncconfig.app_tp_Config)
-		} else if builtinApp == ":pr" {
-			if ncconfig.app_pr_Config == nil {
-				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
-				return 1
-			}
-			pipeConn := misc.NewPipeConn(nconn)
-			input = pipeConn.In
-			output = pipeConn.Out
-			defer pipeConn.Close()
-			go App_PortRotate_main_withconfig(pipeConn, nconn.Config, ncconfig, ncconfig.app_pr_Config)
-		} else if builtinApp == ":br" {
-			if ncconfig.app_br_Config == nil {
-				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
-				return 1
-			}
-			pipeConn := misc.NewPipeConn(nconn)
-			input = pipeConn.In
-			output = pipeConn.Out
-			defer pipeConn.Close()
-			go App_Bridge_main_withconfig(pipeConn, nconn.MQTTHelloAppPayload, ncconfig, ncconfig.app_br_Config)
 		} else if builtinApp == ":httpserver" {
 			if ncconfig.app_httpserver_Config == nil {
 				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
@@ -3624,15 +3315,6 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 	var helloPayload easyp2p.HelloPayload
 	if ncconfig.useMQTTWait && !ncconfig.useMQTTHello {
 		helloPayload = easyp2p.HelloPayloadFromString(topicSalt)
-		switch helloPayload.App {
-		case "br":
-			//Wait模式，如果对方hello的载荷是bridge类型，则提前验证session是否接受，免得浪费资源建立连接
-			if !Bridge_IsP2PHelloAllowed(helloPayload.AppString()) {
-				ReportP2PStatus(ncconfig, reportSessionID, "error:bridge session not found", ncconfig.network, "", "")
-				return nil, fmt.Errorf("bridge session not found: %s", helloPayload.AppString())
-			}
-		}
-
 		if cs, ok := helloPayload.GetControlValue("cs"); ok {
 			switch cs {
 			case "ss", "tls":
