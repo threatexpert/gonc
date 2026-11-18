@@ -2397,7 +2397,22 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 
 		// 4. 客户端本地 dialUDP 到 SOCKS5 服务器的 UDP 绑定地址
 		var localUDPConn net.Conn
-		localUDPConn, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort})
+		var udpLocal *net.UDPAddr
+		switch local := c.Config.LocalAddr.(type) {
+		case *net.TCPAddr:
+			if local != nil {
+				udpLocal = &net.UDPAddr{IP: local.IP, Zone: local.Zone}
+			}
+		case *net.UDPAddr:
+			if local != nil {
+				udpLocal = &net.UDPAddr{IP: local.IP, Zone: local.Zone}
+			}
+		}
+		udpDialer := &net.Dialer{Timeout: timeout, Control: netx.LocalAddrControl(udpLocal, nil)}
+		if udpLocal != nil {
+			udpDialer.LocalAddr = udpLocal
+		}
+		localUDPConn, err = udpDialer.Dial("udp", (&net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort}).String())
 		if err != nil {
 			serverTCPConn.Close()
 			return nil, fmt.Errorf("dial local UDP to SOCKS5 server UDP address error: %w", err)

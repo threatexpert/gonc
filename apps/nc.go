@@ -431,6 +431,17 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		swriter.SetOutput(logFile)
 	}
 
+	// Configure process-wide DNS before initialization can fetch -stunsrv URLs.
+	if config.localbind != "" {
+		config.localbindIP, _, err = net.SplitHostPort(config.localbind)
+		if err != nil {
+			return nil, fmt.Errorf("invalid local bind address: %w", err)
+		}
+	}
+	if err := configureDNS(config); err != nil {
+		return nil, err
+	}
+
 	// 1. 初始化基本设置
 	if err := firstInit(config); err != nil {
 		return nil, err
@@ -474,7 +485,11 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 			config.tlsSNI = host
 		}
 	}
-	configureDNS(config)
+	// Built-in commands may also configure global DNS. Preserve the outer
+	// command's existing precedence when it explicitly specifies -dns.
+	if err := configureDNS(config); err != nil {
+		return nil, err
+	}
 	swriter.Enable(config.verbose)
 	config.connConfig, err = preinitNegotiationConfig(config)
 	if err != nil {
@@ -644,7 +659,11 @@ func firstInit(ncconfig *AppNetcatConfig) error {
 	if ncconfig.stunSrv != "" {
 		if strings.HasPrefix(ncconfig.stunSrv, "http://") || strings.HasPrefix(ncconfig.stunSrv, "https://") {
 			// 支持通过 URL 获取配置，设置 10 秒超时避免阻塞初始化
-			client := &http.Client{Timeout: 10 * time.Second}
+			client, closeIdle, err := newBoundHTTPClient(ncconfig.localbindIP, 10*time.Second)
+			if err != nil {
+				return err
+			}
+			defer closeIdle()
 			resp, err := client.Get(ncconfig.stunSrv)
 			if err != nil {
 				return fmt.Errorf("fetch stun server list from URL failed: %w", err)
@@ -821,7 +840,11 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 				ncconfig.arg_proxyc_Config = xconfig
 			} else {
 				// 多跳链式代理
-				chainClient, err := ParseProxyChainURL(ncconfig.LogWriter, xcommandline)
+				localAddr, err := proxyLocalAddr("tcp", ncconfig.localbindIP)
+				if err != nil {
+					return err
+				}
+				chainClient, err := ParseProxyChainURLWithLocalAddr(ncconfig.LogWriter, xcommandline, localAddr)
 				if err != nil {
 					ncconfig.Logger.Printf("Error parse proxy chain: %v\n", err)
 					return fmt.Errorf("error parse proxy chain: %w", err)
@@ -841,6 +864,13 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 				return fmt.Errorf("error init proxy config: %w", err)
 			}
 			ncconfig.arg_proxyc_Config = xconfig
+		}
+		if pc := ncconfig.arg_proxyc_Config; pc != nil {
+			localAddr, err := proxyLocalAddr(pc.Network, ncconfig.localbindIP)
+			if err != nil {
+				return err
+			}
+			pc.LocalAddr = localAddr
 		}
 	}
 	if ncconfig.natchecker {
@@ -1041,19 +1071,21 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 }
 
 // configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
-func configureDNS(ncconfig *AppNetcatConfig) {
+func configureDNS(ncconfig *AppNetcatConfig) error {
 	if ncconfig.useDNS != "" {
-		setDns(ncconfig.useDNS, ncconfig.localbindIP)
+		return setDns(ncconfig.useDNS, ncconfig.localbindIP)
 	} else if isAndroid() {
 		googleDNS := "8.8.8.8:53"
 		if ncconfig.localbindIP != "" {
-			ip := net.ParseIP(ncconfig.localbindIP)
-			if ip != nil && ip.To16() != nil {
+			host, _, _ := strings.Cut(ncconfig.localbindIP, "%")
+			ip := net.ParseIP(host)
+			if ip != nil && ip.To4() == nil {
 				googleDNS = "[2001:4860:4860::8888]:53"
 			}
 		}
-		setDns(googleDNS, ncconfig.localbindIP)
+		return setDns(googleDNS, ncconfig.localbindIP)
 	}
+	return nil
 }
 
 // runP2PMode 处理建立和维护P2P连接的逻辑
@@ -1207,14 +1239,14 @@ func newP2PAndLanPassivePaths(ctx context.Context, ncconfig *AppNetcatConfig) (p
 	}
 
 	return p2pAndLanPassivePath{
-			id:     p2pAndLanPassivePublicPath,
-			config: &publicConfig,
-		}, p2pAndLanPassivePath{
-			id:              p2pAndLanPassiveLANPath,
-			config:          &lanConfig,
-			quiet:           true,
-			reportConnected: true,
-		}
+		id:     p2pAndLanPassivePublicPath,
+		config: &publicConfig,
+	}, p2pAndLanPassivePath{
+		id:              p2pAndLanPassiveLANPath,
+		config:          &lanConfig,
+		quiet:           true,
+		reportConnected: true,
+	}
 }
 
 func runP2PAndLanPassivePath(
@@ -1470,13 +1502,13 @@ func newP2PAndLanActivePaths(
 	}
 
 	return p2pAndLanActivePath{
-			id:     p2pAndLanActivePublicPath,
-			config: &publicConfig,
-		}, p2pAndLanActivePath{
-			id:     p2pAndLanActiveLANPath,
-			config: &lanConfig,
-			quiet:  true,
-		}
+		id:     p2pAndLanActivePublicPath,
+		config: &publicConfig,
+	}, p2pAndLanActivePath{
+		id:     p2pAndLanActiveLANPath,
+		config: &lanConfig,
+		quiet:  true,
+	}
 }
 
 func runP2PAndLanActivePath(
@@ -1921,7 +1953,7 @@ func runDialModeOnce(console net.Conn, ncconfig *AppNetcatConfig, network, host,
 			}
 		}
 
-		if localAddr == nil {
+		if localAddr == nil || hasProxyConfig(ncconfig) {
 			dialTimeout := 20 * time.Second
 			if ncconfig.dialreadTimeout != 0 {
 				dialTimeout = time.Duration(ncconfig.dialreadTimeout) * time.Second
@@ -3534,39 +3566,17 @@ func do_P2P_multipath(ncconfig *AppNetcatConfig, enableMP bool) (*secure.Negotia
 	return nil, fmt.Errorf("multipath not implemented yet")
 }
 
-func setDns(dnsServer string, localIP string) {
-	// 确保端口存在
-	if strings.Contains(dnsServer, ":") {
-		if _, _, err := net.SplitHostPort(dnsServer); err != nil {
-			dnsServer = net.JoinHostPort(dnsServer, "53")
-		}
-	} else {
-		dnsServer = net.JoinHostPort(dnsServer, "53")
+// setDns retains -dns's process-wide semantics. DNS UDP and TCP sockets both
+// obey -local; callers without an explicit Resolver use this policy too.
+// Like the other process-wide CLI settings, configure it before concurrent
+// network tasks start; this is not a runtime DNS hot-update API.
+func setDns(dnsServer string, localIP string) error {
+	r, err := netx.NewBoundResolver(dnsServer, localIP)
+	if err != nil {
+		return err
 	}
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: time.Second * 5,
-			}
-
-			// 如果指定了本地IP，就绑定
-			if localIP != "" {
-				host, zone, _ := strings.Cut(localIP, "%")
-				ip := net.ParseIP(host)
-				if ip != nil {
-					if strings.HasPrefix(network, "udp") {
-						d.LocalAddr = &net.UDPAddr{IP: ip, Zone: zone}
-					} else if strings.HasPrefix(network, "tcp") {
-						d.LocalAddr = &net.TCPAddr{IP: ip, Zone: zone}
-					}
-				}
-			}
-
-			d.Control = netx.LocalAddrControl(d.LocalAddr, d.Control)
-			return d.DialContext(ctx, network, dnsServer)
-		},
-	}
+	net.DefaultResolver = r
+	return nil
 }
 
 func isAndroid() bool {

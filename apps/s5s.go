@@ -201,7 +201,7 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 	var err error
 
 	// 1. 初始化 ProxyClient
-	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
+	proxyClient, err := getProxyClient(ncconfig.AppNetcatConfig)
 	if err != nil {
 		ncconfig.Logger.Printf("Error create proxy client: %v\n", err)
 		return 1
@@ -224,7 +224,7 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 
 	// 3. 连接远程服务器 (connR)
 	targetAddr := net.JoinHostPort(ncconfig.host, ncconfig.port)
-	if localAddr == nil {
+	if localAddr == nil || hasProxyConfig(ncconfig.AppNetcatConfig) {
 		dialTimeout := 20 * time.Second
 		if ncconfig.dialreadTimeout != 0 {
 			dialTimeout = time.Duration(ncconfig.dialreadTimeout) * time.Second

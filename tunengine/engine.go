@@ -5,21 +5,31 @@ import (
 	"sync"
 
 	"github.com/xjasonlyu/tun2socks/v2/engine"
+	"github.com/xjasonlyu/tun2socks/v2/proxy"
+	"github.com/xjasonlyu/tun2socks/v2/tunnel"
 )
 
 // ErrAlreadyRunning protects the single engine in this process. Stop before
-// restarting with a different policy. This API does not support multiple TUNs.
+// restarting with a different policy (except UpdateProxy). This API does not
+// support multiple TUNs.
 var ErrAlreadyRunning = errors.New("tunengine: engine is already running")
 
+// ErrNotRunning indicates that UpdateProxy was called without a running engine.
+var ErrNotRunning = errors.New("tunengine: engine is not running")
+
 type controller struct {
-	mu      sync.Mutex
-	running bool
-	insert  func(*engine.Key)
-	start   func() error
-	stop    func() error
+	mu       sync.Mutex
+	running  bool
+	insert   func(*engine.Key)
+	start    func() error
+	stop     func() error
+	setProxy func(proxy.Proxy)
 }
 
-var shared = controller{insert: engine.Insert, start: engine.Start, stop: engine.Stop}
+var shared = controller{
+	insert: engine.Insert, start: engine.Start, stop: engine.Stop,
+	setProxy: func(p proxy.Proxy) { tunnel.T().SetProxy(p) },
+}
 
 // Start installs the config and starts the engine under one lock. OS-specific
 // setup and rollback remain the caller's responsibility, including FD ownership
