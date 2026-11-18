@@ -14,6 +14,7 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/threatexpert/gonc/v2/misc"
+	"github.com/threatexpert/gonc/v2/netx"
 )
 
 type mqttSignalRecvPayload struct {
@@ -160,11 +161,13 @@ func startMQTTSignalSession(ctx context.Context, brokerServers []string, clientI
 		Timeout: mqttConnectTimeout,
 	}
 	if localIP != "" {
-		if ip := net.ParseIP(localIP); ip != nil {
-			dialer.LocalAddr = &net.TCPAddr{IP: ip}
+		host, zone, _ := strings.Cut(localIP, "%")
+		if ip := net.ParseIP(host); ip != nil {
+			dialer.LocalAddr = &net.TCPAddr{IP: ip, Zone: zone}
 		}
 	}
 
+	dialer.Control = netx.LocalAddrControl(dialer.LocalAddr, dialer.Control)
 	for i, server := range brokerServers {
 		serverURL, q, _ := ParseMQTTServerV3(server)
 		go s.connectBroker(serverURL, q, i, dialer, ready, fail)

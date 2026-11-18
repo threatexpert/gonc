@@ -114,7 +114,7 @@ func GetPublicIPsContext(parentCtx context.Context, network, bind string, timeou
 		}
 		basedUDPConn := shPktCon
 		if basedUDPConn == nil {
-			sharedUDPConn, err := net.ListenUDP(listenNetwork, localAddr)
+			sharedUDPConn, err := netx.ListenUDP(listenNetwork, localAddr)
 			if err != nil {
 				return nil, err
 			}
@@ -201,7 +201,7 @@ func GetPublicIPsContext(parentCtx context.Context, network, bind string, timeou
 			var conn net.Conn
 			dialer := &net.Dialer{LocalAddr: laddr}
 			if strings.HasPrefix(useNetwork, "tcp") {
-				dialer.Control = netx.ControlTCP
+				dialer.Control = netx.LocalAddrControl(laddr, netx.ControlTCP)
 				if strings.Contains(stunAddr, "?") {
 					conn, err = netx.DialRace(ctx, useNetwork, stunAddr, dialer.DialContext)
 				} else {

@@ -156,3 +156,23 @@ gonc -p2p mysecret123 -x2 "-psk simplekey123 1.2.3.4:1080"
 
 ??? question "支持 IPv6 吗？"
     **完美支持**。如果检测到双方都有 IPv6 地址，`gonc` 会优先通过 IPv6 建立直连（通常无需打洞），速度和稳定性都是最佳的。
+
+## VPN 接管期间指定物理出口
+
+在 Windows、macOS 和 Linux 上，`-local <本机IP>:0` 会把常规直连 P2P/STUN、MQTT 和普通直接拨号的 socket 同时约束到该 IP 所属接口。macOS 使用 `IP_BOUND_IF` / `IPV6_BOUND_IF`，Windows 使用 `IP_UNICAST_IF` / `IPV6_UNICAST_IF`，Linux 使用 `SO_BINDTODEVICE`。每次重连重新查找接口，找不到地址或设置失败时返回错误，不回退到未绑定的 socket。未指定源 IP、通配地址及回环地址保留原有行为；Android 不增加此约束。
+
+DNS 请求是独立 socket。桌面端要让 MQTT/STUN 域名解析也使用该出口，请同时指定可达的 DNS 服务器 IP，例如：
+
+```bash
+gonc -p2p mysecret123 -local 192.168.10.187:0 -dns 8.8.8.8:53
+```
+
+`-dns` 当前设置的是进程级 Go 解析器；GUI 的 VPN DNS 字段不是此参数。IPv6 本地地址使用 `[地址]:0`，链路本地地址还需接口 zone，例如 `[fe80::1234%en0]:0`。显式指定 IPv4 源地址不会自动选择同接口的 IPv6 源地址。
+
+接口必须仍有到目标的可用路由，系统防火墙也必须允许此流量；这些参数不修改全局路由或防火墙，不等同于系统级断网保护。旧 Linux 内核或受限网络命名空间可能要求 `CAP_NET_RAW`，不支持此选项的环境会直接报错。IP 地址失效后需更新 `-local`。独立 LAN 发现分支仍按原有方式选择接口；此处的 P2P 指 MQTT/STUN 公网打洞分支，未将 `-local` 扩展为所有应用子功能的全局网卡开关。
+
+MQTT 沿用 Paho 的 `SetDialer` 和原有 TCP/TLS 连接流程，没有新增自定义连接器。接口约束适用于使用该 Dialer 的连接；Paho v1.5.1 的 TLS `all_proxy` 分支会另建代理 Dialer，不保证遵守此约束。
+
+macOS 上，`IP_BOUND_IF` 不会创建路由。已复现 VPN 的 `0.0.0.0/1`、`::/1` 接管路由导致物理接口作用域查找失败，即使设置接口绑定成功，仍可能返回 `no route to host`。为物理接口提供可用的作用域默认路由可解决该条件，但 gonc 不自动添加此路由；它也不是进程专属通道，其他指定该接口的程序同样可能旁路 VPN。
+
+macOS 验收可先保持 VPN 开启，用 `gonc -local <en0的IP>:0 8.8.8.8 53` 检查 TCP 连接，并在 en0 和 VPN 接口上抓包确认实际出口；再使用上述 P2P 命令分别验证 TCP、`-u`、重连及 DNS。单纯连接成功不能替代出口抓包。

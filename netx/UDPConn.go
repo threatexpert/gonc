@@ -15,6 +15,7 @@ type BoundUDPConn struct {
 	conn           net.PacketConn
 	connmu         sync.Mutex
 	supportRebuild bool
+	rebuildListen  func(string, *net.UDPAddr) (*net.UDPConn, error)
 	remoteAddr     net.Addr
 	keepOpen       bool
 	closeChan      chan struct{}
@@ -76,6 +77,12 @@ func (b *BoundUDPConn) SetSupportRebuild(support bool) {
 	b.supportRebuild = support
 }
 
+// SetRebuildListener must be called before concurrent use. It preserves the
+// caller's interface policy when a failed UDP socket needs to be recreated.
+func (b *BoundUDPConn) SetRebuildListener(listen func(string, *net.UDPAddr) (*net.UDPConn, error)) {
+	b.rebuildListen = listen
+}
+
 func (b *BoundUDPConn) Rebuild() (*net.UDPConn, error) {
 	b.connmu.Lock()
 	defer b.connmu.Unlock()
@@ -89,7 +96,11 @@ func (b *BoundUDPConn) Rebuild() (*net.UDPConn, error) {
 
 	b.conn.Close()
 
-	c, e := net.ListenUDP(nw, localAddr)
+	listen := b.rebuildListen
+	if listen == nil {
+		listen = net.ListenUDP
+	}
+	c, e := listen(nw, localAddr)
 	if e != nil {
 		return nil, e
 	}

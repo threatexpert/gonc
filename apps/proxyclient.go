@@ -206,6 +206,7 @@ func (c *ProxyClientConfig) dialToServer(timeout time.Duration) (net.Conn, error
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		LocalAddr: c.LocalAddr,
+		Control:   netx.LocalAddrControl(c.LocalAddr, nil),
 	}
 	return dialer.Dial(c.Network, serverAddress)
 }

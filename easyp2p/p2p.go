@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/threatexpert/gonc/v2/misc"
@@ -1203,7 +1204,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		uconn = relayConn
 		isSharedUDPConn = true
 	} else {
-		uconn, err = net.ListenUDP(network, localAddr)
+		uconn, err = sessCtx.listenUDP(network, localAddr)
 		if err != nil {
 			return nil, false, false, fmt.Errorf("error binding UDP address: %v", err)
 		}
@@ -1218,6 +1219,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	}
 
 	buconn := netx.NewBoundUDPConn(uconn, "", isSharedUDPConn)
+	buconn.SetRebuildListener(sessCtx.listenUDP)
 	buconn.SetSupportRebuild(true)
 	var pickOnce sync.Once
 	var forceRebind bool
@@ -1445,7 +1447,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 				var conn *net.UDPConn
 				receiver, err := sourceReceivers.add(ctxStopPunching, func() (*udpPunchReceiver, error) {
 					var err error
-					conn, err = net.ListenUDP(network, &net.UDPAddr{IP: localAddr.IP, Port: port, Zone: localAddr.Zone})
+					conn, err = sessCtx.listenUDP(network, &net.UDPAddr{IP: localAddr.IP, Port: port, Zone: localAddr.Zone})
 					if err != nil {
 						return nil, err
 					}
@@ -1535,8 +1537,8 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		}
 
 		sendPingOnNewPort := func(i int) bool {
-			freshAddr := &net.UDPAddr{IP: localAddr.IP, Port: 0}
-			newConn, err := net.ListenUDP(network, freshAddr)
+			freshAddr := &net.UDPAddr{IP: localAddr.IP, Port: 0, Zone: localAddr.Zone}
+			newConn, err := sessCtx.listenUDP(network, freshAddr)
 			if err == nil {
 				// 存入切片，以便协程退出时集中清理
 				pingConns = append(pingConns, newConn)
@@ -1681,7 +1683,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, addrPair.Remote.String())
 		} else {
-			uconnBrandnew, err = CreateUDPConnFromAddr(addrPair.Local, addrPair.Remote, false)
+			uconnBrandnew, err = createUDPConnFromAddr(addrPair.Local, addrPair.Remote, false, sessCtx.bindsLocalInterface())
 		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
@@ -1706,7 +1708,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, raddr.String())
 		} else {
-			uconnBrandnew, err = CreateUDPConnFromAddr(laddr, raddr, forceRebind)
+			uconnBrandnew, err = createUDPConnFromAddr(laddr, raddr, forceRebind, sessCtx.bindsLocalInterface())
 		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
@@ -1755,11 +1757,25 @@ func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPa
 }
 
 func CreateUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind bool) (net.Conn, error) {
+	return createUDPConnFromAddr(laddr, raddr, forcelyBind, false)
+}
+
+func createUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind, bindInterface bool) (net.Conn, error) {
 	// 类型断言：必须是 *net.UDPAddr
 	la, ok1 := laddr.(*net.UDPAddr)
 	ra, ok2 := raddr.(*net.UDPAddr)
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("both laddr and raddr must be *net.UDPAddr, got %T and %T", laddr, raddr)
+	}
+	if bindInterface {
+		local := la
+		var previous func(string, string, syscall.RawConn) error
+		if forcelyBind {
+			local = &net.UDPAddr{Port: la.Port}
+			previous = netx.ControlUDP
+		}
+		d := net.Dialer{LocalAddr: local, Control: netx.LocalAddrControl(la, previous)}
+		return d.Dial("udp", ra.String())
 	}
 
 	if forcelyBind {
@@ -2010,7 +2026,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 	var commitOnce sync.Once
 
 	// Start listener
-	lc := net.ListenConfig{Control: netx.ControlTCP}
+	lc := net.ListenConfig{Control: sessCtx.localControl(localAddr, netx.ControlTCP)}
 	listener, err := lc.Listen(attemptCtx, network, localAddr.String())
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to listen: %v", err)
@@ -2200,6 +2216,7 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 						dialer.Control = netx.ControlTCP
 					}
 				}
+				dialer.Control = sessCtx.localControl(localAddr, dialer.Control)
 
 				conn, err := dialer.DialContext(attemptCtx, network, targetAddr)
 				if err != nil {

@@ -1935,6 +1935,7 @@ func runDialModeOnce(console net.Conn, ncconfig *AppNetcatConfig, network, host,
 			case strings.HasPrefix(network, "udp"):
 				dialer.Control = netx.ControlUDP
 			}
+			dialer.Control = netx.LocalAddrControl(localAddr, dialer.Control)
 			if ncconfig.dialreadTimeout != 0 {
 				dialer.Timeout = time.Duration(ncconfig.dialreadTimeout) * time.Second
 			}
@@ -3551,16 +3552,18 @@ func setDns(dnsServer string, localIP string) {
 
 			// 如果指定了本地IP，就绑定
 			if localIP != "" {
-				ip := net.ParseIP(localIP)
+				host, zone, _ := strings.Cut(localIP, "%")
+				ip := net.ParseIP(host)
 				if ip != nil {
 					if strings.HasPrefix(network, "udp") {
-						d.LocalAddr = &net.UDPAddr{IP: ip}
+						d.LocalAddr = &net.UDPAddr{IP: ip, Zone: zone}
 					} else if strings.HasPrefix(network, "tcp") {
-						d.LocalAddr = &net.TCPAddr{IP: ip}
+						d.LocalAddr = &net.TCPAddr{IP: ip, Zone: zone}
 					}
 				}
 			}
 
+			d.Control = netx.LocalAddrControl(d.LocalAddr, d.Control)
 			return d.DialContext(ctx, network, dnsServer)
 		},
 	}
