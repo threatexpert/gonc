@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/threatexpert/gonc/v2/goncembed"
 	"github.com/zeebo/blake3"
@@ -30,6 +31,30 @@ type Session struct {
 func (s *Session) Stop() {
 	if s != nil && s.inner != nil {
 		s.inner.Stop()
+	}
+}
+
+// AwaitDone waits for the session to finish. A timeout does not cancel the session.
+// Call off the UI thread and outside callbacks. Nonpositive timeouts only poll.
+func (s *Session) AwaitDone(timeoutMillis int) bool {
+	if s == nil || s.inner == nil {
+		return true
+	}
+	if timeoutMillis <= 0 {
+		select {
+		case <-s.inner.Done():
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(time.Duration(timeoutMillis) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-s.inner.Done():
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

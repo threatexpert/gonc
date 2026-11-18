@@ -96,11 +96,30 @@ func StartTun2SocksWithPolicy(fd int, proxyURL string, deviceName string, mtu in
 
 // StopTun2Socks stops the tun2socks engine.
 func StopTun2Socks() {
+	_ = StopTun2SocksWithError()
+}
+
+// StopTun2SocksWithError retains the running state when cleanup fails so callers
+// can report the error and retry instead of discarding the engine.
+func StopTun2SocksWithError() error {
 	tun2socksMu.Lock()
 	defer tun2socksMu.Unlock()
 	if !tun2socksStarted {
-		return
+		return nil
 	}
-	_ = tunengine.Stop()
+	if err := tunengine.Stop(); err != nil {
+		return err
+	}
 	tun2socksStarted = false
+	return nil
+}
+
+// UpdateTun2SocksProxy changes only future proxy dials, retaining the TUN stack.
+func UpdateTun2SocksProxy(endpoint string) error {
+	tun2socksMu.Lock()
+	defer tun2socksMu.Unlock()
+	if !tun2socksStarted {
+		return tunengine.ErrNotRunning
+	}
+	return tunengine.UpdateProxy(endpoint)
 }
