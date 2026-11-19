@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,7 +70,9 @@ type Client struct {
 
 	absLocalDownloadRoot string
 
-	progressTracker *DownloadProgress
+	progressTracker       *DownloadProgress
+	linkCreationAvailable bool
+	receiveActions        map[string]ReceiveAction
 }
 
 // DownloadProgress tracks the overall download progress.
@@ -311,6 +314,8 @@ func (c *Client) Start(ctx context.Context) error {
 		c.logInfo("Dry run enabled: no files will be downloaded or created.")
 	}
 
+	// Probe only the selected destination, not a process-wide OS capability.
+	c.linkCreationAvailable = c.config.DryRun || probeSymlinkCreation(c.absLocalDownloadRoot)
 	// Fetch all file information first
 	filesToDownload, err := c.fetchFileList(ctx)
 	if err != nil {
@@ -318,6 +323,14 @@ func (c *Client) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to fetch file list: %w", err)
 	}
 
+	// Prepare real directories first; files keep listing order and links are last.
+	for _, dir := range orderedReceiveDirectories(filesToDownload, c.receiveActions) {
+		if err := c.downloadFile(ctx, http.DefaultClient, filesToDownload[dir.index]); err != nil {
+			c.logError("Failed to prepare directory %s: %v", filesToDownload[dir.index].Path, err)
+			continue
+		}
+		c.progressTracker.FileCompleted()
+	}
 	// Initialize queue size based on number of files determined
 	c.queue = make(chan FileInfo, c.config.Concurrency*2)
 
@@ -328,6 +341,9 @@ func (c *Client) Start(ctx context.Context) error {
 
 	// Now populate the queue with files to download
 	for _, fileInfo := range filesToDownload {
+		if c.receiveActions[fileInfo.Path] != ReceiveContent {
+			continue
+		}
 		select {
 		case c.queue <- fileInfo: // Try to send fileInfo
 			// Successfully sent
@@ -341,11 +357,21 @@ func (c *Client) Start(ctx context.Context) error {
 
 	close(c.queue)
 	c.wg.Wait()
+	for _, file := range filesToDownload {
+		if c.receiveActions[file.Path] != ReceiveLink {
+			continue
+		}
+		if err := c.downloadFile(ctx, http.DefaultClient, file); err != nil {
+			c.logError("Failed to receive link %s: %v", file.Path, err)
+		} else {
+			c.progressTracker.FileCompleted()
+		}
+	}
 
 	c.progressTracker.PrintProgress(true, true)
 	//c.progressTracker.ClearProgressLine() // Clear final progress line
 	c.logInfo("Download process completed.")
-	return nil
+	return ctx.Err()
 }
 
 func (c *Client) setAcceptEncodingForCompress(req *http.Request) {
@@ -386,96 +412,6 @@ func (c *Client) decodedResponseReader(resp *http.Response, label string, allowU
 		}
 		return nil, nil, fmt.Errorf("%w %q for %s", errUnsupportedContentEncoding, contentEncoding, label)
 	}
-}
-
-// fetchFileList connects to the server and streams recursive file info,
-// collecting all FileInfo objects before returning them.
-func (c *Client) fetchFileList(ctx context.Context) ([]FileInfo, error) {
-	serverURL, err := url.Parse(c.config.ServerURL)
-	if err != nil {
-		c.logError("Invalid server URL: %v", err)
-		return nil, fmt.Errorf("invalid server URL: %w", err)
-	}
-
-	requestPath := path.Clean(serverURL.Path)
-	if requestPath == "." {
-		requestPath = "/"
-	} else if !strings.HasPrefix(requestPath, "/") {
-		requestPath = "/" + requestPath
-	}
-
-	fullRequestURL := serverURL.Scheme + "://" + serverURL.Host + requestPath
-
-	req, err := http.NewRequestWithContext(ctx, "GET", fullRequestURL, nil)
-	if err != nil {
-		c.logError("Error creating request: %v", err)
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	c.setAcceptEncodingForCompress(req)
-
-	var collectedFiles []FileInfo // Collect files here
-	httpClient := &http.Client{}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		c.logError("Error making request to server: %v", err)
-		return nil, fmt.Errorf("error making request to server: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		c.logError("Server returned non-OK status for file list (%s): %s", fullRequestURL, resp.Status)
-		return collectedFiles, nil //let it keep running
-	}
-
-	reader, closeReader, err := c.decodedResponseReader(resp, "file list", true)
-	if err != nil {
-		return nil, err
-	}
-	defer closeReader()
-
-	scanner := bufio.NewScanner(reader)
-
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			c.logInfo("Aborting file list fetch due to context cancellation: %v", ctx.Err())
-			return nil, ctx.Err()
-		default:
-		}
-		line := scanner.Bytes()
-		var fileInfo FileInfo
-		if err := json.Unmarshal(line, &fileInfo); err != nil {
-			c.logError("Error unmarshaling JSON line: %v, line: %s", err, string(line))
-			continue
-		}
-
-		if !c.shouldInclude(fileInfo.Path) || c.shouldExclude(fileInfo.Path) {
-			c.logVerbose("Skipping %s due to include/exclude filters", fileInfo.Path)
-			continue
-		}
-
-		collectedFiles = append(collectedFiles, fileInfo) // Collect the fileInfo
-	}
-
-	if err := scanner.Err(); err != nil {
-		c.logError("Error reading server response: %v", err)
-		return nil, fmt.Errorf("error reading server response: %w", err)
-	}
-
-	// After collecting all files, calculate totals and populate progress tracker
-	for _, fileInfo := range collectedFiles {
-		c.progressTracker.IncrementTotalFiles()
-		if !fileInfo.IsDir {
-			c.progressTracker.AddTotalBytes(fileInfo.Size)
-		}
-	}
-
-	c.logInfo("Finished fetching file list. Total files to process: %d, total bytes: %s",
-		c.progressTracker.totalFiles.Load(), formatBytes(c.progressTracker.totalBytes.Load()))
-
-	// Return the list of files to the Start method
-	return collectedFiles, nil
 }
 
 // worker goroutine to download files from the queue.
@@ -544,6 +480,33 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 			fileInfo.Path, cleanedLocalPath, c.absLocalDownloadRoot)
 	}
 	localFilePath := cleanedLocalPath
+	if err := c.checkReceiveParents(localFilePath); err != nil {
+		return err
+	}
+	if c.receiveActions[fileInfo.Path] == ReceiveLink {
+		return c.receiveLink(ctx, httpClient, fileInfo, localFilePath)
+	}
+	if info, err := os.Lstat(localFilePath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			if fileInfo.IsDir {
+				if !c.config.Overwrite && !c.config.Resume {
+					return fmt.Errorf("local symlink conflicts with directory at %s", fileInfo.Path)
+				}
+				if !c.config.DryRun {
+					if err := os.Remove(localFilePath); err != nil {
+						return err
+					}
+				}
+			} else {
+				return c.receiveContentOverLink(ctx, httpClient, fileInfo, localFilePath)
+			}
+		}
+		if info.Mode()&os.ModeSymlink == 0 && (info.IsDir() != fileInfo.IsDir || (!info.IsDir() && !info.Mode().IsRegular())) {
+			return fmt.Errorf("local type conflicts at %s", fileInfo.Path)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 
 	var downloadURL string
 	var localFileExists bool
@@ -910,6 +873,7 @@ func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Clien
 
 	scanner := bufio.NewScanner(reader)
 	var manifest blake3Manifest
+	seenHeader := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var typed struct {
@@ -920,12 +884,19 @@ func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Clien
 		}
 		switch typed.Type {
 		case "file":
+			if seenHeader {
+				return nil, errBlake3ManifestUnsupported
+			}
+			seenHeader = true
 			var header blake3ManifestFileRecord
 			if err := json.Unmarshal(line, &header); err != nil {
 				return nil, err
 			}
 			if header.Algo != blake3ManifestAlgo {
 				return nil, errBlake3ManifestUnsupported
+			}
+			if header.Size < 0 || header.ManifestSize < 0 || header.ManifestSize > header.Size || header.BlockSize <= 0 {
+				return nil, fmt.Errorf("invalid BLAKE3 manifest dimensions")
 			}
 			modTime, err := time.Parse(time.RFC3339Nano, header.ModTime)
 			if err != nil {
@@ -938,6 +909,9 @@ func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Clien
 			manifest.ManifestSize = header.ManifestSize
 			manifest.LimitSize = header.LimitSize
 		case "block":
+			if !seenHeader {
+				return nil, errBlake3ManifestUnsupported
+			}
 			var block blake3ManifestBlockRecord
 			if err := json.Unmarshal(line, &block); err != nil {
 				return nil, err
@@ -950,11 +924,28 @@ func (c *Client) fetchBlake3Manifest(ctx context.Context, httpClient *http.Clien
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+	if !seenHeader {
+		return nil, errBlake3ManifestUnsupported
+	}
 	if manifest.BlockSize <= 0 && manifest.Size > 0 {
 		return nil, errBlake3ManifestUnsupported
 	}
 	if manifest.ManifestSize <= 0 {
 		manifest.ManifestSize = manifest.Size
+	}
+	count := manifest.ManifestSize / manifest.BlockSize
+	if manifest.ManifestSize%manifest.BlockSize != 0 {
+		count++
+	}
+	if int64(len(manifest.Blocks)) != count {
+		return nil, fmt.Errorf("incomplete BLAKE3 manifest")
+	}
+	for i, block := range manifest.Blocks {
+		offset, size := manifestBlockBounds(i, manifest.ManifestSize, manifest.BlockSize)
+		hash, err := hex.DecodeString(block.Hash)
+		if block.Index != i || block.Offset != offset || block.Size != size || err != nil || len(hash) != 32 {
+			return nil, fmt.Errorf("invalid BLAKE3 block %d", i)
+		}
 	}
 	return &manifest, nil
 }

@@ -23,11 +23,12 @@ import (
 
 // FileInfo represents a file or directory for JSON listing.
 type FileInfo struct {
-	Name    string    `json:"name"`
-	IsDir   bool      `json:"is_dir"`
-	ModTime time.Time `json:"mod_time"`
-	Size    int64     `json:"size"` // Size in bytes, 0 for directories
-	Path    string    `json:"path"` // Full relative path from the root
+	Name       string    `json:"name"`
+	IsDir      bool      `json:"is_dir"`
+	ModTime    time.Time `json:"mod_time"`
+	Size       int64     `json:"size"`
+	Path       string    `json:"path"`
+	LinkTarget string    `json:"link_target,omitempty"`
 }
 
 // ServerConfig holds the server configuration.
@@ -70,6 +71,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 	}
 
+	if disk, ok := source.(*OSFileSource); ok {
+		owned := *disk
+		owned.logSkip = serverLogger.Printf
+		source = &owned
+	}
 	s := &Server{
 		config: cfg,
 		logger: serverLogger,
@@ -356,7 +362,19 @@ func (s *Server) serveDirectoryFromSource(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		s.logger.Printf("Warning: Error reading directory listing for %s (showing partial results): %v", requestedPath, err)
 	}
-	s.serveHTMLDirectoryListing(w, r, entries, r.URL.Path)
+	listing := make([]htmlDirectoryEntry, 0, len(entries))
+	for _, info := range entries {
+		name := path.Join(requestedPath, info.Name())
+		file, include, err := s.describeEntry(name, info)
+		if err != nil {
+			s.logger.Printf("Error describing directory entry %s: %v", name, err)
+			continue
+		}
+		if include {
+			listing = append(listing, htmlDirectoryEntry{FileInfo: file, isLink: info.Mode()&fs.ModeSymlink != 0})
+		}
+	}
+	s.serveHTMLDirectoryListing(w, r, listing, r.URL.Path)
 }
 
 func (s *Server) serveSourceError(w http.ResponseWriter, r *http.Request, requestedPath string, err error) {
@@ -374,15 +392,19 @@ func (s *Server) serveSourceError(w http.ResponseWriter, r *http.Request, reques
 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 }
 
-// serveHTMLDirectoryListing serves an HTML page for directory listing (for browsers).
-// Refactored to accept []fs.FileInfo instead of reading the file itself.
-func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Request, entries []fs.FileInfo, displayPath string) {
+type htmlDirectoryEntry struct {
+	FileInfo
+	isLink bool
+}
+
+// serveHTMLDirectoryListing serves an HTML page using resolved target attributes.
+func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Request, entries []htmlDirectoryEntry, displayPath string) {
 	// Sort entries: directories first, then by name
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].IsDir() != entries[j].IsDir() {
-			return entries[i].IsDir() // Directories first
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir // Directories first
 		}
-		return entries[i].Name() < entries[j].Name()
+		return entries[i].Name < entries[j].Name
 	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -406,6 +428,7 @@ func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Reques
         td a { text-decoration: none; color: #007bff; }
         td a:hover { text-decoration: underline; }
         .dir-entry { font-weight: bold; }
+        .link-label { color: #666; font-size: 0.85em; }
         .size-col { width: 15%; white-space: nowrap; }
         .time-col { width: 25%; white-space: nowrap; }
     </style>
@@ -438,33 +461,41 @@ func (s *Server) serveHTMLDirectoryListing(w http.ResponseWriter, r *http.Reques
 	// File and Directory Entries
 	for _, entry := range entries {
 		suffix := ""
-		if entry.IsDir() {
+		if entry.IsDir {
 			suffix = "/"
 		}
 
 		// HTML Escape filename to prevent XSS
-		escapedName := htmlEscape(entry.Name())
+		escapedName := htmlEscape(entry.Name)
 
 		sb.WriteString(`
             <tr>
                 <td><a href="`)
-		sb.WriteString(encodePathSegmentPreservingSlashes(filepath.ToSlash(entry.Name())) + suffix) // URL escape name for href
+		sb.WriteString(htmlEscape(encodePathSegmentPreservingSlashes(filepath.ToSlash(entry.Name)) + suffix)) // URL and HTML escape name for href
 		sb.WriteString(`" class="`)
-		if entry.IsDir() {
+		if entry.IsDir {
 			sb.WriteString(`dir-entry`)
 		}
 		sb.WriteString(`">`)
 		sb.WriteString(escapedName)
-		sb.WriteString(`</a></td>
-                <td>`)
-		if entry.IsDir() {
-			sb.WriteString(`&lt;DIR&gt;`)
-		} else {
-			sb.WriteString(formatBytes(entry.Size()))
+		sb.WriteString(`</a>`)
+		if entry.isLink {
+			sb.WriteString(` <span class="link-label">(link)</span>`)
 		}
 		sb.WriteString(`</td>
                 <td>`)
-		sb.WriteString(entry.ModTime().Format("2006-01-02 15:04:05"))
+		if entry.isLink && entry.Size < 0 {
+			sb.WriteString(`Target unavailable`)
+		} else if entry.IsDir {
+			sb.WriteString(`&lt;DIR&gt;`)
+		} else {
+			sb.WriteString(formatBytes(entry.Size))
+		}
+		sb.WriteString(`</td>
+                <td>`)
+		if !entry.ModTime.IsZero() {
+			sb.WriteString(entry.ModTime.Format("2006-01-02 15:04:05"))
+		}
 		sb.WriteString(`</td>
             </tr>`)
 	}
@@ -547,7 +578,6 @@ func (s *Server) serveBlake3ManifestFromSource(w http.ResponseWriter, r *http.Re
 	}
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("Transfer-Encoding", "chunked")
 
 	encoder := json.NewEncoder(w)
 	header := blake3ManifestFileRecord{
@@ -564,12 +594,12 @@ func (s *Server) serveBlake3ManifestFromSource(w http.ResponseWriter, r *http.Re
 	}
 	if err := encoder.Encode(header); err != nil {
 		s.logger.Printf("Error encoding BLAKE3 manifest header for %s: %v", requestedPath, err)
-		return
+		panic(http.ErrAbortHandler)
 	}
 	for _, block := range blocks {
 		if err := encoder.Encode(block); err != nil {
 			s.logger.Printf("Error encoding BLAKE3 manifest block for %s: %v", requestedPath, err)
-			return
+			panic(http.ErrAbortHandler)
 		}
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
@@ -584,80 +614,106 @@ func (s *Server) serveNDJSONListFromSource(w http.ResponseWriter, r *http.Reques
 		s.serveSourceError(w, r, requestedPath, err)
 		return
 	}
-
+	if stat.IsDir() {
+		if source, ok := s.source.(interface{ ValidateDirectory(string) error }); ok {
+			if err := source.ValidateDirectory(requestedPath); err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("Transfer-Encoding", "chunked")
-
 	encoder := json.NewEncoder(w)
-
-	writeInfo := func(sourcePath string, info fs.FileInfo) error {
+	wrote := false
+	fail := func(err error) {
+		s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
+		// A partial list must not look complete. Abort the HTTP stream rather than
+		// introduce extra protocol fields or silently omit a failed subtree.
+		if wrote {
+			panic(http.ErrAbortHandler)
+		}
+		http.Error(w, "directory listing failed", http.StatusInternalServerError)
+	}
+	writeInfo := func(name string, info fs.FileInfo) error {
 		if info == nil {
 			return nil
 		}
-		fileInfo := FileInfo{
-			Name:    info.Name(),
-			IsDir:   info.IsDir(),
-			ModTime: info.ModTime(),
-			Size:    info.Size(),
-			Path:    sourcePath,
+		file, include, err := s.describeEntry(name, info)
+		if err != nil {
+			if name == requestedPath {
+				return err
+			}
+			s.logger.Printf("Skipping %s: %v", name, err)
+			return nil
 		}
-		if err := encoder.Encode(fileInfo); err != nil {
-			s.logger.Printf("Error encoding FileInfo for %s: %v", sourcePath, err)
-			return fmt.Errorf("client write error: %w", err)
+		if !include {
+			return nil
 		}
+		if err := encoder.Encode(file); err != nil {
+			return err
+		}
+		wrote = true
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 		return nil
 	}
-
-	if !recursive {
-		if !stat.IsDir() {
-			if err := writeInfo(requestedPath, stat); err != nil {
-				if strings.Contains(err.Error(), "client write error") {
-					s.logger.Printf("NDJSON list stopped due to client disconnect.")
-					return
-				}
-				s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
+	if !stat.IsDir() {
+		if source, ok := s.source.(LinkFileSource); ok {
+			stat, err = source.Lstat(requestedPath)
+			if err != nil {
+				fail(err)
+				return
 			}
-			return
 		}
-
+		if err := writeInfo(requestedPath, stat); err != nil {
+			fail(err)
+		}
+		return
+	}
+	if !recursive {
 		entries, err := s.source.ReadDir(requestedPath)
 		if err != nil {
-			s.serveSourceError(w, r, requestedPath, err)
+			fail(err)
 			return
 		}
 		for _, entry := range entries {
-			entryPath := path.Join(requestedPath, filepath.ToSlash(entry.Name()))
-			if !strings.HasPrefix(entryPath, "/") {
-				entryPath = "/" + entryPath
-			}
-			if err := writeInfo(entryPath, entry); err != nil {
-				if strings.Contains(err.Error(), "client write error") {
-					s.logger.Printf("NDJSON list stopped due to client disconnect.")
-					return
-				}
-				s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
+			name := path.Join(requestedPath, filepath.ToSlash(entry.Name()))
+			if err := writeInfo(name, entry); err != nil {
+				fail(err)
 				return
 			}
 		}
 		return
 	}
-
-	err = s.source.Walk(requestedPath, func(sourcePath string, info fs.FileInfo, walkErr error) error {
+	// WalkDir visits the root before opening it. Delay this first record so
+	// an unreadable requested directory can still return an HTTP error.
+	var pendingRoot fs.FileInfo
+	err = s.source.Walk(requestedPath, func(name string, info fs.FileInfo, walkErr error) error {
 		if walkErr != nil {
-			s.logger.Printf("Error walking path %s: %v", sourcePath, walkErr)
+			if name == requestedPath || name == "" {
+				return walkErr
+			}
+			s.logger.Printf("Skipping %s: %v", name, walkErr)
 			return nil
 		}
-		return writeInfo(sourcePath, info)
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "client write error") {
-			s.logger.Printf("NDJSON list stopped due to client disconnect.")
-			return
+		if name == requestedPath && !wrote {
+			pendingRoot = info
+			return nil
 		}
-		s.logger.Printf("NDJSON list failed for %s: %v", requestedPath, err)
+		if pendingRoot != nil {
+			if err := writeInfo(requestedPath, pendingRoot); err != nil {
+				return err
+			}
+			pendingRoot = nil
+		}
+		return writeInfo(name, info)
+	})
+	if err == nil && pendingRoot != nil {
+		err = writeInfo(requestedPath, pendingRoot)
+	}
+	if err != nil {
+		fail(err)
 	}
 }
 

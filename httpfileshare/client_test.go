@@ -55,55 +55,66 @@ func TestDownloadFileRejectsSiblingPrefixPathTraversal(t *testing.T) {
 	}
 }
 
-func TestDownloadFileOldServerManifestUnsupportedRedownloadsFullFile(t *testing.T) {
-	const remoteBody = "0123456789"
-	const localPartial = "0123"
-	remoteModTime := time.Unix(1700001000, 0)
+func TestDownloadFileNon200ManifestRedownloadsFullFile(t *testing.T) {
+	for _, status := range []int{204, 404, 403, 429, 500} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var manifests, downloads atomic.Int32
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("manifest") == blake3ManifestAlgo {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Header.Get("Range") != "" {
-			t.Fatalf("unexpected Range request after manifest fallback")
-		}
-		_, _ = io.WriteString(w, remoteBody)
-	}))
-	defer server.Close()
+			const remoteBody = "0123456789"
+			const localPartial = "0123"
+			remoteModTime := time.Unix(1700001000, 0)
 
-	tmpDir := t.TempDir()
-	localPath := filepath.Join(tmpDir, "data.bin")
-	if err := os.WriteFile(localPath, []byte(localPartial), 0644); err != nil {
-		t.Fatal(err)
-	}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("manifest") == blake3ManifestAlgo {
+					manifests.Add(1)
+					w.WriteHeader(status)
+					return
+				}
+				downloads.Add(1)
+				if r.Method != http.MethodGet || r.Header.Get("Range") != "" {
+					t.Errorf("unexpected request after manifest fallback: %s Range=%q", r.Method, r.Header.Get("Range"))
+				}
+				_, _ = io.WriteString(w, remoteBody)
+			}))
+			defer server.Close()
 
-	client, err := newTestClient(server.URL, tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.progressTracker.AddTotalBytes(int64(len(remoteBody)))
+			tmpDir := t.TempDir()
+			localPath := filepath.Join(tmpDir, "data.bin")
+			if err := os.WriteFile(localPath, []byte(localPartial), 0644); err != nil {
+				t.Fatal(err)
+			}
 
-	err = client.downloadFile(context.Background(), server.Client(), FileInfo{
-		Name:    "data.bin",
-		Path:    "/data.bin",
-		Size:    int64(len(remoteBody)),
-		ModTime: remoteModTime,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+			client, err := newTestClient(server.URL, tmpDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.progressTracker.AddTotalBytes(int64(len(remoteBody)))
 
-	gotProgress := client.progressTracker.bytesDownloaded.Load()
-	if gotProgress != int64(len(remoteBody)) {
-		t.Fatalf("bytesDownloaded = %d, want %d", gotProgress, len(remoteBody))
-	}
-	gotBody, err := os.ReadFile(localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotBody) != remoteBody {
-		t.Fatalf("local body = %q, want %q", gotBody, remoteBody)
+			err = client.downloadFile(context.Background(), server.Client(), FileInfo{
+				Name:    "data.bin",
+				Path:    "/data.bin",
+				Size:    int64(len(remoteBody)),
+				ModTime: remoteModTime,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			gotProgress := client.progressTracker.bytesDownloaded.Load()
+			if gotProgress != int64(len(remoteBody)) {
+				t.Fatalf("bytesDownloaded = %d, want %d", gotProgress, len(remoteBody))
+			}
+			gotBody, err := os.ReadFile(localPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(gotBody) != remoteBody {
+				t.Fatalf("local body = %q, want %q", gotBody, remoteBody)
+			}
+			if manifests.Load() != 1 || downloads.Load() != 1 {
+				t.Fatalf("got %d manifest and %d content requests", manifests.Load(), downloads.Load())
+			}
+		})
 	}
 }
 

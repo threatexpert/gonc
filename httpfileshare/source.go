@@ -31,6 +31,7 @@ type FileSource interface {
 // OSFileSource adapts local filesystem paths to FileSource. It preserves the
 // server's existing single-root and multi-root virtual mount behavior.
 type OSFileSource struct {
+	logSkip          func(string, ...any)
 	mounts           []virtualMount
 	singleRoot       string
 	singleRootIsFile bool
@@ -60,7 +61,7 @@ func NewOSFileSource(rootPaths []string) (*OSFileSource, error) {
 	src := &OSFileSource{}
 	if len(absPaths) == 1 {
 		src.singleRoot = absPaths[0]
-		if stat, err := os.Stat(absPaths[0]); err == nil && !stat.IsDir() {
+		if stat, err := os.Lstat(absPaths[0]); err == nil && !stat.IsDir() {
 			src.singleRootIsFile = true
 			src.singleRootAlias = filepath.Base(absPaths[0])
 		}
@@ -80,12 +81,10 @@ func NewOSFileSource(rootPaths []string) (*OSFileSource, error) {
 		}
 
 		alias := baseName
-		if count, exists := seenAliases[alias]; exists {
-			seenAliases[baseName]++
-			alias = fmt.Sprintf("%s-%d", baseName, count+1)
-		} else {
-			seenAliases[alias] = 1
+		for suffix := 2; seenAliases[alias] != 0; suffix++ {
+			alias = fmt.Sprintf("%s-%d", baseName, suffix)
 		}
+		seenAliases[alias] = 1
 
 		src.mounts = append(src.mounts, virtualMount{
 			Alias:    alias,
@@ -134,7 +133,7 @@ func (s *OSFileSource) ReadDir(name string) ([]fs.FileInfo, error) {
 	}
 	if isVirtualRoot {
 		if s.singleRootIsFile {
-			stat, err := os.Stat(s.singleRoot)
+			stat, err := os.Lstat(s.singleRoot)
 			if err != nil {
 				return nil, err
 			}
@@ -142,8 +141,11 @@ func (s *OSFileSource) ReadDir(name string) ([]fs.FileInfo, error) {
 		}
 		var entries []fs.FileInfo
 		for _, m := range s.mounts {
-			stat, err := os.Stat(m.RealPath)
+			stat, err := os.Lstat(m.RealPath)
 			if err != nil {
+				if s.logSkip != nil {
+					s.logSkip("Skipping %s: %v", m.Alias, err)
+				}
 				continue
 			}
 			entries = append(entries, virtualFileInfo{FileInfo: stat, name: m.Alias})
@@ -162,6 +164,9 @@ func (s *OSFileSource) ReadDir(name string) ([]fs.FileInfo, error) {
 	for _, de := range dirEntries {
 		info, err := de.Info()
 		if err != nil {
+			if s.logSkip != nil {
+				s.logSkip("Skipping %s: %v", path.Join(name, de.Name()), err)
+			}
 			continue
 		}
 		entries = append(entries, info)
@@ -177,7 +182,14 @@ func (s *OSFileSource) Walk(name string, fn func(sourcePath string, info fs.File
 
 	if s.singleRoot != "" {
 		if s.singleRootIsFile {
-			return s.walkSingleFileRoot(requestedPath, fn)
+			if requestedPath == "/" || requestedPath == "/"+s.singleRootAlias {
+				return s.walkSingleFileRoot(requestedPath, fn)
+			}
+			full, _, err := s.resolvePath(requestedPath)
+			if err != nil {
+				return err
+			}
+			return s.walkRequestedRoot(full, requestedPath, fn)
 		}
 		fullPath, _, err := s.resolvePath(requestedPath)
 		if err != nil {
@@ -186,7 +198,7 @@ func (s *OSFileSource) Walk(name string, fn func(sourcePath string, info fs.File
 		if _, err := os.Stat(fullPath); err != nil {
 			return err
 		}
-		return s.walkDiskRoot(fullPath, requestedPath, fn)
+		return s.walkRequestedRoot(fullPath, requestedPath, fn)
 	}
 
 	if requestedPath == "/" {
@@ -202,15 +214,12 @@ func (s *OSFileSource) Walk(name string, fn func(sourcePath string, info fs.File
 	if err != nil {
 		return err
 	}
-	return s.walkDiskRoot(fullPath, requestedPath, fn)
+	return s.walkRequestedRoot(fullPath, requestedPath, fn)
 }
 
 func (s *OSFileSource) walkDiskRoot(rootDiskPath string, virtualPrefix string, fn func(sourcePath string, info fs.FileInfo, err error) error) error {
 	return filepath.WalkDir(rootDiskPath, func(currentPath string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return fn("", nil, err)
-		}
-
+		walkErr := err
 		relPath, err := filepath.Rel(rootDiskPath, currentPath)
 		if err != nil {
 			return fn("", nil, err)
@@ -221,16 +230,25 @@ func (s *OSFileSource) walkDiskRoot(rootDiskPath string, virtualPrefix string, f
 			fullVirtualPath = "/" + fullVirtualPath
 		}
 
-		info, err := d.Info()
-		if err != nil {
-			return fn(fullVirtualPath, nil, err)
+		var info fs.FileInfo
+		if walkErr == nil {
+			info, walkErr = d.Info()
+		}
+		if walkErr != nil {
+			if err := fn(fullVirtualPath, nil, walkErr); err != nil {
+				return err
+			}
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		return fn(fullVirtualPath, info, nil)
 	})
 }
 
 func (s *OSFileSource) walkSingleFileRoot(requestedPath string, fn func(sourcePath string, info fs.FileInfo, err error) error) error {
-	stat, err := os.Stat(s.singleRoot)
+	stat, err := os.Lstat(s.singleRoot)
 	if err != nil {
 		return err
 	}
@@ -242,6 +260,9 @@ func (s *OSFileSource) walkSingleFileRoot(requestedPath string, fn func(sourcePa
 		return fn(filePath, virtualFileInfo{FileInfo: stat, name: s.singleRootAlias}, nil)
 	}
 	if requestedPath == filePath {
+		if target, err := os.Stat(s.singleRoot); err == nil && target.IsDir() {
+			return s.walkRequestedRoot(s.singleRoot, filePath, fn)
+		}
 		return fn(filePath, virtualFileInfo{FileInfo: stat, name: s.singleRootAlias}, nil)
 	}
 	return os.ErrNotExist
@@ -260,6 +281,12 @@ func (s *OSFileSource) resolvePath(name string) (fullPath string, isVirtualRoot 
 			}
 			if strings.TrimPrefix(name, "/") == s.singleRootAlias {
 				return s.singleRoot, false, nil
+			}
+			prefix := "/" + s.singleRootAlias + "/"
+			if strings.HasPrefix(name, prefix) {
+				if info, err := os.Stat(s.singleRoot); err == nil && info.IsDir() {
+					return filepath.Join(s.singleRoot, filepath.FromSlash(strings.TrimPrefix(name, prefix))), false, nil
+				}
 			}
 			return "", false, os.ErrNotExist
 		}
