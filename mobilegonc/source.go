@@ -32,17 +32,19 @@ type mobileFileSource struct {
 }
 
 type mobileFileInfoJSON struct {
-	Name          string `json:"name"`
-	IsDir         bool   `json:"isDir"`
-	Size          int64  `json:"size"`
-	ModTimeMillis int64  `json:"modTimeMillis"`
+	Mode          *uint32 `json:"mode,omitempty"`
+	Name          string  `json:"name"`
+	IsDir         bool    `json:"isDir"`
+	Size          int64   `json:"size"`
+	ModTimeMillis int64   `json:"modTimeMillis"`
 }
 
 type mobileFileInfo struct {
-	name    string
-	isDir   bool
-	size    int64
-	modTime time.Time
+	permissions *uint32
+	name        string
+	isDir       bool
+	size        int64
+	modTime     time.Time
 }
 
 func (s *mobileFileSource) Description() string {
@@ -161,7 +163,7 @@ func (v mobileFileInfoJSON) fileInfo() fs.FileInfo {
 	if v.IsDir {
 		size = 0
 	}
-	return mobileFileInfo{name: name, isDir: v.IsDir, size: size, modTime: modTime}
+	return mobileFileInfo{permissions: v.Mode, name: name, isDir: v.IsDir, size: size, modTime: modTime}
 }
 
 func cleanMobilePath(name string) (string, error) {
@@ -181,6 +183,13 @@ func cleanMobilePath(name string) (string, error) {
 func (i mobileFileInfo) Name() string { return i.name }
 func (i mobileFileInfo) Size() int64  { return i.size }
 func (i mobileFileInfo) Mode() fs.FileMode {
+	if i.permissions != nil {
+		mode := fs.FileMode(*i.permissions).Perm()
+		if i.isDir {
+			mode |= fs.ModeDir
+		}
+		return mode
+	}
 	if i.isDir {
 		return fs.ModeDir | 0755
 	}
@@ -188,7 +197,12 @@ func (i mobileFileInfo) Mode() fs.FileMode {
 }
 func (i mobileFileInfo) ModTime() time.Time { return i.modTime }
 func (i mobileFileInfo) IsDir() bool        { return i.isDir }
-func (i mobileFileInfo) Sys() any           { return nil }
+func (i mobileFileInfo) Sys() any {
+	if i.permissions == nil {
+		return nil
+	}
+	return *i.permissions
+}
 
 type mobileFile struct {
 	source AndroidFileSource

@@ -324,11 +324,14 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 
 	// Prepare real directories first; files keep listing order and links are last.
-	for _, dir := range orderedReceiveDirectories(filesToDownload, c.receiveActions) {
+	dirs := orderedReceiveDirectories(filesToDownload, c.receiveActions)
+	prepared := dirs[:0]
+	for _, dir := range dirs {
 		if err := c.downloadFile(ctx, http.DefaultClient, filesToDownload[dir.index]); err != nil {
 			c.logError("Failed to prepare directory %s: %v", filesToDownload[dir.index].Path, err)
 			continue
 		}
+		prepared = append(prepared, dir)
 		c.progressTracker.FileCompleted()
 	}
 	// Initialize queue size based on number of files determined
@@ -368,6 +371,18 @@ func (c *Client) Start(ctx context.Context) error {
 		}
 	}
 
+	if !c.config.DryRun && ctx.Err() == nil {
+		for i := len(prepared) - 1; i >= 0; i-- {
+			file := filesToDownload[prepared[i].index]
+			if file.Mode == nil || file.Path == "/" {
+				continue
+			}
+			full := filepath.Join(c.absLocalDownloadRoot, filepath.FromSlash(file.Path))
+			if err := ApplyPermissions(c.absLocalDownloadRoot, full, file.Mode, true); err != nil {
+				c.logError("Failed to set directory permissions for %s: %v", file.Path, err)
+			}
+		}
+	}
 	c.progressTracker.PrintProgress(true, true)
 	//c.progressTracker.ClearProgressLine() // Clear final progress line
 	c.logInfo("Download process completed.")
@@ -512,10 +527,12 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 	var localFileExists bool
 	var localFileSize int64
 	var localModTime time.Time
+	var localMode os.FileMode
 
 	if stat, err := os.Stat(localFilePath); err == nil {
 		localFileExists = true
 		localFileSize = stat.Size()
+		localMode = stat.Mode()
 		localModTime = stat.ModTime()
 		c.logVerbose("Local file exists: %s, size: %d bytes", localFilePath, localFileSize)
 	} else if !os.IsNotExist(err) {
@@ -549,10 +566,13 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 
 		downloadURL = remoteURL.ResolveReference(parsedFileInfoURLPath).String()
 
-		if c.config.Resume && localFileExists && localFileSize == fileInfo.Size && localModTime.Equal(fileInfo.ModTime) {
+		if localFileExists && localFileSize == fileInfo.Size && localModTime.Equal(fileInfo.ModTime) && (c.config.Resume || PermissionsDiffer(fileInfo.Mode, localMode)) {
 			c.logVerbose("File %s already matches server size and modification time. Skipping download.", localFilePath)
 			c.progressTracker.AddBytesDownloaded(fileInfo.Size)
-			return nil
+			if c.config.DryRun {
+				return nil
+			}
+			return ApplyPermissions(c.absLocalDownloadRoot, localFilePath, fileInfo.Mode, false)
 		}
 
 		if c.config.Resume && localFileExists {
@@ -565,7 +585,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 				return err
 			}
 			if repaired {
-				return nil
+				return ApplyPermissions(c.absLocalDownloadRoot, localFilePath, fileInfo.Mode, false)
 			}
 			c.logRepair("BLAKE3 repair unavailable or inefficient for %s; re-downloading full file", localFilePath)
 			if err := c.downloadFullFile(ctx, httpClient, downloadURL, localFilePath, fileInfo); err != nil {
@@ -579,7 +599,7 @@ func (c *Client) downloadFile(ctx context.Context, httpClient *http.Client, file
 			c.logInfo("Skipping existing file (use -o to overwrite): %s", localFilePath)
 			c.progressTracker.AddBytesDownloaded(localFileSize)
 			return nil
-		} else if localFileExists && c.config.Overwrite {
+		} else if localFileExists && c.config.Overwrite && !c.config.DryRun {
 			c.logInfo("Overwriting existing file: %s", localFilePath)
 		} else if c.config.DryRun {
 			c.logInfo("Dry run: Would download %s to %s", downloadURL, localFilePath)
@@ -659,7 +679,7 @@ func (c *Client) downloadFullFile(ctx context.Context, httpClient *http.Client, 
 		c.logInfo("Warning: Could not set modification time for %s: %v", localFilePath, err)
 	}
 
-	return nil
+	return ApplyPermissions(c.absLocalDownloadRoot, localFilePath, fileInfo.Mode, false)
 }
 
 type blake3Manifest struct {

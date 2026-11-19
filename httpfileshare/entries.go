@@ -35,5 +35,11 @@ func (s *Server) describeEntry(name string, info fs.FileInfo) (FileInfo, bool, e
 		s.logger.Printf("Skipping special file %s", name)
 		return file, false, nil
 	}
+	// Virtual roots and document providers can expose synthetic modes without
+	// filesystem attributes. Leave those permissions unspecified on the wire.
+	if (name != "/" || !info.IsDir()) && info.Sys() != nil {
+		mode := uint32(info.Mode().Perm())
+		file.Mode = &mode
+	}
 	return file, true, nil
 }

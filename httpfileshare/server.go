@@ -28,6 +28,7 @@ type FileInfo struct {
 	ModTime    time.Time `json:"mod_time"`
 	Size       int64     `json:"size"`
 	Path       string    `json:"path"`
+	Mode       *uint32   `json:"mode,omitempty"`
 	LinkTarget string    `json:"link_target,omitempty"`
 }
 

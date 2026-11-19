@@ -69,7 +69,7 @@ func readTestList(t *testing.T, server *Server) map[string]FileInfo {
 	}
 	return entries
 }
-func TestLinkListAddsOnlyLinkTarget(t *testing.T) {
+func TestLinkListIncludesTargetPermissions(t *testing.T) {
 	root, server := linkFixture(t)
 	entries := readTestList(t, server)
 	actual, err := os.Stat(filepath.Join(root, "pkg", "cli.js"))
@@ -95,7 +95,10 @@ func TestLinkListAddsOnlyLinkTarget(t *testing.T) {
 		if err := json.Unmarshal(body, &fields); err != nil {
 			t.Fatal(err)
 		}
-		want := 5
+		want := 6
+		if entries[name].Mode == nil {
+			t.Fatalf("missing target mode: %s", body)
+		}
 		if entries[name].LinkTarget != "" {
 			want++
 		}
