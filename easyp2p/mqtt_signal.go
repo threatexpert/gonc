@@ -897,7 +897,7 @@ func (s *MQTTSignalSession) publishReply(ctx context.Context, topic string, qos 
 	}
 }
 
-func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), preferredBrokerIndex int) (recvData string, recvIndex int, keepAlive bool, err error) {
+func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, topicSalt, sessionUid string, timeout time.Duration, messageHandler func(string) (bool, error), preferredBrokerIndex int, policies ...mqttExchangePolicy) (recvData string, recvIndex int, keepAlive bool, err error) {
 	var qos byte = 1
 	topic := topicFromSaltAndSessionUid(topicSalt, sessionUid)
 	parentCtx := ctx
@@ -916,8 +916,19 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 	}
 	defer cancel()
 
+	policy := mqttExchangePolicy{}
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
 	if exmode != exmodePublishOnly {
-		if err := s.subscribe(exchangeCtx, topic, qos); err != nil {
+		subscribeCtx := exchangeCtx
+		cancelSubscribe := func() {}
+		if policy.hello {
+			subscribeCtx, cancelSubscribe = context.WithTimeout(exchangeCtx, mqttPrepareTopicsTimeout)
+		}
+		err := s.subscribe(subscribeCtx, topic, qos)
+		cancelSubscribe()
+		if err != nil {
 			return "", -1, false, err
 		}
 	}
@@ -934,6 +945,7 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 		}
 	}()
 
+	publishStarted := time.Now()
 	startBackgroundPublisher := func() {
 		go func() {
 			for _, delay := range mqttPublishBurstDelays {
@@ -947,13 +959,25 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 				}
 			}
 
-			ticker := time.NewTicker(mqttPublishTickerInterval)
-			defer ticker.Stop()
+			if !policy.slowHello {
+				ticker := time.NewTicker(mqttPublishTickerInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-publishCtx.Done():
+						return
+					case <-ticker.C:
+						s.publish(publishCtx, topic, qos, sendData, 1, diagnostics)
+					}
+				}
+			}
 			for {
+				timer := time.NewTimer(policy.retryInterval(time.Since(publishStarted)))
 				select {
 				case <-publishCtx.Done():
+					timer.Stop()
 					return
-				case <-ticker.C:
+				case <-timer.C:
 					s.publish(publishCtx, topic, qos, sendData, 1, diagnostics)
 				}
 			}
@@ -1026,7 +1050,14 @@ func (s *MQTTSignalSession) exchange(ctx context.Context, exmode int, sendData, 
 		if cause := context.Cause(parentCtx); cause != nil {
 			return "", -1, false, cause
 		}
-		return "", -1, false, s.signalError("exchange", topic, fmt.Errorf("timeout waiting for remote data exchange (brokers=%d/%d subscribed=%d)", len(s.clientsSnapshot()), len(s.brokers), s.subscribedCount(topic)))
+		if cause := context.Cause(s.ctx); cause != nil {
+			return "", -1, false, cause
+		}
+		cause := fmt.Errorf("timeout waiting for remote data exchange (brokers=%d/%d subscribed=%d)", len(s.clientsSnapshot()), len(s.brokers), s.subscribedCount(topic))
+		if policy.hello && s.hasConfirmedHelloChannel(topic, diagnostics) {
+			cause = fmt.Errorf("%w: %v", ErrHelloWaitTimeout, cause)
+		}
+		return "", -1, false, s.signalError("exchange", topic, cause)
 	case <-s.ctx.Done():
 		stopPublisher()
 		if cause := context.Cause(parentCtx); cause != nil {

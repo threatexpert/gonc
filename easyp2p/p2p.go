@@ -207,6 +207,10 @@ var (
 )
 
 func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSignalSession, exmode int, sendData any, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error)) (recvData T, recvIndex int, err error) {
+	return mqttSecureExchangeWithPolicy[T](ctx, signal, exmode, sendData, topicSalt, sessionUid, timeout, messageFilter, mqttExchangePolicy{})
+}
+
+func mqttSecureExchangeWithPolicy[T any](ctx context.Context, signal *MQTTSignalSession, exmode int, sendData any, topicSalt, sessionUid string, timeout time.Duration, messageFilter func(T) (bool, error), policy mqttExchangePolicy) (recvData T, recvIndex int, err error) {
 	var zero T
 	if signal == nil {
 		return zero, -1, fmt.Errorf("nil MQTT signal session")
@@ -246,7 +250,7 @@ func MQTT_SecureExchangeWithSession[T any](ctx context.Context, signal *MQTTSign
 		return true, nil
 	}
 
-	remoteInfoRaw, srvIndex, _, err := signal.exchange(ctx, exmode, string(encPayloadBytes), topicSalt, sessionUid, timeout, msgHandler, mqttNoPreferredBroker)
+	remoteInfoRaw, srvIndex, _, err := signal.exchange(ctx, exmode, string(encPayloadBytes), topicSalt, sessionUid, timeout, msgHandler, mqttNoPreferredBroker, policy)
 	if err != nil {
 		return zero, srvIndex, err
 	}
@@ -2628,7 +2632,7 @@ func MQTTHelloSession(ctx context.Context, sessionUid, localIP string, helloPayl
 		return true, nil
 	}
 
-	recvData, srvIndex, err := MQTT_SecureExchangeWithSession(ctx, signal, EXMODE_mutual, msgSYN, topicSalt, sessionUid, timeout, filterACK)
+	recvData, srvIndex, err := mqttSecureExchangeWithPolicy(ctx, signal, EXMODE_mutual, msgSYN, topicSalt, sessionUid, timeout, filterACK, mqttExchangePolicy{hello: true, slowHello: timeout > 30*time.Second})
 	if err != nil {
 		signal.Close()
 		return "", nil, err

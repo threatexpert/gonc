@@ -118,6 +118,7 @@ type AppNetcatConfig struct {
 	useMutilPath         bool
 	useMQTTWait          bool
 	useMQTTHello         bool
+	helloTimeout         time.Duration
 	useLAN               bool
 	useLANPassive        bool
 	p2pWithLanMode       bool
@@ -270,9 +271,10 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	}
 
 	config := &AppNetcatConfig{
-		LogWriter: swriter,
-		Logger:    log.New(swriter, "", 0),
-		ctx:       context.Background(),
+		helloTimeout: 30 * time.Second,
+		LogWriter:    swriter,
+		Logger:       log.New(swriter, "", 0),
+		ctx:          context.Background(),
 	}
 
 	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
@@ -3278,9 +3280,9 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (strin
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
-		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 30*time.Second, ncconfig.LogWriter)
+		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, ncconfig.helloTimeout, ncconfig.LogWriter)
 		if err != nil {
-			return "", nil, fmt.Errorf("mqtt-hello: %v", err)
+			return "", nil, fmt.Errorf("mqtt-hello: %w", err)
 		}
 	}
 	return salt, signal, nil
@@ -3306,11 +3308,23 @@ func p2pCandidateHasGuaranteedHandshakeBoundary(ncconfig *AppNetcatConfig, ciphe
 	}
 }
 
+// p2pPathErrorStatus preserves a stable machine-readable code for peer wait timeouts.
+func p2pPathErrorStatus(err error) string {
+	if errors.Is(err, easyp2p.ErrHelloWaitTimeout) {
+		return "error:hello-timeout"
+	}
+	return fmt.Sprintf("error:%v", err)
+}
+
 func reportP2PPathError(ncconfig *AppNetcatConfig, ctx context.Context, reportSessionID string, err error) error {
 	if errors.Is(err, errP2PCandidateSuperseded) || errors.Is(context.Cause(ctx), errP2PCandidateSuperseded) {
 		return errP2PCandidateSuperseded
 	}
-	ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	status := p2pPathErrorStatus(err)
+	ReportP2PStatus(ncconfig, reportSessionID, status, ncconfig.network, "", "")
 	return err
 }
 

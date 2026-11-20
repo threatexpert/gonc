@@ -13,6 +13,8 @@ import (
 )
 
 type RunOptions struct {
+	// HelloTimeout configures embedded sessions only; zero keeps the 30-second default.
+	HelloTimeout   time.Duration
 	P2PWithLANMode bool
 	HTTPFileSource httpfileshare.FileSource
 	ProgressSink   func(ProgressSnapshot)
@@ -80,6 +82,12 @@ func PrepareNetcatConfigWithOptions(ctx context.Context, logWriter io.Writer, ar
 	config, err := AppNetcatConfigByArgs(logWriter, "gonc", args)
 	if err != nil {
 		return nil, err
+	}
+	if options.HelloTimeout < 0 {
+		return nil, fmt.Errorf("HelloTimeout cannot be negative")
+	}
+	if options.HelloTimeout > 0 {
+		config.helloTimeout = options.HelloTimeout
 	}
 	config.ctx = ctx
 	config.ConsoleMode = false

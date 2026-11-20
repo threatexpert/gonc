@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/threatexpert/gonc/v2/apps"
 	"github.com/threatexpert/gonc/v2/httpfileshare"
@@ -31,6 +32,8 @@ type TrafficCallback interface {
 }
 
 type P2POptions struct {
+	// HelloTimeout controls receiver peer discovery; zero keeps the 30-second default.
+	HelloTimeout   time.Duration
 	UseUDP         bool
 	P2PWithLANMode bool
 }
@@ -129,6 +132,7 @@ func StartP2PReceiveWithOptions(password string, options P2POptions, cb Callback
 	}
 	args = append(args, "-httplocal")
 	return startP2PWithFileSourceAndOptions(args, cb, "receive", nil, apps.RunOptions{
+		HelloTimeout:   options.HelloTimeout,
 		P2PWithLANMode: options.P2PWithLANMode,
 	})
 }

@@ -4,6 +4,7 @@ package mobilegonc
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -95,9 +96,18 @@ func StartP2PReceive(password string, useUDP bool, cb Callback) (*Session, error
 // StartP2PReceiveWithLAN optionally races normal P2P with active LAN discovery
 // and exposes only the winning connection to the local HTTP client.
 func StartP2PReceiveWithLAN(password string, useUDP bool, p2pWithLAN bool, cb Callback) (*Session, error) {
+	return StartP2PReceiveWithHelloTimeout(password, useUDP, p2pWithLAN, 0, cb)
+}
+
+// StartP2PReceiveWithHelloTimeout accepts a peer wait deadline in seconds.
+// Zero keeps the legacy 30-second default; negative or overflowing values are rejected.
+func StartP2PReceiveWithHelloTimeout(password string, useUDP bool, p2pWithLAN bool, helloTimeoutSeconds int64, cb Callback) (*Session, error) {
+	if helloTimeoutSeconds < 0 || helloTimeoutSeconds > int64((1<<63-1)/time.Second) {
+		return nil, fmt.Errorf("invalid Hello timeout seconds")
+	}
 	session, err := goncembed.StartP2PReceiveWithOptions(
 		password,
-		goncembed.P2POptions{UseUDP: useUDP, P2PWithLANMode: p2pWithLAN},
+		goncembed.P2POptions{UseUDP: useUDP, P2PWithLANMode: p2pWithLAN, HelloTimeout: time.Duration(helloTimeoutSeconds) * time.Second},
 		cb,
 	)
 	if err != nil {

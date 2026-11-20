@@ -250,6 +250,10 @@ func TestMQTTSubscriptionRetriesRespectCallerAndPreparationDeadlines(t *testing.
 			if !prepare && strings.Contains(output.String(), "subscribe failed:") {
 				t.Fatal("logged before three failures")
 			}
+			// Settle retries already runnable at the preparation deadline before
+			// measuring cancellation. Otherwise one can finish between this
+			// snapshot and cancel(), falsely appearing to run after cancellation.
+			synctest.Wait()
 			before := client.callCount()
 			cancel()
 			time.Sleep(30 * time.Second)
