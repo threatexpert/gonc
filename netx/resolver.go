@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// Linux supplies a distinct control hook so an embedder can identify bootstrap DNS.
+var resolverSocketControl = func(local net.Addr, _ string) socketControl {
+	return LocalAddrControl(local, nil)
+}
+
 // NewBoundResolver routes only this resolver's DNS sockets through localIP.
 // The DNS server must be an IP literal: bootstrapping it must not recurse into
 // the system resolver (which may already depend on the disconnected VPN).
@@ -40,7 +45,7 @@ func NewBoundResolver(server, localIP string) (*net.Resolver, error) {
 				d.LocalAddr = &net.TCPAddr{IP: local, Zone: zone}
 			}
 		}
-		d.Control = LocalAddrControl(d.LocalAddr, nil)
+		d.Control = resolverSocketControl(d.LocalAddr, server)
 		return d.DialContext(ctx, network, server)
 	}}, nil
 }
