@@ -26,13 +26,36 @@ func outboundTestIP(t *testing.T) string {
 }
 
 func TestSTUNListUsesGlobalDNSAndLocal(t *testing.T) {
+	t.Run("endpoint", func(t *testing.T) {
+		local := outboundTestIP(t)
+		testBoundSTUNList(t, local+":0", local)
+	})
+	t.Run("interface", func(t *testing.T) {
+		if runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+			t.Skip("desktop interface binding")
+		}
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, iface := range interfaces {
+			if iface.Flags&net.FlagLoopback != 0 && iface.Flags&net.FlagUp != 0 {
+				testBoundSTUNList(t, iface.Name, "127.0.0.1")
+				return
+			}
+		}
+		t.Skip("no active loopback interface")
+	})
+}
+
+func testBoundSTUNList(t *testing.T, binding, local string) {
+	t.Helper()
 	preserveGlobalDNS(t)
 	oldSTUN, oldMQTT := easyp2p.STUNServers, easyp2p.MQTTBrokerServers
 	t.Cleanup(func() { easyp2p.STUNServers, easyp2p.MQTTBrokerServers = oldSTUN, oldMQTT })
 	t.Setenv("HTTP_PROXY", "")
 	t.Setenv("HTTPS_PROXY", "")
 	t.Setenv("NO_PROXY", "*")
-	local := outboundTestIP(t)
 	dns := testdns.Start(t, [4]byte{127, 0, 0, 1}, false)
 	seen := make(chan string, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +70,7 @@ func TestSTUNListUsesGlobalDNSAndLocal(t *testing.T) {
 	}))
 	defer server.Close()
 	_, port, _ := net.SplitHostPort(server.Listener.Addr().String())
-	_, err := AppNetcatConfigByArgs(io.Discard, "gonc", []string{"-dns", dns.Address, "-local", local + ":0", "-stunsrv", "http://stun-list.invalid:" + port + "/start", "outer.invalid", "80"})
+	_, err := AppNetcatConfigByArgs(io.Discard, "gonc", []string{"-dns", dns.Address, "-local", binding, "-stunsrv", "http://stun-list.invalid:" + port + "/start", "outer.invalid", "80"})
 	if err != nil {
 		t.Fatal(err)
 	}

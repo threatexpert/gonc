@@ -61,6 +61,7 @@ type P2PSessionContext struct {
 	SharedKey             [32]byte
 	MQTTSignal            *MQTTSignalSession
 	LocalBindIP           string
+	localDevice           string
 	LocalPublicIPv4Count  int // 本端公网IPv4出口数量，用于调整打洞策略
 	LocalPublicIPv6Count  int
 	RemotePublicIPv4Count int
@@ -523,10 +524,11 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		Addresses: []PunchingAddressInfo{},
 	}
 	var err error
-	localBindIP := ""
-	if bind != "" {
-		localBindIP, _, _ = net.SplitHostPort(bind)
+	binding, err := netx.ParseLocalBinding(bind)
+	if err != nil {
+		return nil, nil, err
 	}
+	localBindIP := binding.Source()
 	if signal == nil {
 		signal, err = NewMQTTSignalSession(ctx, MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0), localBindIP, logWriter)
 		if err != nil {
@@ -676,10 +678,12 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		}
 	}
 
+	explicitIP, _, _ := net.SplitHostPort(binding.Endpoint)
 	sessCtx := &P2PSessionContext{
 		SharedKey:             sharedKey,
 		MQTTSignal:            signal,
-		LocalBindIP:           localBindIP,
+		LocalBindIP:           explicitIP,
+		localDevice:           binding.Device,
 		LocalPublicIPv4Count:  LocalPublicIPv4Count,
 		LocalPublicIPv6Count:  LocalPublicIPv6Count,
 		RemotePublicIPv4Count: RemotePublicIPv4Count,
@@ -977,10 +981,11 @@ func Easy_P2P_MPWithOptions(ctx context.Context, network, sessionUid string, opt
 	p2pLogf(logWriter, "=== Checking NAT reachability ===\n")
 
 	if signal == nil {
-		localBindIP := ""
-		if bind != "" {
-			localBindIP, _, _ = net.SplitHostPort(bind)
+		binding, err := netx.ParseLocalBinding(bind)
+		if err != nil {
+			return nil, err
 		}
+		localBindIP := binding.Source()
 		signal, err = NewMQTTSignalSession(ctx, MQTT_GenerateClientID(TopicDesc_Signal, sessionUid, 0), localBindIP, logWriter)
 		if err != nil {
 			return nil, fmt.Errorf("failed to prepare MQTT signal session: %w", err)
@@ -1687,7 +1692,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, addrPair.Remote.String())
 		} else {
-			uconnBrandnew, err = createUDPConnFromAddr(addrPair.Local, addrPair.Remote, false, sessCtx.bindsLocalInterface())
+			uconnBrandnew, err = createUDPConnFromAddr(addrPair.Local, addrPair.Remote, false, sessCtx)
 		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
@@ -1712,7 +1717,7 @@ func Auto_P2P_UDP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		if isSharedUDPConn {
 			uconnBrandnew, err = newConnFromPacketConn(uconn, raddr.String())
 		} else {
-			uconnBrandnew, err = createUDPConnFromAddr(laddr, raddr, forceRebind, sessCtx.bindsLocalInterface())
+			uconnBrandnew, err = createUDPConnFromAddr(laddr, raddr, forceRebind, sessCtx)
 		}
 		if err != nil {
 			errFin = fmt.Errorf("error binding UDP address: %v", err)
@@ -1761,24 +1766,24 @@ func newConnFromPacketConn(uconn net.PacketConn, raddr string) (*netx.ConnFromPa
 }
 
 func CreateUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind bool) (net.Conn, error) {
-	return createUDPConnFromAddr(laddr, raddr, forcelyBind, false)
+	return createUDPConnFromAddr(laddr, raddr, forcelyBind, nil)
 }
 
-func createUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind, bindInterface bool) (net.Conn, error) {
+func createUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind bool, session *P2PSessionContext) (net.Conn, error) {
 	// 类型断言：必须是 *net.UDPAddr
 	la, ok1 := laddr.(*net.UDPAddr)
 	ra, ok2 := raddr.(*net.UDPAddr)
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("both laddr and raddr must be *net.UDPAddr, got %T and %T", laddr, raddr)
 	}
-	if bindInterface {
+	if session.bindsLocalInterface() {
 		local := la
 		var previous func(string, string, syscall.RawConn) error
 		if forcelyBind {
 			local = &net.UDPAddr{Port: la.Port}
 			previous = netx.ControlUDP
 		}
-		d := net.Dialer{LocalAddr: local, Control: netx.LocalAddrControl(la, previous)}
+		d := net.Dialer{LocalAddr: local, Control: session.localControl(la, previous)}
 		return d.Dial("udp", ra.String())
 	}
 

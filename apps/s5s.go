@@ -210,12 +210,7 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 	// 2. 准备本地绑定地址 (如果有)
 	var localAddr net.Addr
 	if ncconfig.localbind != "" {
-		switch {
-		case strings.HasPrefix(ncconfig.network, "tcp"):
-			localAddr, err = net.ResolveTCPAddr(ncconfig.network, ncconfig.localbind)
-		case strings.HasPrefix(ncconfig.network, "udp"):
-			localAddr, err = net.ResolveUDPAddr(ncconfig.network, ncconfig.localbind)
-		}
+		localAddr, err = ncconfig.binding.DialAddr(ncconfig.network)
 		if err != nil {
 			ncconfig.Logger.Printf("Error resolving address: %v\n", err)
 			return 1
@@ -231,12 +226,13 @@ func App_s5c_main_withconfig(connL net.Conn, keyingMaterial [32]byte, ncconfig *
 		}
 		connR, err = proxyClient.DialTimeout(ncconfig.network, targetAddr, dialTimeout)
 	} else {
-		dialer := &net.Dialer{LocalAddr: localAddr}
-		switch {
-		case strings.HasPrefix(ncconfig.network, "tcp"):
-			dialer.Control = netx.ControlTCP
-		case strings.HasPrefix(ncconfig.network, "udp"):
-			dialer.Control = netx.ControlUDP
+		control := netx.ControlTCP
+		if strings.HasPrefix(ncconfig.network, "udp") {
+			control = netx.ControlUDP
+		}
+		dialer := &net.Dialer{LocalAddr: localAddr, Control: control}
+		if ncconfig.binding.Device != "" {
+			dialer = netx.BoundDialer(localAddr, control)
 		}
 		if ncconfig.dialreadTimeout != 0 {
 			dialer.Timeout = time.Duration(ncconfig.dialreadTimeout) * time.Second

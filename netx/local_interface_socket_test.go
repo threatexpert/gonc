@@ -82,3 +82,43 @@ func TestLocalInterfaceSocketOptions(t *testing.T) {
 		t.Skip("no active non-loopback IP addresses")
 	}
 }
+
+func TestNamedInterfaceDialerBindsBothFamilies(t *testing.T) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback == 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		binding, err := ParseLocalBinding(iface.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local, err := binding.DialAddr("udp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dialer := BoundDialer(local, nil)
+		if dialer.LocalAddr != nil {
+			t.Fatalf("device name restricted the source address to %v", dialer.LocalAddr)
+		}
+		for _, host := range []string{"127.0.0.1", "::1"} {
+			conn, err := dialer.Dial("udp", net.JoinHostPort(host, "53"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := conn.(syscall.Conn).SyscallConn()
+			if err == nil {
+				err = checkLocalSocketInterface(raw, net.ParseIP(host), iface)
+			}
+			conn.Close()
+			if err != nil {
+				t.Fatalf("%s on %s: %v", host, iface.Name, err)
+			}
+		}
+		return
+	}
+	t.Skip("no active loopback interface")
+}

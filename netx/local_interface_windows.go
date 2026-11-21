@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -22,9 +23,17 @@ func bindLocalInterface(conn syscall.RawConn, ip net.IP, zone string) error {
 	if err != nil {
 		return err
 	}
+	return bindInterfaceIndex(conn, index, ip.To4() != nil)
+}
+
+func bindNamedInterface(conn syscall.RawConn, iface *net.Interface, network, _ string) error {
+	return bindInterfaceIndex(conn, iface.Index, strings.HasSuffix(network, "4"))
+}
+
+func bindInterfaceIndex(conn syscall.RawConn, index int, ipv4 bool) error {
 	var optionErr error
 	if err := conn.Control(func(fd uintptr) {
-		if ip.To4() != nil {
+		if ipv4 {
 			var value [4]byte
 			binary.BigEndian.PutUint32(value[:], uint32(index))
 			optionErr = windows.SetsockoptInet4Addr(windows.Handle(fd), windows.IPPROTO_IP, ipUnicastIF, value)

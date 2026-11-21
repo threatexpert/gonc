@@ -91,6 +91,27 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 }
 
 func GetPublicIPsContext(parentCtx context.Context, network, bind string, timeout time.Duration, natIPUniq bool, shPktCon net.PacketConn) ([]*STUNResult, error) {
+	binding, err := netx.ParseLocalBinding(bind)
+	if err != nil {
+		return nil, err
+	}
+	return getPublicIPs(parentCtx, network, binding, timeout, natIPUniq, shPktCon)
+}
+
+func getPublicIPs(parentCtx context.Context, network string, binding netx.LocalBinding, timeout time.Duration, natIPUniq bool, shPktCon net.PacketConn) ([]*STUNResult, error) {
+	bind := binding.Endpoint
+	if binding.Device != "" {
+		ip, err := netx.InterfaceIP(binding.Device, !strings.HasSuffix(network, "6"))
+		if err != nil {
+			return nil, err
+		}
+		_, port, _ := net.SplitHostPort(bind)
+		if port == "" {
+			port = "0"
+		}
+		bind = net.JoinHostPort(ip.String(), port)
+	}
+
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel() // Ensure cancel is called to release context resources
 
@@ -114,7 +135,12 @@ func GetPublicIPsContext(parentCtx context.Context, network, bind string, timeou
 		}
 		basedUDPConn := shPktCon
 		if basedUDPConn == nil {
-			sharedUDPConn, err := netx.ListenUDP(listenNetwork, localAddr)
+			var sharedUDPConn *net.UDPConn
+			if binding.Device != "" {
+				sharedUDPConn, err = netx.ListenInterfaceUDP(ctx, listenNetwork, localAddr, binding.Device)
+			} else {
+				sharedUDPConn, err = netx.ListenUDP(listenNetwork, localAddr)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -201,7 +227,11 @@ func GetPublicIPsContext(parentCtx context.Context, network, bind string, timeou
 			var conn net.Conn
 			dialer := &net.Dialer{LocalAddr: laddr}
 			if strings.HasPrefix(useNetwork, "tcp") {
-				dialer.Control = netx.LocalAddrControl(laddr, netx.ControlTCP)
+				if binding.Device != "" {
+					dialer.Control = netx.InterfaceControl(binding.Device, netx.ControlTCP)
+				} else {
+					dialer.Control = netx.LocalAddrControl(laddr, netx.ControlTCP)
+				}
 				if strings.Contains(stunAddr, "?") {
 					conn, err = netx.DialRace(ctx, useNetwork, stunAddr, dialer.DialContext)
 				} else {
@@ -432,9 +462,14 @@ func GetNetworksPublicIPsContext(ctx context.Context, networkList []string, bind
 	var wg sync.WaitGroup
 	resultsChan := make(chan []*STUNResult, len(networkList))
 	errorsChan := make(chan error, len(networkList))
+	binding, err := netx.ParseLocalBinding(bind)
+	if err != nil {
+		return nil, err
+	}
+	bind = binding.Endpoint
 	bindUnspecified := false
 	if bind == "" {
-		bindUnspecified = true
+		bindUnspecified = binding.Device == ""
 		port, err := GetFreePort()
 		if err != nil {
 			return nil, err
@@ -476,7 +511,9 @@ func GetNetworksPublicIPsContext(ctx context.Context, networkList []string, bind
 		wg.Add(1)
 		go func(network string) {
 			defer wg.Done()
-			results, err := GetPublicIPsContext(ctx, network, bindAddrCandidate, timeout, false, shPktCon)
+			candidate := binding
+			candidate.Endpoint = bindAddrCandidate
+			results, err := getPublicIPs(ctx, network, candidate, timeout, false, shPktCon)
 			if err != nil {
 				errorsChan <- fmt.Errorf("network %s: %v", network, err)
 				return

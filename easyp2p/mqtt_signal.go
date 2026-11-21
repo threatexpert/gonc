@@ -157,17 +157,13 @@ func startMQTTSignalSession(ctx context.Context, brokerServers []string, clientI
 	ready := make(chan struct{}, 1)
 	fail := make(chan struct{}, len(brokerServers))
 
-	dialer := &net.Dialer{
-		Timeout: mqttConnectTimeout,
+	local, err := netx.SourceAddr("tcp", localIP)
+	if err != nil {
+		cancel()
+		return nil, nil, nil, err
 	}
-	if localIP != "" {
-		host, zone, _ := strings.Cut(localIP, "%")
-		if ip := net.ParseIP(host); ip != nil {
-			dialer.LocalAddr = &net.TCPAddr{IP: ip, Zone: zone}
-		}
-	}
-
-	dialer.Control = netx.LocalAddrControl(dialer.LocalAddr, dialer.Control)
+	dialer := netx.BoundDialer(local, nil)
+	dialer.Timeout = mqttConnectTimeout
 	for i, server := range brokerServers {
 		serverURL, q, _ := ParseMQTTServerV3(server)
 		go s.connectBroker(serverURL, q, i, dialer, ready, fail)

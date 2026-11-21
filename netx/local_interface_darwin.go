@@ -5,6 +5,7 @@ package netx
 import (
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -22,8 +23,16 @@ func bindLocalInterface(conn syscall.RawConn, ip net.IP, zone string) error {
 	if err != nil {
 		return err
 	}
+	return bindInterfaceIndex(conn, index, ip.To4() != nil)
+}
+
+func bindNamedInterface(conn syscall.RawConn, iface *net.Interface, network, _ string) error {
+	return bindInterfaceIndex(conn, iface.Index, strings.HasSuffix(network, "4"))
+}
+
+func bindInterfaceIndex(conn syscall.RawConn, index int, ipv4 bool) error {
 	level, option := unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF
-	if ip.To4() != nil {
+	if ipv4 {
 		level, option = unix.IPPROTO_IP, unix.IP_BOUND_IF
 	}
 	var optionErr error

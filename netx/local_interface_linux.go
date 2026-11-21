@@ -16,13 +16,13 @@ func LocalAddrControl(local net.Addr, previous socketControl) socketControl {
 	return linuxSocketControl(local, previous, "")
 }
 
-// RegisterLinuxSocketBinder delegates sockets explicitly bound to this source IP.
+// RegisterLinuxSocketBinder delegates sockets explicitly bound to this IP or device.
 // dns is nonempty only for a NewBoundResolver socket. The callback must finish
 // configuring the socket before returning. Release removes only this registration.
-func RegisterLinuxSocketBinder(ip, dnsServer string, bind func(syscall.RawConn, string) error) (release func()) {
+func RegisterLinuxSocketBinder(source, dnsServer string, bind func(syscall.RawConn, string) error) (release func()) {
 	entry := &linuxBinder{bind: bind, dns: dnsServer}
-	linuxBinders.Store(ip, entry)
-	return func() { linuxBinders.CompareAndDelete(ip, entry) }
+	linuxBinders.Store(source, entry)
+	return func() { linuxBinders.CompareAndDelete(source, entry) }
 }
 
 type linuxBinder struct {
@@ -37,18 +37,27 @@ func init() {
 		return linuxSocketControl(local, nil, server)
 	}
 }
+
 func linuxSocketControl(local net.Addr, previous socketControl, dns string) socketControl {
 	return localInterfaceControl(local, previous, func(c syscall.RawConn, ip net.IP, zone string) error {
-		entry, ok := linuxBinders.Load(ip.String())
-		if ok && dns != "" && dns == entry.(*linuxBinder).dns {
-			return entry.(*linuxBinder).bind(c, dns)
-		}
-		err := bindLocalInterface(c, ip, zone)
-		if ok && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
-			return entry.(*linuxBinder).bind(c, "")
-		}
-		return err
+		return bindLinuxSocket(c, ip.String(), dns, func() error { return bindLocalInterface(c, ip, zone) })
 	})
+}
+
+func bindNamedInterface(c syscall.RawConn, iface *net.Interface, network, dns string) error {
+	return bindLinuxSocket(c, iface.Name, dns, func() error { return bindLinuxDevice(c, iface.Name) })
+}
+
+func bindLinuxSocket(c syscall.RawConn, key, dns string, direct func() error) error {
+	entry, ok := linuxBinders.Load(key)
+	if ok && dns != "" && dns == entry.(*linuxBinder).dns {
+		return entry.(*linuxBinder).bind(c, dns)
+	}
+	err := direct()
+	if ok && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
+		return entry.(*linuxBinder).bind(c, "")
+	}
+	return err
 }
 
 func bindLocalInterface(conn syscall.RawConn, ip net.IP, zone string) error {
@@ -60,17 +69,21 @@ func bindLocalInterface(conn syscall.RawConn, ip net.IP, zone string) error {
 	if err != nil {
 		return err
 	}
+	return bindLinuxDevice(conn, iface.Name)
+}
+
+func bindLinuxDevice(conn syscall.RawConn, name string) error {
 	var optionErr error
 	if err := conn.Control(func(fd uintptr) {
-		optionErr = unix.BindToDevice(int(fd), iface.Name)
+		optionErr = unix.BindToDevice(int(fd), name)
 	}); err != nil {
 		return err
 	}
 	if errors.Is(optionErr, unix.EPERM) || errors.Is(optionErr, unix.EACCES) {
-		return fmt.Errorf("bind socket to %s: this kernel or network namespace requires CAP_NET_RAW: %w", iface.Name, optionErr)
+		return fmt.Errorf("bind socket to %s: this kernel or network namespace requires CAP_NET_RAW: %w", name, optionErr)
 	}
 	if optionErr != nil {
-		return fmt.Errorf("bind socket to %s: %w", iface.Name, optionErr)
+		return fmt.Errorf("bind socket to %s: %w", name, optionErr)
 	}
 	return nil
 }

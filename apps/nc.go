@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	//_ "net/http/pprof"
@@ -104,7 +105,7 @@ type AppNetcatConfig struct {
 	kcpEnabled           bool
 	kcpSEnabled          bool
 	localbind            string
-	localbindIP          string
+	binding              netx.LocalBinding
 	remoteAddr           string
 	progressEnabled      bool
 	runCmd               string
@@ -313,7 +314,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.useUNIXdomain, "U", false, "Specifies to use UNIX-domain sockets.")
 	fs.BoolVar(&config.kcpEnabled, "kcp", false, "use UDP+KCP protocol, -u can be omitted")
 	fs.BoolVar(&config.kcpSEnabled, "kcps", false, "kcp server mode")
-	fs.StringVar(&config.localbind, "local", "", "ip:port")
+	fs.StringVar(&config.localbind, "local", "", "local IP:port or network interface name")
 	fs.StringVar(&config.remoteAddr, "remote", "", "host:port address to connect to; do not need to provide final <host> <port> arguments if this is set")
 	fs.BoolVar(&config.progressEnabled, "progress", false, "show transfer progress")
 	fs.StringVar(&config.runCmd, "exec", "", "runs a command for each connection")
@@ -435,7 +436,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 
 	// Configure process-wide DNS before initialization can fetch -stunsrv URLs.
 	if config.localbind != "" {
-		config.localbindIP, _, err = net.SplitHostPort(config.localbind)
+		config.binding, err = netx.ParseLocalBinding(config.localbind)
 		if err != nil {
 			return nil, fmt.Errorf("invalid local bind address: %w", err)
 		}
@@ -661,7 +662,7 @@ func firstInit(ncconfig *AppNetcatConfig) error {
 	if ncconfig.stunSrv != "" {
 		if strings.HasPrefix(ncconfig.stunSrv, "http://") || strings.HasPrefix(ncconfig.stunSrv, "https://") {
 			// 支持通过 URL 获取配置，设置 10 秒超时避免阻塞初始化
-			client, closeIdle, err := newBoundHTTPClient(ncconfig.localbindIP, 10*time.Second)
+			client, closeIdle, err := newBoundHTTPClient(ncconfig.binding.Source(), 10*time.Second)
 			if err != nil {
 				return err
 			}
@@ -842,7 +843,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 				ncconfig.arg_proxyc_Config = xconfig
 			} else {
 				// 多跳链式代理
-				localAddr, err := proxyLocalAddr("tcp", ncconfig.localbindIP)
+				localAddr, err := netx.SourceAddr("tcp", ncconfig.binding.Source())
 				if err != nil {
 					return err
 				}
@@ -868,7 +869,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 			ncconfig.arg_proxyc_Config = xconfig
 		}
 		if pc := ncconfig.arg_proxyc_Config; pc != nil {
-			localAddr, err := proxyLocalAddr(pc.Network, ncconfig.localbindIP)
+			localAddr, err := netx.SourceAddr(pc.Network, ncconfig.binding.Source())
 			if err != nil {
 				return err
 			}
@@ -955,14 +956,6 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 		}
 	}
 
-	if ncconfig.localbind != "" {
-		localbindIP, _, err := net.SplitHostPort(ncconfig.localbind)
-		if err != nil {
-			return network, "", "", "", fmt.Errorf("invalid local bind address: %v", err)
-		}
-		ncconfig.localbindIP = localbindIP
-	}
-
 	switch len(ncconfig.Args) {
 	case 2:
 		host, port = ncconfig.Args[0], ncconfig.Args[1]
@@ -975,7 +968,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 			return network, "", "", "", fmt.Errorf("invalid arguments")
 		}
 	case 0:
-		if ncconfig.listenMode && ncconfig.localbind != "" {
+		if ncconfig.listenMode && ncconfig.binding.Device != "" {
+			port = "0"
+		} else if ncconfig.listenMode && ncconfig.localbind != "" {
 			host, port, err = net.SplitHostPort(ncconfig.localbind)
 			if err != nil {
 				return network, "", "", "", fmt.Errorf("invalid local address %q: %v", ncconfig.localbind, err)
@@ -1075,17 +1070,17 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 // configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
 func configureDNS(ncconfig *AppNetcatConfig) error {
 	if ncconfig.useDNS != "" {
-		return setDns(ncconfig.useDNS, ncconfig.localbindIP)
+		return setDns(ncconfig.useDNS, ncconfig.binding.Source())
 	} else if isAndroid() {
 		googleDNS := "8.8.8.8:53"
-		if ncconfig.localbindIP != "" {
-			host, _, _ := strings.Cut(ncconfig.localbindIP, "%")
+		if ncconfig.binding.Source() != "" {
+			host, _, _ := strings.Cut(ncconfig.binding.Source(), "%")
 			ip := net.ParseIP(host)
 			if ip != nil && ip.To4() == nil {
 				googleDNS = "[2001:4860:4860::8888]:53"
 			}
 		}
-		return setDns(googleDNS, ncconfig.localbindIP)
+		return setDns(googleDNS, ncconfig.binding.Source())
 	}
 	return nil
 }
@@ -1561,6 +1556,15 @@ func runP2PAndLanActivePath(
 
 // runListenMode 在监听模式下启动服务器
 func runListenMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
+	if name := ncconfig.binding.Device; name != "" {
+		address, err := netx.InterfaceListenHost(name, network, host)
+		if err != nil {
+			ncconfig.Logger.Printf("Cannot listen on %s: %v", name, err)
+			return 1
+		}
+		host = address
+	}
+
 	if !hasProxyConfig(ncconfig) {
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
@@ -1595,7 +1599,7 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		time.Sleep(1500 * time.Millisecond)
 	}
 
-	uconn, err := net.ListenUDP(network, addr)
+	uconn, err := netx.ListenInterfaceUDP(ncconfig.ctx, network, addr, ncconfig.binding.Device)
 	if err != nil {
 		ncconfig.Logger.Printf("Error listening on UDP address: %v\n", err)
 		return 1
@@ -1722,6 +1726,7 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			}
 			lc.Control = netx.ControlTCP
 		}
+		lc.Control = netx.InterfaceControl(ncconfig.binding.Device, lc.Control)
 		listener, err = lc.Listen(context.Background(), network, listenAddr)
 		if err != nil {
 			ncconfig.Logger.Printf("Error listening on %s: %v\n", listenAddr, err)
@@ -1931,17 +1936,10 @@ func runDialModeOnce(console net.Conn, ncconfig *AppNetcatConfig, network, host,
 		conn, err = net.Dial("unix", port)
 	} else {
 		var localAddr net.Addr
-		if ncconfig.localbind != "" {
-			switch {
-			case strings.HasPrefix(network, "tcp"):
-				localAddr, err = net.ResolveTCPAddr(network, ncconfig.localbind)
-			case strings.HasPrefix(network, "udp"):
-				localAddr, err = net.ResolveUDPAddr(network, ncconfig.localbind)
-			}
-			if err != nil {
-				ncconfig.Logger.Printf("Error resolving address: %v\n", err)
-				return 1
-			}
+		localAddr, err = ncconfig.binding.DialAddr(network)
+		if err != nil {
+			ncconfig.Logger.Printf("Error resolving address: %v", err)
+			return 1
 		}
 
 		if ncconfig.useSTUN {
@@ -1962,14 +1960,14 @@ func runDialModeOnce(console net.Conn, ncconfig *AppNetcatConfig, network, host,
 			}
 			conn, err = proxyClient.DialTimeout(network, net.JoinHostPort(host, port), dialTimeout)
 		} else {
-			dialer := &net.Dialer{LocalAddr: localAddr}
+			var control func(string, string, syscall.RawConn) error
 			switch {
 			case strings.HasPrefix(network, "tcp"):
-				dialer.Control = netx.ControlTCP
+				control = netx.ControlTCP
 			case strings.HasPrefix(network, "udp"):
-				dialer.Control = netx.ControlUDP
+				control = netx.ControlUDP
 			}
-			dialer.Control = netx.LocalAddrControl(localAddr, dialer.Control)
+			dialer := netx.BoundDialer(localAddr, control)
 			if ncconfig.dialreadTimeout != 0 {
 				dialer.Timeout = time.Duration(ncconfig.dialreadTimeout) * time.Second
 			}
@@ -3272,7 +3270,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (strin
 			// Keep persistent listeners and their broker failure state alive while idle.
 			waitTimeout = 0
 		}
-		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, waitTimeout, ncconfig.LogWriter)
+		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.binding.Source(), waitTimeout, ncconfig.LogWriter)
 		if err != nil {
 			return "", nil, fmt.Errorf("mqtt-wait: %v", err)
 		}
@@ -3280,7 +3278,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (strin
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
-		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, ncconfig.helloTimeout, ncconfig.LogWriter)
+		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.binding.Source(), ncconfig.MQTTHelloPayload, ncconfig.helloTimeout, ncconfig.LogWriter)
 		if err != nil {
 			return "", nil, fmt.Errorf("mqtt-hello: %w", err)
 		}
@@ -3400,11 +3398,7 @@ func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PC
 		ReportP2PStatus(ncconfig, reportSessionID, "discovering", ncconfig.network, "", "")
 
 		transportPref := easyp2p.LANTransportFromConfig(ncconfig.udpProtocol)
-		if ncconfig.useLANPassive {
-			connInfo, err = easyp2p.Easy_P2P_LAN_Passive(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
-		} else {
-			connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
-		}
+		connInfo, err = easyp2p.EasyP2PLANOnInterface(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.useLANPassive, ncconfig.LogWriter, ncconfig.binding.Device)
 		if err != nil {
 			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err

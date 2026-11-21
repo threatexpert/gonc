@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/threatexpert/gonc/v2/netx"
 	"io"
 	"log"
 	"net"
@@ -256,6 +257,10 @@ func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
 }
 
 func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
+	return openLanMcast("", listInterfaces, loggers...)
+}
+
+func openLanMcast(device string, listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
 	gip := net.ParseIP(LANMulticastIP)
 	dst := &net.UDPAddr{IP: gip, Port: LANMulticastPort}
 	var logger *log.Logger
@@ -263,7 +268,8 @@ func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), l
 		logger = loggers[0]
 	}
 
-	c, err := net.ListenPacket("udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
+	lc := net.ListenConfig{Control: netx.InterfaceControl(device, nil)}
+	c, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
 	if err != nil {
 		return nil, fmt.Errorf("bind %s:%d: %v", LANMulticastIP, LANMulticastPort, err)
 	}
@@ -272,6 +278,9 @@ func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), l
 	ifaces, enumErr := listInterfaces()
 	var good []lanMcastIface
 	for _, iface := range ifaces {
+		if device != "" && iface.Name != device {
+			continue
+		}
 		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
@@ -285,6 +294,10 @@ func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), l
 		}
 	}
 	if len(good) == 0 {
+		if device != "" {
+			c.Close()
+			return nil, fmt.Errorf("cannot join multicast group on interface %s", device)
+		}
 		if err := p.JoinGroup(nil, &net.UDPAddr{IP: gip}); err != nil {
 			_ = c.Close()
 			if enumErr != nil {
@@ -511,6 +524,10 @@ func lanDiscoverWithPortAllocator(
 	logWriter io.Writer,
 	allocate func() (int, error),
 ) (*LANDiscoverResult, error) {
+	return discoverLANOnInterface(ctx, sessionKey, transportPref, timeout, passive, logWriter, allocate, "")
+}
+
+func discoverLANOnInterface(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer, allocate func() (int, error), device string) (*LANDiscoverResult, error) {
 	logger := misc.NewLog(logWriter, "[LAN] ", log.LstdFlags|log.Lmsgprefix)
 	key := lanDeriveKey(sessionKey)
 	sid := lanDeriveSessionID(sessionKey)
@@ -520,7 +537,7 @@ func lanDiscoverWithPortAllocator(
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	mc, err := newLanMcast(logger)
+	mc, err := openLanMcast(device, net.Interfaces, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -541,12 +558,22 @@ func lanDiscoverWithPortAllocator(
 		logger.Printf("Mode: active beacon every %s for %s, then every %s\n",
 			lanActiveBeaconInterval, lanActiveFastBeaconWindow, lanActiveSlowBeaconInterval)
 	}
+	source := bestLocalIPForRemote
+	if device != "" {
+		source = func(_ string) (string, error) {
+			ip, err := netx.InterfaceIP(device, true)
+			if err != nil {
+				return "", err
+			}
+			return ip.String(), nil
+		}
+	}
 	return runLANDiscoverWorkers(ctx, cancel,
 		func() (*LANDiscoverResult, error) {
-			return lanInitiator(ctx, mc, disp, key, sid, transportPref, bestLocalIPForRemote, punchPorts, sf, logger, passive, initiatorRole)
+			return lanInitiator(ctx, mc, disp, key, sid, transportPref, source, punchPorts, sf, logger, passive, initiatorRole)
 		},
 		func() (*LANDiscoverResult, error) {
-			return lanResponder(ctx, mc, disp, key, sid, transportPref, bestLocalIPForRemote, punchPorts, sf, logger)
+			return lanResponder(ctx, mc, disp, key, sid, transportPref, source, punchPorts, sf, logger)
 		},
 	)
 }
@@ -813,23 +840,16 @@ func lanResponder(
 // ============================================================================
 
 func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
-	return easyP2PLAN(ctx, sessionKey, transportPref, timeout, false, logWriter)
+	return EasyP2PLANOnInterface(ctx, sessionKey, transportPref, timeout, false, logWriter, "")
 }
 
 func Easy_P2P_LAN_Passive(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
-	return easyP2PLAN(ctx, sessionKey, transportPref, timeout, true, logWriter)
+	return EasyP2PLANOnInterface(ctx, sessionKey, transportPref, timeout, true, logWriter, "")
 }
 
-func easyP2PLAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*P2PConnInfo, error) {
-	fmt.Fprintf(logWriter, "=== LAN Discovery Mode ===\n")
-
-	var result *LANDiscoverResult
-	var err error
-	if passive {
-		result, err = LANDiscoverPassive(ctx, sessionKey, transportPref, timeout, logWriter)
-	} else {
-		result, err = LANDiscover(ctx, sessionKey, transportPref, timeout, logWriter)
-	}
+func EasyP2PLANOnInterface(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer, device string) (*P2PConnInfo, error) {
+	fmt.Fprintln(logWriter, "=== LAN Discovery Mode ===")
+	result, err := discoverLANOnInterface(ctx, sessionKey, transportPref, timeout, passive, logWriter, GetFreePort, device)
 	if err != nil {
 		return nil, err
 	}
@@ -842,7 +862,7 @@ func easyP2PLAN(ctx context.Context, sessionKey, transportPref string, timeout t
 		LocalLAN: localAddr, LocalNAT: localAddr, LocalNATType: "easy",
 		RemoteLAN: remoteAddr, RemoteNAT: remoteAddr, RemoteNATType: "easy",
 	}
-	sessCtx := &P2PSessionContext{SharedKey: sharedKey}
+	sessCtx := &P2PSessionContext{SharedKey: sharedKey, localDevice: device}
 
 	var conn net.Conn
 	var isClient bool

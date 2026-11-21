@@ -1,6 +1,7 @@
 package easyp2p
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"syscall"
@@ -14,6 +15,9 @@ func (s *P2PSessionContext) bindsLocalInterface() bool {
 	if s == nil {
 		return false
 	}
+	if s.localDevice != "" {
+		return true
+	}
 	ip, err := netip.ParseAddr(s.LocalBindIP)
 	return err == nil && !ip.IsUnspecified() && !ip.IsLoopback()
 }
@@ -22,12 +26,18 @@ func (s *P2PSessionContext) localControl(local net.Addr, previous func(string, s
 	if !s.bindsLocalInterface() {
 		return previous
 	}
+	if s.localDevice != "" {
+		return netx.InterfaceControl(s.localDevice, previous)
+	}
 	return netx.LocalAddrControl(local, previous)
 }
 
 func (s *P2PSessionContext) listenUDP(network string, local *net.UDPAddr) (*net.UDPConn, error) {
 	if !s.bindsLocalInterface() {
 		return net.ListenUDP(network, local)
+	}
+	if s.localDevice != "" {
+		return netx.ListenInterfaceUDP(context.Background(), network, local, s.localDevice)
 	}
 	return netx.ListenUDP(network, local)
 }
