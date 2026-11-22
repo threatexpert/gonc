@@ -20,14 +20,24 @@ func LocalAddrControl(local net.Addr, previous socketControl) socketControl {
 // dns is nonempty only for a NewBoundResolver socket. The callback must finish
 // configuring the socket before returning. Release removes only this registration.
 func RegisterLinuxSocketBinder(source, dnsServer string, bind func(syscall.RawConn, string) error) (release func()) {
-	entry := &linuxBinder{bind: bind, dns: dnsServer}
+	return registerLinuxBinder(source, &linuxBinder{bind: bind, dns: dnsServer})
+}
+
+// RegisterLinuxProtectedSocketBinder configures every socket with the selected
+// source before its first packet, even if ordinary device binding is permitted.
+func RegisterLinuxProtectedSocketBinder(source, dnsServer string, bind func(syscall.RawConn, string) error) func() {
+	return registerLinuxBinder(source, &linuxBinder{bind: bind, dns: dnsServer, required: true})
+}
+
+func registerLinuxBinder(source string, entry *linuxBinder) func() {
 	linuxBinders.Store(source, entry)
 	return func() { linuxBinders.CompareAndDelete(source, entry) }
 }
 
 type linuxBinder struct {
-	dns  string
-	bind func(syscall.RawConn, string) error
+	required bool
+	dns      string
+	bind     func(syscall.RawConn, string) error
 }
 
 var linuxBinders sync.Map
@@ -52,6 +62,9 @@ func bindLinuxSocket(c syscall.RawConn, key, dns string, direct func() error) er
 	entry, ok := linuxBinders.Load(key)
 	if ok && dns != "" && dns == entry.(*linuxBinder).dns {
 		return entry.(*linuxBinder).bind(c, dns)
+	}
+	if ok && entry.(*linuxBinder).required {
+		return entry.(*linuxBinder).bind(c, "")
 	}
 	err := direct()
 	if ok && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {

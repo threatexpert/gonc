@@ -4,6 +4,7 @@ package netx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -13,6 +14,19 @@ import (
 	"github.com/threatexpert/gonc/v2/internal/testdns"
 	"golang.org/x/sys/unix"
 )
+
+func TestProtectedBindingCannotFallBackToAnUnmarkedSocket(t *testing.T) {
+	want := errors.New("mark failed")
+	release := RegisterLinuxProtectedSocketBinder("protected-device", "", func(syscall.RawConn, string) error { return want })
+	defer release()
+	err := bindLinuxSocket(nil, "protected-device", "", func() error {
+		t.Fatal("protected socket bypassed the registered binder")
+		return nil
+	})
+	if !errors.Is(err, want) {
+		t.Fatal(err)
+	}
+}
 
 func checkLocalSocketInterface(raw syscall.RawConn, _ net.IP, iface net.Interface) error {
 	var name string
