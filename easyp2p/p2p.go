@@ -58,6 +58,7 @@ const (
 
 // P2PSessionContext 描述一次打洞会话的全局上下文（所有候选共享）
 type P2PSessionContext struct {
+	tunnelNetwork         *netx.TunnelNetwork
 	SharedKey             [32]byte
 	MQTTSignal            *MQTTSignalSession
 	LocalBindIP           string
@@ -684,6 +685,7 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 		MQTTSignal:            signal,
 		LocalBindIP:           explicitIP,
 		localDevice:           binding.Device,
+		tunnelNetwork:         netx.TunnelNetworkFrom(ctx),
 		LocalPublicIPv4Count:  LocalPublicIPv4Count,
 		LocalPublicIPv6Count:  LocalPublicIPv6Count,
 		RemotePublicIPv4Count: RemotePublicIPv4Count,
@@ -1776,7 +1778,7 @@ func createUDPConnFromAddr(laddr, raddr net.Addr, forcelyBind bool, session *P2P
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("both laddr and raddr must be *net.UDPAddr, got %T and %T", laddr, raddr)
 	}
-	if session.bindsLocalInterface() {
+	if (session != nil && session.tunnelNetwork != nil) || session.bindsLocalInterface() {
 		local := la
 		var previous func(string, string, syscall.RawConn) error
 		if forcelyBind {

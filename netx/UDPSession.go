@@ -318,7 +318,7 @@ func (d *UDPSessionDialer) DialContext(ctx context.Context, network string, addr
 	errCh := make(chan error, 1)
 
 	go func() {
-		resolvedAddr, resolveErr := net.ResolveUDPAddr(network, address)
+		resolvedAddr, resolveErr := TunnelNetworkFrom(ctx).resolveUDP(ctx, network, address)
 		if resolveErr != nil {
 			errCh <- fmt.Errorf("failed to resolve UDP address %s: %w", address, resolveErr)
 			return

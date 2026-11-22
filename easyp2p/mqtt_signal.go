@@ -162,7 +162,7 @@ func startMQTTSignalSession(ctx context.Context, brokerServers []string, clientI
 		cancel()
 		return nil, nil, nil, err
 	}
-	dialer := netx.BoundDialer(local, nil)
+	dialer := netx.TunnelNetworkFrom(ctx).Dialer(local, nil)
 	dialer.Timeout = mqttConnectTimeout
 	for i, server := range brokerServers {
 		serverURL, q, _ := ParseMQTTServerV3(server)

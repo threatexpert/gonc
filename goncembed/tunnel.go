@@ -2,11 +2,18 @@ package goncembed
 
 import (
 	"fmt"
+	"github.com/threatexpert/gonc/v2/apps"
+	"github.com/threatexpert/gonc/v2/netx"
 	"strings"
 )
 
 // StartP2PTunnel starts gonc in link mode and exposes a linkConfig.
 func StartP2PTunnel(password string, useUDP bool, linkConfig string, extraArgs string, cb Callback) (session *Session, err error) {
+	return StartP2PTunnelWithNetwork(password, useUDP, linkConfig, extraArgs, nil, cb)
+}
+
+// StartP2PTunnelWithNetwork scopes first-hop sockets and DNS to this attempt.
+func StartP2PTunnelWithNetwork(password string, useUDP bool, linkConfig, extraArgs string, network *netx.TunnelNetwork, cb Callback) (session *Session, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic starting tunnel: %v", r)
@@ -37,7 +44,7 @@ func StartP2PTunnel(password string, useUDP bool, linkConfig string, extraArgs s
 		}
 		cb.Event("info", fmt.Sprintf("Starting gonc tunnel with args: -p2p ***%s -link %s", udpArg, linkConfig))
 	}
-	return start(args, cb, "tunnel")
+	return startP2PWithFileSourceAndOptions(args, cb, "tunnel", nil, apps.RunOptions{TunnelNetwork: network})
 }
 
 // StartP2PLinkAgent starts gonc in linkagent (dual proxy service) mode. This is

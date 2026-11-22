@@ -23,6 +23,9 @@ func (s *P2PSessionContext) bindsLocalInterface() bool {
 }
 
 func (s *P2PSessionContext) localControl(local net.Addr, previous func(string, string, syscall.RawConn) error) func(string, string, syscall.RawConn) error {
+	if s != nil && s.tunnelNetwork != nil {
+		return s.tunnelNetwork.Control(previous)
+	}
 	if !s.bindsLocalInterface() {
 		return previous
 	}
@@ -33,6 +36,9 @@ func (s *P2PSessionContext) localControl(local net.Addr, previous func(string, s
 }
 
 func (s *P2PSessionContext) listenUDP(network string, local *net.UDPAddr) (*net.UDPConn, error) {
+	if s != nil && s.tunnelNetwork != nil {
+		return s.tunnelNetwork.ListenUDP(context.Background(), network, local)
+	}
 	if !s.bindsLocalInterface() {
 		return net.ListenUDP(network, local)
 	}

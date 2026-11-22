@@ -263,6 +263,10 @@ func (v binarySizeValue) Set(value string) error {
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
 func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*AppNetcatConfig, error) {
+	return appNetcatConfigByArgs(context.Background(), logWriter, argv0, args)
+}
+
+func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 string, args []string) (*AppNetcatConfig, error) {
 	var swriter *misc.SwitchableWriter
 	if sw, ok := logWriter.(*misc.SwitchableWriter); ok {
 		// 复用，不再包一层
@@ -275,7 +279,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		helloTimeout: 30 * time.Second,
 		LogWriter:    swriter,
 		Logger:       log.New(swriter, "", 0),
-		ctx:          context.Background(),
+		ctx:          ctx,
 	}
 
 	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
@@ -662,7 +666,7 @@ func firstInit(ncconfig *AppNetcatConfig) error {
 	if ncconfig.stunSrv != "" {
 		if strings.HasPrefix(ncconfig.stunSrv, "http://") || strings.HasPrefix(ncconfig.stunSrv, "https://") {
 			// 支持通过 URL 获取配置，设置 10 秒超时避免阻塞初始化
-			client, closeIdle, err := newBoundHTTPClient(ncconfig.binding.Source(), 10*time.Second)
+			client, closeIdle, err := tunnelHTTPClient(netx.TunnelNetworkFrom(ncconfig.ctx), ncconfig.binding.Source(), 10*time.Second)
 			if err != nil {
 				return err
 			}
@@ -847,7 +851,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 				if err != nil {
 					return err
 				}
-				chainClient, err := ParseProxyChainURLWithLocalAddr(ncconfig.LogWriter, xcommandline, localAddr)
+				chainClient, err := parseProxyChain(ncconfig.LogWriter, xcommandline, localAddr, netx.TunnelNetworkFrom(ncconfig.ctx))
 				if err != nil {
 					ncconfig.Logger.Printf("Error parse proxy chain: %v\n", err)
 					return fmt.Errorf("error parse proxy chain: %w", err)
@@ -873,6 +877,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) error {
 			if err != nil {
 				return err
 			}
+			pc.tunnelNetwork = netx.TunnelNetworkFrom(ncconfig.ctx)
 			pc.LocalAddr = localAddr
 		}
 	}
@@ -1069,6 +1074,10 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 
 // configureDNS 如果指定，则设置DNS解析器，并为Android提供默认值
 func configureDNS(ncconfig *AppNetcatConfig) error {
+	// Embedded protected tunnels use their private bootstrap resolver.
+	if netx.TunnelNetworkFrom(ncconfig.ctx) != nil {
+		return nil
+	}
 	if ncconfig.useDNS != "" {
 		return setDns(ncconfig.useDNS, ncconfig.binding.Source())
 	} else if isAndroid() {

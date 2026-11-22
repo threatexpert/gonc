@@ -257,10 +257,10 @@ func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
 }
 
 func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
-	return openLanMcast("", listInterfaces, loggers...)
+	return openLanMcast(context.Background(), "", listInterfaces, loggers...)
 }
 
-func openLanMcast(device string, listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
+func openLanMcast(ctx context.Context, device string, listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
 	gip := net.ParseIP(LANMulticastIP)
 	dst := &net.UDPAddr{IP: gip, Port: LANMulticastPort}
 	var logger *log.Logger
@@ -269,7 +269,10 @@ func openLanMcast(device string, listInterfaces func() ([]net.Interface, error),
 	}
 
 	lc := net.ListenConfig{Control: netx.InterfaceControl(device, nil)}
-	c, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
+	if s := netx.TunnelNetworkFrom(ctx); s != nil {
+		lc.Control = s.Control(nil)
+	}
+	c, err := lc.ListenPacket(ctx, "udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
 	if err != nil {
 		return nil, fmt.Errorf("bind %s:%d: %v", LANMulticastIP, LANMulticastPort, err)
 	}
@@ -537,7 +540,7 @@ func discoverLANOnInterface(ctx context.Context, sessionKey, transportPref strin
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	mc, err := openLanMcast(device, net.Interfaces, logger)
+	mc, err := openLanMcast(ctx, device, net.Interfaces, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -862,7 +865,7 @@ func EasyP2PLANOnInterface(ctx context.Context, sessionKey, transportPref string
 		LocalLAN: localAddr, LocalNAT: localAddr, LocalNATType: "easy",
 		RemoteLAN: remoteAddr, RemoteNAT: remoteAddr, RemoteNATType: "easy",
 	}
-	sessCtx := &P2PSessionContext{SharedKey: sharedKey, localDevice: device}
+	sessCtx := &P2PSessionContext{SharedKey: sharedKey, localDevice: device, tunnelNetwork: netx.TunnelNetworkFrom(ctx)}
 
 	var conn net.Conn
 	var isClient bool

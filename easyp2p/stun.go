@@ -136,7 +136,9 @@ func getPublicIPs(parentCtx context.Context, network string, binding netx.LocalB
 		basedUDPConn := shPktCon
 		if basedUDPConn == nil {
 			var sharedUDPConn *net.UDPConn
-			if binding.Device != "" {
+			if s := netx.TunnelNetworkFrom(ctx); s != nil {
+				sharedUDPConn, err = s.ListenUDP(ctx, listenNetwork, localAddr)
+			} else if binding.Device != "" {
 				sharedUDPConn, err = netx.ListenInterfaceUDP(ctx, listenNetwork, localAddr, binding.Device)
 			} else {
 				sharedUDPConn, err = netx.ListenUDP(listenNetwork, localAddr)
@@ -227,7 +229,9 @@ func getPublicIPs(parentCtx context.Context, network string, binding netx.LocalB
 			var conn net.Conn
 			dialer := &net.Dialer{LocalAddr: laddr}
 			if strings.HasPrefix(useNetwork, "tcp") {
-				if binding.Device != "" {
+				if s := netx.TunnelNetworkFrom(ctx); s != nil {
+					dialer = s.Dialer(laddr, netx.ControlTCP)
+				} else if binding.Device != "" {
 					dialer.Control = netx.InterfaceControl(binding.Device, netx.ControlTCP)
 				} else {
 					dialer.Control = netx.LocalAddrControl(laddr, netx.ControlTCP)

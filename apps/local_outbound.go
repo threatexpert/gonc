@@ -8,11 +8,14 @@ import (
 )
 
 func newBoundHTTPClient(source string, timeout time.Duration) (*http.Client, func(), error) {
+	return tunnelHTTPClient(nil, source, timeout)
+}
+func tunnelHTTPClient(s *netx.TunnelNetwork, source string, timeout time.Duration) (*http.Client, func(), error) {
 	local, err := netx.SourceAddr("tcp", source)
 	if err != nil {
 		return nil, nil, err
 	}
-	d := netx.BoundDialer(local, nil)
+	d := s.Dialer(local, nil)
 	d.Timeout = timeout
 	tr := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,

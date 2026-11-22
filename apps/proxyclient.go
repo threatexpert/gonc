@@ -193,6 +193,7 @@ type ProxyClientConfig struct {
 	ServerPort       string
 	PresharedKey     string // -psk <psk-string>
 	KcpWithUDP       bool
+	tunnelNetwork    *netx.TunnelNetwork
 	LocalAddr        net.Addr
 	UpstreamDialer   Dialer // 上游拨号器，用于链式代理。nil则使用net.DialTimeout直连
 }
@@ -203,7 +204,7 @@ func (c *ProxyClientConfig) dialToServer(timeout time.Duration) (net.Conn, error
 	if c.UpstreamDialer != nil {
 		return c.UpstreamDialer.DialTimeout(c.Network, serverAddress, timeout)
 	}
-	dialer := netx.BoundDialer(c.LocalAddr, nil)
+	dialer := c.tunnelNetwork.Dialer(c.LocalAddr, nil)
 	dialer.Timeout = timeout
 	return dialer.Dial(c.Network, serverAddress)
 }
@@ -522,6 +523,9 @@ func ParseProxyChainURL(logWriter io.Writer, chain string) (*ProxyClient, error)
 }
 
 func ParseProxyChainURLWithLocalAddr(logWriter io.Writer, chain string, firstHopLocalAddr net.Addr) (*ProxyClient, error) {
+	return parseProxyChain(logWriter, chain, firstHopLocalAddr, nil)
+}
+func parseProxyChain(logWriter io.Writer, chain string, firstHopLocalAddr net.Addr, network *netx.TunnelNetwork) (*ProxyClient, error) {
 	parts := splitProxyChain(chain)
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("empty proxy chain")
@@ -535,6 +539,7 @@ func ParseProxyChainURLWithLocalAddr(logWriter io.Writer, chain string, firstHop
 			return nil, fmt.Errorf("parse proxy URL %q: %w", part, err)
 		}
 		if len(configs) == 0 {
+			config.tunnelNetwork = network
 			config.LocalAddr = firstHopLocalAddr
 		}
 		configs = append(configs, config)

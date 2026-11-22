@@ -2410,7 +2410,7 @@ func (c *Socks5Client) DialTimeout(network, address string, timeout time.Duratio
 				udpLocal = &net.UDPAddr{IP: local.IP, Zone: local.Zone}
 			}
 		}
-		udpDialer := netx.BoundDialer(udpLocal, nil)
+		udpDialer := c.Config.tunnelNetwork.Dialer(udpLocal, nil)
 		udpDialer.Timeout = timeout
 		localUDPConn, err = udpDialer.Dial("udp", (&net.UDPAddr{IP: actualSocks5ServerUDPAddr, Port: actualSocks5ServerUDPPort}).String())
 		if err != nil {

@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/threatexpert/gonc/v2/httpfileshare"
+	"github.com/threatexpert/gonc/v2/netx"
 )
 
 type RunOptions struct {
+	TunnelNetwork *netx.TunnelNetwork
 	// HelloTimeout configures embedded sessions only; zero keeps the 30-second default.
 	HelloTimeout   time.Duration
 	P2PWithLANMode bool
@@ -79,7 +81,8 @@ func PrepareNetcatConfigWithOptions(ctx context.Context, logWriter io.Writer, ar
 		logWriter = io.Discard
 	}
 
-	config, err := AppNetcatConfigByArgs(logWriter, "gonc", args)
+	ctx = netx.WithTunnelNetwork(ctx, options.TunnelNetwork)
+	config, err := appNetcatConfigByArgs(ctx, logWriter, "gonc", args)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +92,6 @@ func PrepareNetcatConfigWithOptions(ctx context.Context, logWriter io.Writer, ar
 	if options.HelloTimeout > 0 {
 		config.helloTimeout = options.HelloTimeout
 	}
-	config.ctx = ctx
 	config.ConsoleMode = false
 	config.ProgressSink = options.ProgressSink
 	if config.daemon {
