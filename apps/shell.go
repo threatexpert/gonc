@@ -112,7 +112,6 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	var input io.ReadCloser
 	var output io.WriteCloser
 	var ptyIO misc.ResizablePty
-	var ptyshSID []byte
 
 	if config.EnablePty {
 		cmd, ptmx, err := misc.PtyStart(config.Args[0], config.Args[1:]...)
@@ -127,11 +126,15 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 		output = ptmx
 		sid, sidHex, err := newPtyshSID()
 		if err == nil {
-			if caps, err := encodePtyshCaps(sidHex); err == nil {
-				if _, err := conn.Write(caps); err == nil {
-					ptyshSID = sid
+			wrapped := newShellServerConn(conn, sid, func(rows, cols int) {
+				recorder.add("SIZE", []byte(fmt.Sprintf("rows=%d cols=%d", rows, cols)))
+				if err := ptyIO.Resize(cols, rows); err != nil {
+					config.Logger.Printf("pty resize error: %v\n", err)
 				}
-			}
+			}, recorder)
+			conn = wrapped
+			defer wrapped.Close()
+			_, _ = conn.Write(encodeShellSessionCaps(sidHex))
 		}
 	} else {
 		cmd := exec.Command(config.Args[0], config.Args[1:]...)
@@ -188,18 +191,7 @@ func App_shell_main_withconfig(conn net.Conn, config *PtyShellConfig) {
 	go func() {
 		defer wg.Done()
 		defer close(inputDone)
-		var shellInput io.Reader = conn
-		if len(ptyshSID) == ptyshSIDSize && ptyIO != nil {
-			shellInput = newPtyshResizeInputReader(conn, ptyshSID, func(rows, cols int) {
-				recorder.add("SIZE", []byte(fmt.Sprintf("rows=%d cols=%d", rows, cols)))
-				if err := ptyIO.Resize(cols, rows); err != nil {
-					config.Logger.Printf("pty resize error: %v\n", err)
-				} else {
-					//config.Logger.Printf("pty resize successful: %dx%d\n", cols, rows)
-				}
-			})
-		}
-		io.Copy(shellRecordWriter{w: output, r: recorder, dir: "IN"}, shellInput)
+		io.Copy(shellRecordWriter{w: output, r: recorder, dir: "IN"}, conn)
 	}()
 	go func() {
 		defer wg.Done()

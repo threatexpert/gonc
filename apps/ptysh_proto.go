@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -187,6 +188,11 @@ type ptyshResizeInputReader struct {
 	out      []byte
 	readBuf  []byte
 	savedErr error
+	// Only installed by a server which advertised session.v2. A matching
+	// zero-size resize frame requests an upgrade; legacy clients never send it.
+	onUpgrade      func(io.Reader) (io.Reader, error)
+	upgradePending bool
+	upgraded       bool
 }
 
 func newPtyshResizeInputReader(r io.Reader, sid []byte, onResize func(rows, cols int)) *ptyshResizeInputReader {
@@ -195,6 +201,16 @@ func newPtyshResizeInputReader(r io.Reader, sid []byte, onResize func(rows, cols
 
 func (r *ptyshResizeInputReader) Read(p []byte) (int, error) {
 	for len(r.out) == 0 {
+		if r.upgradePending {
+			next, err := r.onUpgrade(r.r)
+			if err != nil {
+				return 0, err
+			}
+			r.r, r.upgraded, r.upgradePending = next, true, false
+		}
+		if r.upgraded {
+			return r.r.Read(p)
+		}
 		if r.savedErr != nil {
 			err := r.savedErr
 			r.savedErr = nil
@@ -203,8 +219,14 @@ func (r *ptyshResizeInputReader) Read(p []byte) (int, error) {
 
 		n, err := r.r.Read(r.readBuf)
 		if n > 0 {
-			for _, b := range r.readBuf[:n] {
+			for i, b := range r.readBuf[:n] {
 				r.consume(b)
+				if r.upgradePending {
+					// Keep bytes already read beyond the switching boundary.
+					tail := append([]byte(nil), r.readBuf[i+1:n]...)
+					r.r = io.MultiReader(bytes.NewReader(tail), r.r)
+					break
+				}
 			}
 		}
 		if err != nil {
@@ -294,6 +316,10 @@ func (r *ptyshResizeInputReader) handleFrame() {
 	off += ptyshSIDSize
 	rows := int(binary.BigEndian.Uint16(r.frameBuf[off:]))
 	cols := int(binary.BigEndian.Uint16(r.frameBuf[off+2:]))
+	if rows == 0 && cols == 0 && r.onUpgrade != nil {
+		r.upgradePending = true
+		return
+	}
 	if rows <= 0 || cols <= 0 {
 		return
 	}

@@ -26,6 +26,8 @@ type shellRecordEvent struct {
 }
 
 type shellRecorder struct {
+	mu      sync.RWMutex
+	closed  bool
 	id      string
 	file    io.WriteCloser
 	watch   io.Writer
@@ -65,6 +67,11 @@ func (r *shellRecorder) add(dir string, p []byte) {
 	if r == nil {
 		return
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return
+	}
 	for len(p) > 0 {
 		n := min(len(p), shellRecordChunk)
 		e := shellRecordEvent{at: time.Now(), dir: dir, data: bytes.Clone(p[:n])}
@@ -81,8 +88,13 @@ func (r *shellRecorder) close(end string) {
 	if r == nil {
 		return
 	}
-	r.end = end
-	close(r.events)
+	r.mu.Lock()
+	if !r.closed {
+		r.closed = true
+		r.end = end
+		close(r.events)
+	}
+	r.mu.Unlock()
 	<-r.done
 }
 

@@ -349,7 +349,7 @@ func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 strin
 	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "(mux tunnel mode)socks5 server")
 	fs.BoolVar(&config.appMuxLinkAgent, "linkagent", false, "(mux tunnel mode)dual proxy service")
 	fs.BoolVar(&config.shellAgent, "shellagent", false, "provide a direct shell with -watch enabled; configure with -:sh (P2P: wait for clients)")
-	fs.BoolVar(&config.shellClient, "shell", false, "connect to a direct shell with an interactive terminal (P2P: send hello)")
+	fs.BoolVar(&config.shellClient, "shell", false, "connect to a shell; expose a local file HTTP API when supported (P2P: send hello)")
 	fs.StringVar(&config.runAppLink, "link", "", "(mux tunnel mode)\"<L-Config>;<R-Config>\" (e.g. mux link \"1080;1080\")")
 	fs.StringVar(&config.fileACL, "acl", "", "ACL file for inbound/outbound connections")
 	fs.BoolVar(&config.plainTransport, "plain", false, "use plain TCP/UDP without TLS/KCP/Encryption for P2P")
@@ -2939,20 +2939,38 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 	abort := make(chan struct{})
-	connWriter := io.Writer(nconn)
+	var shellClient *shellClientConn
+	var connReader io.Reader = nconn
+	var connWriter io.Writer = nconn
+	if ncconfig.shellClient && nconn.IsUDP && !nconn.WithKCP {
+		fmt.Fprintln(os.Stderr, "File API unavailable: shell file transfers require a reliable stream (TCP or KCP).")
+	} else if ncconfig.shellClient {
+		var err error
+		shellClient, err = newShellClientConn(nconn, os.Stderr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Shell session upgrade failed: %v\n", err)
+			return 1
+		}
+		defer shellClient.Close()
+		connReader, connWriter = shellClient, shellClient
+	}
 	outputWriter := io.Writer(output)
 	resizeStop := make(chan struct{})
 	var resizeStopOnce sync.Once
 	var resizeStartOnce sync.Once
 	if ncconfig.enablePty || ncconfig.shellClient {
-		lockedConnWriter := &lockedWriter{w: nconn}
+		lockedConnWriter := &lockedWriter{w: connWriter}
 		connWriter = lockedConnWriter
+		var resizeWriter io.Writer = lockedConnWriter
+		if shellClient != nil && shellClient.ctrl != nil {
+			resizeWriter = shellClient.ctrl
+		}
 		outputWriter = newPtyshCapsOutputWriter(output, func(sid []byte) {
 			if ncconfig.shellClient && (!ncconfig.enablePty || !ncconfig.ConsoleMode || !term.IsTerminal(int(os.Stdin.Fd()))) {
 				return
 			}
 			resizeStartOnce.Do(func() {
-				go startPtyshResizeSender(resizeStop, lockedConnWriter, sid, ncconfig.Logger)
+				go startPtyshResizeSender(resizeStop, resizeWriter, sid, ncconfig.Logger)
 			})
 		})
 	}
@@ -2981,6 +2999,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 				}
 				defer term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
 				copyWithProgress(ncconfig, connWriter, input, blocksize, !nconn.IsUDP, stats_out, 0, 0)
+			} else if ncconfig.shellClient {
+				copyWithProgress(ncconfig, connWriter, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes, 0)
 			} else {
 				copyCharDeviceWithProgress(ncconfig, nconn, input, stats_out)
 			}
@@ -2990,7 +3010,11 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 
 		time.Sleep(1 * time.Second)
 		resizeStopOnce.Do(func() { close(resizeStop) })
-		nconn.CloseWrite()
+		if shellClient != nil {
+			shellClient.CloseWrite()
+		} else {
+			nconn.CloseWrite()
+		}
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-write routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
 	// 从连接读取并输出到输出
@@ -2998,7 +3022,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(ncconfig, outputWriter, nconn, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
+		copyWithProgress(ncconfig, outputWriter, connReader, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
 		time.Sleep(1 * time.Second)
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-read routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
