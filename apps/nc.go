@@ -134,6 +134,8 @@ type AppNetcatConfig struct {
 	appMuxListenOn       string
 	appMuxSocksMode      bool
 	appMuxLinkAgent      bool
+	shellAgent           bool
+	shellClient          bool
 	runAppLink           string
 	fileACL              string
 	plainTransport       bool
@@ -346,6 +348,8 @@ func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 strin
 	fs.StringVar(&config.appMuxListenOn, "httplocal-port", "", "(mux tunnel mode)local listen port for remote httpserver")
 	fs.BoolVar(&config.appMuxSocksMode, "socks5server", false, "(mux tunnel mode)socks5 server")
 	fs.BoolVar(&config.appMuxLinkAgent, "linkagent", false, "(mux tunnel mode)dual proxy service")
+	fs.BoolVar(&config.shellAgent, "shellagent", false, "provide a direct shell with -watch enabled; configure with -:sh (P2P: wait for clients)")
+	fs.BoolVar(&config.shellClient, "shell", false, "connect to a direct shell with an interactive terminal (P2P: send hello)")
 	fs.StringVar(&config.runAppLink, "link", "", "(mux tunnel mode)\"<L-Config>;<R-Config>\" (e.g. mux link \"1080;1080\")")
 	fs.StringVar(&config.fileACL, "acl", "", "ACL file for inbound/outbound connections")
 	fs.BoolVar(&config.plainTransport, "plain", false, "use plain TCP/UDP without TLS/KCP/Encryption for P2P")
@@ -369,7 +373,7 @@ func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 strin
 	fs.BoolVar(&config.appMuxListenMode, "browser", false, "alias for -httplocal")
 	fs.StringVar(&config.app_mux_args, ":mux", "-", "enable and config :mux for dynamic service")
 	fs.StringVar(&config.app_s5s_args, ":s5s", "-", "enable and config :s5s for dynamic service")
-	fs.StringVar(&config.app_sh_args, ":sh", "-", "enable and config :sh for dynamic service")
+	fs.StringVar(&config.app_sh_args, ":sh", "-", "configure :sh for dynamic service or -shellagent")
 	fs.StringVar(&config.app_nc_args, ":nc", "-", "enable and config :nc for dynamic service")
 	fs.StringVar(&config.app_httpserver_args, ":httpserver", "-", "enable and config :httpserver for dynamic service")
 	fs.BoolVar(&config.natchecker, "nat-checker", false, "detect NAT type and public IP")
@@ -405,6 +409,9 @@ func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 strin
 	err := fs.Parse(args)
 	if err != nil {
 		return nil, err // 解析错误直接返回
+	}
+	if err := configureShellShortcut(config, fs); err != nil {
+		return nil, err
 	}
 	if config.speedTestDuration < 0 {
 		return nil, fmt.Errorf("-speedtest cannot be negative")
@@ -2937,10 +2944,13 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	resizeStop := make(chan struct{})
 	var resizeStopOnce sync.Once
 	var resizeStartOnce sync.Once
-	if ncconfig.enablePty {
+	if ncconfig.enablePty || ncconfig.shellClient {
 		lockedConnWriter := &lockedWriter{w: nconn}
 		connWriter = lockedConnWriter
 		outputWriter = newPtyshCapsOutputWriter(output, func(sid []byte) {
+			if ncconfig.shellClient && (!ncconfig.enablePty || !ncconfig.ConsoleMode || !term.IsTerminal(int(os.Stdin.Fd()))) {
+				return
+			}
 			resizeStartOnce.Do(func() {
 				go startPtyshResizeSender(resizeStop, lockedConnWriter, sid, ncconfig.Logger)
 			})
@@ -2961,7 +2971,8 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		defer close(outExited)
 
 		info, err := os.Stdin.Stat()
-		if err == nil && info.Mode()&os.ModeCharDevice != 0 && !binaryInputMode {
+		if err == nil && info.Mode()&os.ModeCharDevice != 0 && !binaryInputMode &&
+			(!ncconfig.shellClient || (ncconfig.ConsoleMode && term.IsTerminal(int(os.Stdin.Fd())))) {
 			if ncconfig.enablePty {
 				ncconfig.term_oldstat, err = term.MakeRaw(int(os.Stdin.Fd()))
 				if err != nil {
