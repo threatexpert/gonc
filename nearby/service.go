@@ -613,9 +613,15 @@ func (s *Service) handlePacket(p packet) {
 	var kind struct {
 		K string `json:"k"`
 	}
-	if json.Unmarshal(p.data, &kind) == nil && kind.K == knockKind {
-		s.handleKnock(p.data, p.src)
-		return
+	if json.Unmarshal(p.data, &kind) == nil {
+		switch kind.K {
+		case knockKind:
+			s.handleKnock(p.data, p.src)
+			return
+		case knockRefusedKind:
+			s.handleKnockRefused(p.data, p.src)
+			return
+		}
 	}
 	a, ok := parseAdvert(p.data)
 	if !ok {
