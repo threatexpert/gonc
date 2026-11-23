@@ -36,6 +36,10 @@ type P2POptions struct {
 	HelloTimeout   time.Duration
 	UseUDP         bool
 	P2PWithLANMode bool
+	// LANOnly finds the peer only on the local network (multicast discovery
+	// in both directions, then simultaneous TCP dials) and never contacts
+	// MQTT or STUN servers. It cannot be combined with P2PWithLANMode.
+	LANOnly bool
 }
 
 // Session represents one running gonc task.
@@ -87,6 +91,7 @@ func StartP2PShareSourceWithOptions(source httpfileshare.FileSource, password st
 	args = append(args, "-httpserver", os.DevNull) // a Placeholder
 	return startP2PWithFileSourceAndOptions(args, cb, "send", source, apps.RunOptions{
 		P2PWithLANMode: options.P2PWithLANMode,
+		LANOnly:        options.LANOnly,
 	})
 }
 
@@ -134,6 +139,7 @@ func StartP2PReceiveWithOptions(password string, options P2POptions, cb Callback
 	return startP2PWithFileSourceAndOptions(args, cb, "receive", nil, apps.RunOptions{
 		HelloTimeout:   options.HelloTimeout,
 		P2PWithLANMode: options.P2PWithLANMode,
+		LANOnly:        options.LANOnly,
 	})
 }
 
@@ -146,11 +152,22 @@ func startP2PWithFileSource(args []string, cb Callback, side string, source http
 }
 
 func startP2PWithFileSourceAndOptions(args []string, cb Callback, side string, source httpfileshare.FileSource, runOptions apps.RunOptions) (*Session, error) {
+	return startSession(args, cb, side, source, runOptions, true)
+}
+
+// startSession runs one embedded gonc task. P2P sessions get a loopback
+// report server for status updates. Direct sessions have no P2P status and
+// end with positional host/port arguments, which must stay last.
+func startSession(args []string, cb Callback, side string, source httpfileshare.FileSource, runOptions apps.RunOptions, p2pReports bool) (*Session, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	reportServer, reportURL := startP2PReportServer(cb, side)
-	if reportURL != "" {
-		args = append([]string{}, args...)
-		args = append(args, "-p2p-report-url", reportURL)
+	var reportServer *http.Server
+	if p2pReports {
+		var reportURL string
+		reportServer, reportURL = startP2PReportServer(cb, side)
+		if reportURL != "" {
+			args = append([]string{}, args...)
+			args = append(args, "-p2p-report-url", reportURL)
+		}
 	}
 	writer := &callbackWriter{cb: cb, side: side}
 	progressSink := progressSinkFor(cb, side)
@@ -263,6 +280,10 @@ func (w *callbackWriter) Write(p []byte) (int, error) {
 			}
 		case "tunnel":
 			if endpoint := w.findTunnelReadyEndpoint(message); endpoint != "" {
+				w.cb.Ready(endpoint)
+			}
+		case sideDirectSend:
+			if endpoint := findListeningEndpoint(message); endpoint != "" {
 				w.cb.Ready(endpoint)
 			}
 		}
