@@ -13,6 +13,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/threatexpert/gonc/v2/easyp2p"
@@ -130,11 +131,81 @@ func (w loggerWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// A device answers a knock it will not meet with a refusal, so the knocker
+// fails at once instead of waiting out the rendezvous window. Devices from
+// before refusals ignore them: a refusal carries no tag or port, so it does
+// not parse as an advertisement.
+//
+// A refusal is not authenticated; a device that forgot a pairing has no key
+// to sign it with. The knocker accepts one only for its own pending knock
+// nonce and only from the address the target device advertises from.
+const (
+	knockRefusedKind = "knock-refused"
+	refuseUnknown    = "unknown"   // the device does not recognize the pairing
+	refuseQuick      = "quick-off" // the device does not accept quick transfers
+)
+
 // pendingKnock is resent as a unicast reply to each advertisement from the
 // target device until the connection attempt ends.
 type pendingKnock struct {
 	deviceID string
 	data     []byte
+	nonce    []byte
+	// refused receives the reason when the target device refuses the
+	// knock. It holds one value; later refusals are dropped.
+	refused chan string
+}
+
+// refusalError is the error for a refusal reason.
+func refusalError(reason string) error {
+	if reason == refuseQuick {
+		return ErrQuickRefused
+	}
+	return ErrNotPaired
+}
+
+// refuseKnock tells the device that sent k why its knock will not be met.
+func (s *Service) refuseKnock(k *knockMsg, src net.Addr, reason string) {
+	if s.disc == nil || src == nil {
+		return
+	}
+	data, err := json.Marshal(&knockMsg{M: advertMagic, V: ProtocolVersion, K: knockRefusedKind, Kind: reason, Target: k.Tag, Nonce: k.Nonce})
+	if err != nil {
+		return
+	}
+	s.disc.unicast(data, src)
+}
+
+// handleKnockRefused passes a refusal to the pending knock it answers.
+func (s *Service) handleKnockRefused(data []byte, src net.Addr) {
+	var k knockMsg
+	if err := json.Unmarshal(data, &k); err != nil || k.K != knockRefusedKind || k.V != ProtocolVersion {
+		return
+	}
+	if len(k.Nonce) != knockNonceBytes || (k.Kind != refuseUnknown && k.Kind != refuseQuick) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.isOwnTagLocked(k.Target) {
+		return
+	}
+	for pk := range s.knocks {
+		if !hmac.Equal(pk.nonce, k.Nonce) || !sameIP(s.knockTargetLocked(pk.deviceID), src) {
+			continue
+		}
+		select {
+		case pk.refused <- k.Kind:
+		default:
+		}
+	}
+}
+
+// sameIP reports whether a and b are UDP addresses on the same IP.
+func sameIP(a, b net.Addr) bool {
+	ua, ok1 := a.(*net.UDPAddr)
+	ub, ok2 := b.(*net.UDPAddr)
+	return ok1 && ok2 && ua.IP != nil && ua.IP.Equal(ub.IP)
 }
 
 type connectResult struct {
@@ -183,6 +254,17 @@ func (s *Service) connect(ctx context.Context, d *deviceState, kind string, rec 
 
 	headStart := time.NewTimer(delay)
 	defer headStart.Stop()
+	// closeLate stops the other path and closes its connection, if any.
+	closeLate := func(pending int) {
+		cancel()
+		go func() {
+			for i := 0; i < pending; i++ {
+				if late := <-results; late.conn != nil {
+					_ = late.conn.Close()
+				}
+			}
+		}()
+	}
 	var errs []error
 	rendezvousStarted := false
 	for received := 0; received < started; {
@@ -196,18 +278,15 @@ func (s *Service) connect(ctx context.Context, d *deviceState, kind string, rec 
 			received++
 			if r.err == nil {
 				s.logf("connected to %s (%s) in %.1fs", d.Nickname, r.path, time.Since(began).Seconds())
-				cancel()
-				// Close a late second connection, if any.
-				go func(pending int) {
-					for i := 0; i < pending; i++ {
-						if late := <-results; late.conn != nil {
-							_ = late.conn.Close()
-						}
-					}
-				}(started - received)
+				closeLate(started - received)
 				return r.conn, nil
 			}
 			s.logf("%s to %s failed: %v", r.path, d.Nickname, r.err)
+			if errors.Is(r.err, ErrNotPaired) || errors.Is(r.err, ErrQuickRefused) {
+				// The device answered; waiting on the other path cannot help.
+				closeLate(started - received)
+				return nil, r.err
+			}
 			errs = append(errs, fmt.Errorf("%s: %w", r.path, r.err))
 			if !rendezvousStarted {
 				rendezvousStarted = true
@@ -246,7 +325,7 @@ func (s *Service) knockAndMeet(ctx context.Context, d *deviceState, kind string,
 		return nil, err
 	}
 
-	pk := &pendingKnock{deviceID: d.ID, data: data}
+	pk := &pendingKnock{deviceID: d.ID, data: data, nonce: nonce, refused: make(chan string, 1)}
 	s.mu.Lock()
 	s.knocks[pk] = true
 	src := s.knockTargetLocked(d.ID)
@@ -287,7 +366,26 @@ func (s *Service) knockAndMeet(ctx context.Context, d *deviceState, kind string,
 			}
 		}
 	}()
-	return lanRendezvous(ctx, key, loggerWriter{s})
+	meetCtx, stopMeet := context.WithCancel(ctx)
+	defer stopMeet()
+	var refusal atomic.Value
+	go func() {
+		select {
+		case reason := <-pk.refused:
+			refusal.Store(reason)
+			stopMeet()
+		case <-meetCtx.Done():
+		}
+	}()
+	conn, err := lanRendezvous(meetCtx, key, loggerWriter{s})
+	if reason, ok := refusal.Load().(string); ok {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		s.logf("%s refused the knock (%s)", d.Nickname, reason)
+		return nil, refusalError(reason)
+	}
+	return conn, err
 }
 
 // knockTargetLocked returns where device id's advertisements come from.
@@ -365,11 +463,14 @@ func (s *Service) handleKnock(data []byte, src net.Addr) {
 	switch k.Kind {
 	case knockSession:
 		if rec == nil {
+			// The sender still has a pairing this device forgot.
+			s.refuseKnock(&k, src, refuseUnknown)
 			return
 		}
 		macKey, err := knockMACKey(*rec)
 		if err != nil || !hmac.Equal(k.MAC, knockMAC(macKey, &k)) {
 			s.logf("ignored a knock with a bad signature from %s", host)
+			s.refuseKnock(&k, src, refuseUnknown)
 			return
 		}
 	case knockPair:
@@ -381,6 +482,7 @@ func (s *Service) handleKnock(data []byte, src net.Addr) {
 		on := s.quickReceive && s.handler != nil
 		s.mu.Unlock()
 		if !on {
+			s.refuseKnock(&k, src, refuseQuick)
 			return
 		}
 	default:
