@@ -1749,6 +1749,12 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			return 1
 		}
 		defer listener.Close()
+		// Embedded sessions stop by cancelling the context; closing the
+		// listener unblocks Accept so the session can exit.
+		if ncconfig.ctx != nil && ncconfig.ctx.Done() != nil {
+			stopListener := context.AfterFunc(ncconfig.ctx, func() { _ = listener.Close() })
+			defer stopListener()
+		}
 	}
 
 	if ncconfig.proxyProtocolEnabled {
@@ -1777,6 +1783,9 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
+				if ncconfig.ctx != nil && ncconfig.ctx.Err() != nil {
+					return 0
+				}
 				ncconfig.Logger.Printf("Error accepting connection: %v\n", err)
 				if socks5BindMode {
 					listener.Close()
@@ -1824,6 +1833,9 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		conn, err := listener.Accept()
 		listener.Close()
 		if err != nil {
+			if ncconfig.ctx != nil && ncconfig.ctx.Err() != nil {
+				return 0
+			}
 			ncconfig.Logger.Printf("Error accepting connection: %v\n", err)
 			return 1
 		}

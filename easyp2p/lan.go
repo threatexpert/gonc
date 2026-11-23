@@ -268,9 +268,15 @@ func openLanMcast(ctx context.Context, device string, listInterfaces func() ([]n
 		logger = loggers[0]
 	}
 
-	lc := net.ListenConfig{Control: netx.InterfaceControl(device, nil)}
+	// Address reuse lets several sessions share the multicast port. Every
+	// datagram still leaves from this socket: Windows Firewall only admits the
+	// peer's beacons on a socket that has sent to the group itself, and every
+	// reply is also multicast, so each session sharing the port receives it.
+	// SO_REUSEADDR is enough everywhere because the socket binds the group
+	// address; BSD-derived systems treat it as SO_REUSEPORT for that case.
+	lc := net.ListenConfig{Control: netx.InterfaceControl(device, netx.ControlUDP)}
 	if s := netx.TunnelNetworkFrom(ctx); s != nil {
-		lc.Control = s.Control(nil)
+		lc.Control = s.Control(netx.ControlUDP)
 	}
 	c, err := lc.ListenPacket(ctx, "udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
 	if err != nil {

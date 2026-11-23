@@ -18,6 +18,11 @@ type RunOptions struct {
 	// HelloTimeout configures embedded sessions only; zero keeps the 30-second default.
 	HelloTimeout   time.Duration
 	P2PWithLANMode bool
+	// LANOnly makes a -p2p session use only LAN discovery: both sides
+	// multicast beacons, reply by unicast, and then dial each other from
+	// their punch ports. No MQTT broker or STUN server is contacted, even in
+	// app modes such as -httpserver that normally exchange an MQTT hello.
+	LANOnly        bool
 	HTTPFileSource httpfileshare.FileSource
 	ProgressSink   func(ProgressSnapshot)
 }
@@ -99,6 +104,26 @@ func PrepareNetcatConfigWithOptions(ctx context.Context, logWriter io.Writer, ar
 	}
 	if options.P2PWithLANMode && config.useLAN {
 		return nil, fmt.Errorf("error preparing P2P with LAN mode: -lan selects LAN-only mode")
+	}
+	if options.LANOnly {
+		if options.P2PWithLANMode {
+			return nil, fmt.Errorf("LANOnly and P2PWithLANMode cannot be combined")
+		}
+		if config.autoP2P == "" {
+			return nil, fmt.Errorf("LAN-only mode requires -p2p")
+		}
+		// Same settings as the LAN path of -p2p-with-lan, but active on
+		// both sides so a firewalled side still beacons promptly.
+		config.p2pWithLanMode = false
+		config.useLAN = true
+		config.useLANPassive = false
+		config.useMQTTWait = false
+		config.useMQTTHello = false
+		if config.udpProtocol {
+			config.network = "udp4"
+		} else {
+			config.network = "tcp4"
+		}
 	}
 	config.p2pWithLanMode = config.p2pWithLanMode || options.P2PWithLANMode
 	if options.HTTPFileSource != nil {
