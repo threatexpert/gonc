@@ -977,3 +977,25 @@ func TestMcastPortAvailable(t *testing.T) {
 	}
 	c.Close()
 }
+
+// Two LAN sessions, for example a Nearby transfer during a passphrase
+// session, must be able to run at once, each with its own reply socket.
+func TestConcurrentLanMcastSessions(t *testing.T) {
+	first, err := newLanMcast()
+	if err != nil {
+		t.Skipf("multicast: %v", err)
+	}
+	defer first.Close()
+	second, err := newLanMcast()
+	if err != nil {
+		t.Fatalf("second LAN session could not bind the shared port: %v", err)
+	}
+	defer second.Close()
+	// Both sessions send from the shared port, which is what lets their
+	// beacons through a stateful firewall.
+	for _, mc := range []*lanMcast{first, second} {
+		if got := mc.rawConn.LocalAddr().(*net.UDPAddr).Port; got != LANMulticastPort {
+			t.Fatalf("session sends from port %d, want %d", got, LANMulticastPort)
+		}
+	}
+}
