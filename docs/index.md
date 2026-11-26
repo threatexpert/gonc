@@ -54,20 +54,49 @@
 
 === "Linux"
 
-    从 Release 页面下载二进制文件：
+    **x86-64 (amd64)**
+
     ```bash
     curl -L https://www.gonc.cc/gonc_linux_amd64 -o gonc
     chmod +x gonc
     sudo mv gonc /usr/local/bin/
     ```
 
+    **ARM64 (aarch64)**
+
+    ```bash
+    curl -L https://www.gonc.cc/gonc_linux_arm64 -o gonc
+    chmod +x gonc
+    sudo mv gonc /usr/local/bin/
+    ```
+
 === "macOS"
 
-    从 Release 页面下载二进制文件：
+    **Apple 芯片 (arm64)**
+
     ```bash
     curl -L https://www.gonc.cc/gonc_darwin_arm64 -o gonc
     chmod +x gonc
     sudo mv gonc /usr/local/bin/
+    ```
+
+    **Intel 芯片 (amd64)**
+
+    ```bash
+    curl -L https://www.gonc.cc/gonc_darwin_amd64 -o gonc
+    chmod +x gonc
+    sudo mv gonc /usr/local/bin/
+    ```
+
+=== "Android (Termux)"
+
+    **ARM64 (aarch64)**
+
+    ```bash
+    pkg install wget
+    wget https://www.gonc.cc/gonc_android_arm64 -O gonc
+    chmod +x gonc
+    mv gonc "$PREFIX/bin/"
     ```
 
 ---
