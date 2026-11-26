@@ -12,9 +12,7 @@ README in [English](./README.md) 、 [中文](./README_zh.md)
 
 ---
 
-[最新版本下载](https://www.gonc.cc/)
-
-[详细文档](https://www.gonc.cc/docs/)
+[最新版本下载](https://www.gonc.cc/) &emsp; [详细文档](https://www.gonc.cc/docs/) &emsp;&emsp; 微信群&nbsp;<img src="./wechat-qr.svg" width="57" height="57" align="absmiddle" alt="微信群二维码">
 
 ---
 

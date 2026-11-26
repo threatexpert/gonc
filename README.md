@@ -12,9 +12,7 @@ README in [中文](./README_zh.md) 、 [English](./README.md)
 
 ---
 
-[Latest version download](https://www.gonc.cc/)
-
-[docs](https://www.gonc.cc/docs/)
+[Latest version download](https://www.gonc.cc/) &emsp; [Documentation](https://www.gonc.cc/docs/) &emsp;&emsp; WeChat group&nbsp;<img src="./wechat-qr.svg" width="57" height="57" align="absmiddle" alt="WeChat group QR code">
 
 ---
 
