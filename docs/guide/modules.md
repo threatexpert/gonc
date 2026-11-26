@@ -62,7 +62,16 @@ gonc -shellagent -l 8080
 gonc -shell -remote server:8080
 ```
 
-客户端连接支持新版协议的 PTY shell 后，会在本地 stderr 输出随机端口的 File API 地址和 curl 示例。文件请求复用当前远端连接，无需额外开放远端端口。客户端 `-pty=false` 只关闭本地终端控制，仍可使用文件接口；服务端 `-:sh "-pty=false"` 保持原始字节流，不提供文件接口。
+也可叠加外层 mux，让每个外层流承载独立的 shell 会话及其文件接口：
+
+```bash
+gonc -shellagent -mux -l 8080
+gonc -shell -mux-l - -remote server:8080
+```
+
+`-mux-l -` 保留本地交互终端；`-mux-l <port>` 则为每个本地 TCP 连接建立独立会话，单个 shell 退出不会关闭外层连接。双方可用 `-mux-engine smux` 或 `-mux-engine yamux` 选择一致的外层引擎，shell 内部文件协议仍使用 smux v2。
+
+客户端连接支持新版协议的 PTY shell 后，会在本地 stderr 输出随机端口的 File API 地址和 curl 示例。文件请求复用当前远端连接，无需额外开放远端端口。`-shell` 强制开启客户端 PTY 选项，`-pty=false` 不覆盖该预设；`-shellagent` 强制开启 `keepOpen`，`-k=false` 和 `-keep-open=false` 不覆盖该预设。P2P 下两者分别强制开启主动连接和等待角色，不受对应的 `-H=false` / `-W=false` 影响。服务端 `-:sh "-pty=false"` 仍保持原始字节流，不提供文件接口；`-:sh "-"` 表示未配置附加 shell 参数，不禁用 `-shellagent`。
 
 **在客户端所在机器另开一个命令执行窗口**，保持原 shell 会话运行。以下地址需替换为实际输出的地址；Windows 使用 `curl.exe`：
 

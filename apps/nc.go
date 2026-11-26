@@ -37,7 +37,7 @@ import (
 )
 
 var (
-	VERSION = "v2.6.13"
+	VERSION = "v2.6.15"
 )
 
 type AppNetcatConfig struct {
@@ -413,11 +413,6 @@ func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 strin
 	if err := checkExecFeatures(config); err != nil {
 		return nil, err
 	}
-	if ExecSupported {
-		if err := configureShellShortcut(config, fs); err != nil {
-			return nil, err
-		}
-	}
 	if config.speedTestDuration < 0 {
 		return nil, fmt.Errorf("-speedtest cannot be negative")
 	}
@@ -734,6 +729,7 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 		ncconfig.runAppFileGet != "" ||
 		ncconfig.appMuxSocksMode ||
 		ncconfig.appMuxLinkAgent ||
+		(ExecSupported && ncconfig.shellAgent) ||
 		ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "" ||
 		ncconfig.runAppLink != "" ||
 		ncconfig.muxLocalPort != "" {
@@ -746,7 +742,28 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 func configureAppMode(ncconfig *AppNetcatConfig) error {
 	userSpecifiedRunCmd := ncconfig.runCmd != ""
 	appMode := false
-	if ncconfig.runAppFileServ != "" {
+	if ExecSupported && (ncconfig.shellAgent || ncconfig.shellClient) {
+		if ncconfig.shellAgent {
+			// Put the default first so user options can override -watch.
+			ncconfig.runCmd = ":sh -watch"
+			if ncconfig.app_sh_args != "-" && ncconfig.app_sh_args != "" {
+				ncconfig.runCmd += " " + ncconfig.app_sh_args
+			}
+			ncconfig.keepOpen = true
+			if ncconfig.autoP2P != "" {
+				ncconfig.useMQTTWait = true
+			}
+		} else {
+			if ncconfig.app_sh_args != "-" {
+				return fmt.Errorf("-:sh configures the shell provider; use it with -shellagent, not -shell")
+			}
+			ncconfig.enablePty = true
+			if ncconfig.autoP2P != "" {
+				ncconfig.useMQTTHello = true
+			}
+		}
+		appMode = true
+	} else if ncconfig.runAppFileServ != "" {
 		//使用了-httpserver 的情况，获取多余的参数都当作根目录添加进去。
 		rootPaths := []string{ncconfig.runAppFileServ}
 		if len(ncconfig.Args) > 0 {
@@ -2369,6 +2386,22 @@ Run "%s -h" for all options.
 }
 
 func conflictCheck(ncconfig *AppNetcatConfig) int {
+	if ExecSupported && (ncconfig.shellAgent || ncconfig.shellClient) {
+		switch {
+		case ncconfig.shellAgent && ncconfig.shellClient:
+			ncconfig.Logger.Printf("-shellagent and -shell cannot be used together\n")
+			return 1
+		case ncconfig.remoteCall != "":
+			ncconfig.Logger.Printf("-shellagent/-shell use a direct shell and cannot be used with -call\n")
+			return 1
+		case ncconfig.natchecker || ncconfig.httpdownload:
+			ncconfig.Logger.Printf("-shellagent/-shell cannot be used with -nat-checker or -http-download\n")
+			return 1
+		case ncconfig.speedTestDuration != 0:
+			ncconfig.Logger.Printf("-shellagent/-shell cannot be used with -speedtest\n")
+			return 1
+		}
+	}
 	if ncconfig.useMQTTWait && ncconfig.useMQTTHello {
 		ncconfig.Logger.Printf("-mqtt-wait and -mqtt-hello cannot be used together\n")
 		return 1
@@ -3225,7 +3258,11 @@ func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.C
 		return 1
 	}
 
-	ncconfig.ConsoleMode = false
+	// A single -shell over mux stdin/stdout still owns the local terminal.
+	// Forwarded TCP connections and accepted streams are not local consoles.
+	if !ncconfig.shellClient || !isClient || ncconfig.muxLocalPort != "-" {
+		ncconfig.ConsoleMode = false
+	}
 	listener := newMuxListener(session)
 	defer listener.Close()
 
