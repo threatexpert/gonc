@@ -4,9 +4,9 @@ import "fmt"
 
 // Building with -tags gonc_noexec leaves out every feature that starts a local
 // process: -e/-exec with an external command, the :sh shell, -shellagent and
-// -daemon. Programs that embed gonc for its network features use it so a
-// configuration can never start a shell or another program. The gonc command
-// keeps all of them. :service stays available: a peer can only pick one of the
+// -daemon. It also leaves out the remote shell client (-shell) and raw
+// terminal mode (-pty). The standard gonc command keeps all of these.
+// :service stays available: a peer can only pick one of the
 // built-in services configured beforehand, and :sh cannot be configured.
 //
 // The checks below and the branches guarded by ExecSupported are constant in
@@ -14,11 +14,11 @@ import "fmt"
 // shell implementation it no longer reaches.
 
 func errNoExec(feature string) error {
-	return fmt.Errorf("%s is not available: this build of gonc cannot run local programs (gonc_noexec)", feature)
+	return fmt.Errorf("%s is not available in this build of gonc (gonc_noexec)", feature)
 }
 
-// checkExecFeatures rejects options that run local programs when ExecSupported
-// is false. External -e commands and :sh given with -e are rejected by
+// checkExecFeatures rejects unavailable process and terminal options after
+// flag parsing. External -e commands and :sh given with -e are rejected by
 // preinitBuiltinAppConfig.
 func checkExecFeatures(config *AppNetcatConfig) error {
 	if ExecSupported {
@@ -31,6 +31,10 @@ func checkExecFeatures(config *AppNetcatConfig) error {
 		return errNoExec("-shellagent")
 	case config.app_sh_args != "-":
 		return errNoExec("-:sh")
+	case config.shellClient:
+		return errNoExec("-shell")
+	case config.enablePty:
+		return errNoExec("-pty")
 	}
 	return nil
 }

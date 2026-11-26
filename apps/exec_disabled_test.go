@@ -3,6 +3,9 @@
 package apps
 
 import (
+	"bytes"
+	"errors"
+	"flag"
 	"io"
 	"strings"
 	"testing"
@@ -28,6 +31,26 @@ func TestNoExecBuildRejectsLocalPrograms(t *testing.T) {
 				t.Fatalf("error = %v, want %s rejected", err, tc.feature)
 			}
 		})
+	}
+}
+
+func TestNoExecBuildKeepsShellFlagsRegistered(t *testing.T) {
+	var help bytes.Buffer
+	if _, err := AppNetcatConfigByArgs(&help, "gonc", []string{"-h"}); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help error = %v, want flag.ErrHelp", err)
+	}
+
+	for _, name := range []string{"-shell", "-pty"} {
+		if !strings.Contains(help.String(), "\n  "+name+"\n") {
+			t.Errorf("help does not list %s", name)
+		}
+		_, err := AppNetcatConfigByArgs(io.Discard, "gonc", []string{name, "-l", "1234"})
+		if err == nil || !strings.Contains(err.Error(), name+" is not available") {
+			t.Errorf("%s error = %v, want disabled feature error", name, err)
+		}
+		if _, err := AppNetcatConfigByArgs(io.Discard, "gonc", []string{name + "=false", "-l", "1234"}); err != nil {
+			t.Errorf("%s=false error = %v", name, err)
+		}
 	}
 }
 

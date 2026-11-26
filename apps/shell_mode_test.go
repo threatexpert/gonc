@@ -1,3 +1,5 @@
+//go:build !gonc_noexec
+
 package apps
 
 import (
