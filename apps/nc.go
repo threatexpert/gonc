@@ -410,6 +410,9 @@ func appNetcatConfigByArgs(ctx context.Context, logWriter io.Writer, argv0 strin
 	if err != nil {
 		return nil, err // 解析错误直接返回
 	}
+	if err := checkExecFeatures(config); err != nil {
+		return nil, err
+	}
 	if err := configureShellShortcut(config, fs); err != nil {
 		return nil, err
 	}
@@ -594,7 +597,7 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	}
 	config.ConsoleMode = true
 	ensureSignalHandler()
-	if config.daemon {
+	if ExecSupported && config.daemon {
 		if err := daemonize(config); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to daemonize: %v\n", err)
 			return 1
@@ -2483,6 +2486,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 	case ":nc":
 		ncconfig.app_nc_Config, err = AppNetcatConfigByArgs(ncconfig.LogWriter, ":nc", args[1:])
 	case ":sh":
+		if !ExecSupported {
+			return errNoExec(":sh")
+		}
 		ncconfig.app_sh_Config, err = PtyShellConfigByArgs(ncconfig.LogWriter, args[1:])
 	case ":tp":
 		ncconfig.app_tp_Config, err = AppTPConfigByArgs(ncconfig.LogWriter, args[1:])
@@ -2492,6 +2498,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 	default:
 		if strings.HasPrefix(builtinApp, ":") {
 			return fmt.Errorf("unknown built-in command: %s", builtinApp)
+		}
+		if !ExecSupported {
+			return errNoExec("-e with an external program")
 		}
 		return nil // not a built-in app, let caller handle it
 	}
@@ -2872,7 +2881,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 				blocksize = bufsize
 			}
 			go App_Netcat_main_withconfig(pipeConn, ncconfig.app_nc_Config)
-		} else if builtinApp == ":sh" {
+		} else if ExecSupported && builtinApp == ":sh" {
 			if ncconfig.app_sh_Config == nil {
 				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
 				return 1
@@ -2904,6 +2913,9 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			go App_HttpServer_main_withconfig(pipeConn, ncconfig.app_httpserver_Config)
 		} else if strings.HasPrefix(builtinApp, ":") {
 			ncconfig.Logger.Printf("Invalid service command: %s\n", builtinApp)
+			return 1
+		} else if !ExecSupported {
+			ncconfig.Logger.Printf("%v\n", errNoExec("-e with an external program"))
 			return 1
 		} else {
 			// 创建命令
